@@ -3389,6 +3389,25 @@ public:
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_clock_label != 0;
 
+    constexpr uint64_t compute_done_value = 0x1234567887654321ull;
+    uint64_t compute_done_label = 0;
+    auto compute_done_commands = make_interrupt_packet(
+        2, 2, &compute_done_label, compute_done_value, 0x678u);
+    compute_done_commands[1] = 0x62fu; // CS_DONE, shader-done index, no GCR action.
+    gpu.SubmitCompute(0x20, compute_done_commands);
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto compute_done_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
+            compute_done_wait == 0 && interrupt_count == 1 &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
+                interrupt_event.udata == &compute_interrupt_udata &&
+                compute_done_label == compute_done_value,
+            "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
