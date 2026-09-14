@@ -30943,7 +30943,9 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
   }
-  for (uint32_t offset = 0x0cau; offset <= 0x0ebu; offset++) {
+  // Restoring shader state after Toolkit rendering still emits the compiler's
+  // GS-front allocation metadata at 0xca.
+  for (uint32_t offset = 0x0cbu; offset <= 0x0ebu; offset++) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
   }
@@ -30976,16 +30978,25 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-  std::array<uint32_t, 6> registers{
+  std::array<uint32_t, 24> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
       Pm4::SPI_SHADER_PGM_CHKSUM_HS, 0x12345678u,
       Pm4::SPI_SHADER_PGM_RSRC4_HS, 0x87654321u,
+      Pm4::SPI_SHADER_PGM_LO_ES, 0x050025e5u,
+      Pm4::SPI_SHADER_PGM_HI_ES, 0u,
+      Pm4::SPI_SHADER_PGM_RSRC1_GS, 0x60000002u,
+      Pm4::SPI_SHADER_PGM_RSRC2_GS, 0x00030008u,
+      0x000000cau, 0x03000002u,
+      Pm4::SPI_SHADER_PGM_LO_PS, 0x05000104u,
+      Pm4::SPI_SHADER_PGM_HI_PS, 0u,
+      Pm4::SPI_SHADER_PGM_RSRC1_PS, 0x022c018du,
+      Pm4::SPI_SHADER_PGM_RSRC2_PS, 0x0000003cu,
   };
   const auto address = reinterpret_cast<uint64_t>(registers.data());
   std::array<uint32_t, 5> command{
       KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
       static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
-      0x80000000u, 3u,
+      0x80000000u, static_cast<uint32_t>(registers.size() / 2u),
   };
   Pm4Execution execution;
   const bool handlers_present =
@@ -30996,6 +31007,17 @@ void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
           handlers_present &&
               processor.Process(execution, command) == Pm4ProcessResult::Complete,
           "private AGC shader registers were rejected by SET_SH_REG_INDIRECT");
+  const auto &vs = processor.GetShCtx().GetVs();
+  const auto &ps = processor.GetShCtx().GetPs().ps_regs;
+  Require("Pm4PrivateAgcShaderRegisters", "native state around front metadata",
+          vs.es_regs.data_addr == 0x50025e500ull &&
+              vs.gs_regs.rsrc1.vgprs == 2u &&
+              vs.gs_regs.rsrc1.gs_vgpr_component_count == 3u &&
+              vs.gs_regs.rsrc2.es_vgpr_component_count == 3u &&
+              vs.gs_regs.rsrc2.user_sgpr == 4u &&
+              ps.data_addr == 0x500010400ull && ps.rsrc1.vgprs == 13u &&
+              ps.rsrc2.user_sgpr == 30u,
+          "GS-front metadata changed native GS state or prevented later PS writes");
   std::printf("[host]    %-32s ok\n", "Pm4PrivateAgcShaderRegisters");
 }
 
