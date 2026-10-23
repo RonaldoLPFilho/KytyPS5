@@ -1,4 +1,7 @@
 #include "graphics/presentation/videoOut.h"
+#include "live-counters.h"
+#include "live-trace.h"
+#include "time-census.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -20,9 +23,13 @@
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/systemContent.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <list>
 #include <thread>
 #include <vector>
@@ -181,6 +188,7 @@ struct VideoOutConfig {
 	bool                                opened      = false;
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
+	uint64_t                            last_flip_vblank = 0; // vblank_status.count at the last flip
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -257,6 +265,7 @@ public:
 	void                     Init(uint32_t width, uint32_t height);
 	FlipQueue&               GetFlipQueue() { return m_flip_queue; }
 	Graphics::RenderContext& Renderer() const noexcept { return m_renderer; }
+	bool                     IsHdrSupported() const noexcept { return m_presenter.IsHdrSupported(); }
 
 	void VblankBegin();
 	void VblankEnd();
@@ -475,9 +484,26 @@ static int DeleteVideoOutEvent(int handle, EventQueue::KernelEqueue eq, VideoOut
 	return result == LibKernel::KERNEL_ERROR_ENOENT ? OK : result;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
+// KYTY_FLIP_RATE=1 or 2: at least 2 or 3 vblanks between flips (30 or 20 fps at 60 Hz), a steady
+// frame rate, e.g. for recordings with frame generation. The vblanks keep their rate, and so does
+// the game's clock in play. Unlike the game's own sceVideoOutSetFlipRate (flips only on every 2nd
+// vblank), a late frame waits for the next vblank, not for the next even one (50 ms, not 67).
+// Movies advance a frame per flip (the intro played at half speed): with frame generation only
+// frames of the game's 3D view are capped (Presenter::FlipRateApplies).
+static int FlipRateFloor() {
+	static const int floor = [] {
+		const char* value = std::getenv("KYTY_FLIP_RATE");
+		return std::clamp(value != nullptr ? std::atoi(value) : 0, 0, 2);
+	}();
+	return floor;
+}
+
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
+	}
+	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
+		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;
 
@@ -542,9 +568,9 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	const auto pitch =
 	    Graphics::TileGetTexturePitch(pixel_format.guest_format, attribute.width, tile_mode);
 	Graphics::TileSizeAlign total {};
-	Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width, attribute.height,
-	                                  1, 1, tile_mode, false, total);
-	if (total.size == 0 || total.align != 65536 ||
+	if (!Graphics::TileGetTextureTotalSize(pixel_format.guest_format, attribute.width,
+	                                       attribute.height, 1, 1, tile_mode, false, total) ||
+	    total.size == 0 || total.align != 65536 ||
 	    (buffer.data_address & (total.align - 1u)) != 0) {
 		EXIT("invalid video-out surface footprint or alignment\n");
 	}
@@ -647,6 +673,7 @@ int VideoOutDriver::Impl::Open(int bus_type) {
 	config.flip_status.count         = 0;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
+	config.last_flip_vblank          = 0;
 
 	return handle;
 }
@@ -757,6 +784,7 @@ void VideoOutDriver::Impl::VblankBegin() {
 
 void VideoOutDriver::Impl::VblankEnd() {
 	Common::LockGuard lock(m_mutex);
+	LiveCounters::Add(LiveCounters::Vblanks);
 
 	for (int i = 1; i < VIDEO_OUT_NUM_MAX; i++) {
 		auto& ctx = m_video_out_ctx[i];
@@ -809,6 +837,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		VblankBegin();
 		bool presented = m_flip_queue.Flip(0);
+		if (!presented) presented = m_presenter.PresentSkippedIfDue();
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
 				m_presenter.Present(*frame, true);
@@ -968,6 +997,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
 	bool                current = false;
+	bool                hdr     = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
@@ -988,7 +1018,9 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 					     " index=%d group=%d\n",
 					     request_id, index, surface.group_index);
 				}
-				source_info = cfg->groups[surface.group_index].ImageInfo(surface);
+				const auto& group = cfg->groups[surface.group_index];
+				source_info       = group.ImageInfo(surface);
+				hdr               = Graphics::IsHdrVideoOutPixelFormat(group.attribute.pixel_format);
 			}
 		}
 	}
@@ -1002,12 +1034,17 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		}
 		return;
 	}
+	static std::atomic_flag hdr_warned;
+	if (hdr && !m_presenter.IsHdrSupported() && !hdr_warned.test_and_set(std::memory_order_relaxed)) {
+		std::printf("warning: the game outputs HDR (PQ) frames without an HDR10 swapchain; shown unconverted\n");
+		std::fflush(stdout);
+	}
 	Graphics::Presenter::Frame* frame = nullptr;
 	if (special) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr);
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1106,7 +1143,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	m_mutex.Unlock();
 
 	r.cfg->mutex.Lock();
-	if (!IsFlipDueLocked(*r.cfg, r.generation)) {
+	const bool capped = r.frame != nullptr && Graphics::Presenter::FlipRateApplies(*r.frame);
+	if (!IsFlipDueLocked(*r.cfg, r.generation, capped)) {
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1121,9 +1159,13 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.front().state = RequestState::Presenting;
 	m_mutex.Unlock();
+	// The port is not locked while presenting (a present can wait for the swapchain): the GPU thread reserves the
+	// next flip under it. The presented frame is its own copy; a port closed meanwhile takes no status or event.
+	r.cfg->mutex.Unlock();
 
 	m_presenter.Present(*r.frame);
 
+	r.cfg->mutex.Lock();
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
@@ -1131,17 +1173,20 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.pop_front();
 
-	r.cfg->flip_status.count++;
-	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
-	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
-	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
-	r.cfg->flip_status.flipArg                  = r.flip_arg;
-	r.cfg->flip_status.currentBuffer            = r.index;
-	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
-	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
-		r.cfg->flip_status.gcQueueNum--;
+	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
+		r.cfg->flip_status.count++;
+		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
+		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
+		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
+		r.cfg->flip_status.flipArg                  = r.flip_arg;
+		r.cfg->flip_status.currentBuffer            = r.index;
+		r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+		if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
+			r.cfg->flip_status.gcQueueNum--;
+		}
+		TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 	}
-	TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 
 	m_processing = false;
 	m_done_cond_var.SignalAll();
@@ -1490,6 +1535,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	LiveTrace::Event(LiveTrace::FlipComplete, request_id);
 	m_impl->GetFlipQueue().Complete(request_id);
 }
 
@@ -1507,6 +1553,7 @@ void VideoOutDriver::WaitFlipDone(int handle, int index) {
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(FlipStatus, 0);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1552,6 +1599,7 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetVblankStatus(int handle, VideoOutVblankStatus* status) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(VblankStatus, 0);
 
 	if (status == nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
@@ -1632,6 +1680,7 @@ KYTY_SYSV_ABI int VideoOutGetEventCount(const EventQueue::KernelEvent* ev) {
 
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(WaitVblank, 0);
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
@@ -1659,9 +1708,14 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
+	// HDR when the title declares it (param ATTRIBUTE bit 29) and --hdr found an HDR10 display:
+	// the game then flips BT.2100 PQ buffers, which the HDR10 swapchain shows as they are.
+	int32_t    attribute   = 0;
+	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
+	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
 	status->resolution   = (ctx->width >= 3840 || ctx->height >= 2160 ? 2u : 1u);
-	status->dynamicRange = 1;
+	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
 	         ? VIDEO_OUT_REFRESH_RATE_119_88HZ

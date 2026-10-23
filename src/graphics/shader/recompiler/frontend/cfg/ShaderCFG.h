@@ -61,9 +61,26 @@ struct BasicBlock {
 	uint32_t              inst_end   = 0;
 	std::vector<uint32_t> predecessors;
 	std::vector<uint32_t> successors;
-	std::vector<uint32_t> dominators;
-	std::vector<uint32_t> post_dominators;
 	Terminator            terminator;
+};
+
+// The (post-)dominator tree of the last analysis. A block added since has no dominance; a block no
+// root reaches (entry and blocks without predecessors; for post-dominance, blocks without
+// successors) counts as dominated by every analysed block.
+struct DominatorTree {
+	enum Kind : uint8_t { Unknown, Tree, All };
+	std::vector<uint8_t>  kind;
+	std::vector<uint32_t> parent; // UINT32_MAX: a root
+	std::vector<uint32_t> depth;  // dominators, the block included
+	std::vector<uint32_t> enter;  // preorder number; its subtree ends at `leave`
+	std::vector<uint32_t> leave;
+	uint32_t              analysed = 0;
+
+	[[nodiscard]] bool                  Dominates(uint32_t dominator, uint32_t block) const;
+	[[nodiscard]] uint32_t              Depth(uint32_t block) const;
+	[[nodiscard]] uint32_t              NearestCommon(uint32_t a, uint32_t b) const;
+	[[nodiscard]] std::vector<uint32_t> Dominators(uint32_t block) const;
+	void                                Remap(const std::vector<uint32_t>& id_map);
 };
 
 struct BackEdge {
@@ -93,6 +110,8 @@ struct Graph {
 	std::vector<NaturalLoop>                natural_loops;
 	std::vector<StronglyConnectedComponent> components;
 	std::vector<uint32_t>                   code_table_load_pcs;
+	DominatorTree                           dominators;
+	DominatorTree                           post_dominators;
 	uint32_t                                entry_block   = UINT32_MAX;
 	bool                                    irreducible   = false;
 	bool                                    unsupported   = false;

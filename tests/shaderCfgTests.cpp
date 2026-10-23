@@ -1,4 +1,8 @@
 #include "common/emulatorConfig.h"
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+#include "native-resource-state.h"
+#include "shader-warmup-cache.h"
+#endif
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/subsystems.h"
@@ -8,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/pipeline/driverCachePolicy.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -144,6 +149,46 @@ TestCompileResult RecompileForTest(
         "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization, push_data_start_dword);
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  // Exercise persisted compiler inputs on the existing compute, pixel, vertex
+  // and mesh fixtures, including their resource specializations and CFGs.
+  LocalShaderWarmup::Record saved;
+  saved.stage = options.stage; saved.hash = options.shader_hash;
+  saved.user_data_count = static_cast<uint32_t>(options.user_data.size());
+  saved.push_cursor = push_data_start_dword;
+  saved.code.assign(code.begin(), code.end());
+  saved.back_code.assign(options.back_code.begin(), options.back_code.end());
+  saved.specialization = specialization;
+  if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Mesh) {
+    saved.vertex = *options.input_info.vertex;
+    BuildStageStaticKey(saved.vertex, saved.static_key);
+  } else if (options.stage == ShaderType::Pixel) {
+    saved.pixel = *options.input_info.pixel;
+    BuildStageStaticKey(saved.pixel, saved.static_key);
+  } else {
+    saved.compute = *options.input_info.compute;
+    BuildStageStaticKey(saved.compute, saved.static_key);
+  }
+  LocalShaderWarmup::Writer writer;
+  // Synthetic mesh tests may intentionally use a zero-size workgroup; those
+  // never enter the renderer's mesh program cache and are not recorded there.
+  if (LocalShaderWarmup::Visit(writer, saved)) {
+    LocalShaderWarmup::Record restored;
+    LocalShaderWarmup::Reader reader {writer.words};
+    Check(LocalShaderWarmup::Visit(reader, restored) && reader.cursor == writer.words.size() &&
+          LocalShaderWarmup::ValidKey(restored) && restored.specialization == specialization,
+          "shader warmup changed the compiler key or specialization");
+    auto replay = options;
+    replay.back_code = restored.back_code;
+    if (options.stage == ShaderType::Vertex || options.stage == ShaderType::Mesh)
+      replay.input_info.vertex = &restored.vertex;
+    else if (options.stage == ShaderType::Pixel) replay.input_info.pixel = &restored.pixel;
+    else replay.input_info.compute = &restored.compute;
+    auto ir = ShaderRecompiler::TranslateProgram(restored.code, replay);
+    auto actual = ShaderRecompiler::CompileProgram(std::move(ir), replay, restored.specialization, restored.push_cursor);
+    Check(actual.spirv == compiled.spirv, "persisted shader warmup input changed SPIR-V output");
+  }
+#endif
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -1167,6 +1212,20 @@ void TestNativeShaderResourceDependencies() {
 }
 
 void TestNormalizedImageContracts() {
+  using Libs::Graphics::ImageSubresources;
+  Check(!ImageSubresources{2, 1}.Contains({1, 360}) &&
+            !ImageSubresources{1, 360}.Contains({2, 1}) &&
+            ImageSubresources{2, 360}.Contains({1, 360}) &&
+            ImageSubresources{2, 360}.Contains({2, 1}) &&
+            ImageSubresources{2, 360}.Contains({2, 360}),
+        "independent mip/layer capacity check failed");
+  using Libs::Graphics::IsBinaryDriverCacheKey;
+  Check(IsBinaryDriverCacheKey(std::string(64, 'a')) &&
+            !IsBinaryDriverCacheKey("") && !IsBinaryDriverCacheKey(std::string(63, 'a')) &&
+            !IsBinaryDriverCacheKey(std::string(65, 'a')) &&
+            !IsBinaryDriverCacheKey(std::string(64, 'G')) &&
+            !IsBinaryDriverCacheKey("../" + std::string(61, 'a')),
+        "local driver cache fingerprint validation failed");
   ImageInfo container{};
   container.data = {0x10000, 0x15000};
   container.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -5796,13 +5855,13 @@ void TestNewShaderRecompilerVintrpTranslation() {
   auto duplicate_result =
       RecompileForTest(duplicate_location_shader, options);
   Check(ProgramInputCount(duplicate_result.program,
-                          ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
-        "duplicate-location VINTRP shader did not reflect both raw parameter "
-        "attrs");
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 1,
+        "duplicate-location VINTRP shader did not share one parameter input");
   Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 0u) == 1,
         "duplicate-location VINTRP emitted more than one Location 0 input");
-  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 1,
-        "duplicate-location VINTRP did not fall back attr1 to Location 1");
+  Check(SpirvDecorationValueCount(duplicate_result.spirv, 30u, 1u) == 0,
+        "duplicate-location VINTRP declared a Location the vertex stage does "
+        "not export");
   CheckSpirvBinaryValidates(duplicate_result.spirv);
 
   const uint32_t flat_shader[] = {
@@ -8881,7 +8940,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
       EncodeSopp(0x01),
   };
 
+  // A partial wave64 on a 32-wide host starts with a lane-dependent EXEC, so the guard is a
+  // branch (a guard on a constant EXEC is emitted as straight-line code).
+  auto compute = RegressionComputeInputInfo();
+  compute.threads_num[0]     = 48;
+  compute.host_subgroup_size = 32;
   auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
@@ -9339,6 +9404,82 @@ void TestMergedShaderUserDataSnapshot() {
   }
 }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+void TestPreparationVertexInputReuse() {
+  const auto saved_mode = kyty_local_preparation_scratch_mode.load();
+  const uint32_t code[] = {EncodeSopp(0x01)};
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_offset = offsets.data();
+  user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
+  std::array<ShaderSemantic, 32> semantics{};
+  std::array<uint32_t, 32> attributes{};
+  std::array<uint32_t, 128> buffers{};
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffers.data()),
+                           reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(regs.gs_user_sgpr.value, tables, sizeof(tables));
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.input_semantics = semantics.data();
+  mapped.code_size_bytes = sizeof(code);
+  ShaderVertexInputInfo actual{};
+  for (uint32_t count : {32u, 1u, 0u, 17u, 2u, 31u, 0u, 32u, 3u}) {
+    for (uint32_t i = 0; i < 32; ++i) {
+      semantics[i].semantic = 31u - i;
+      semantics[i].hardware_mapping = 9u + i;
+      semantics[i].size_in_elements = 4;
+      attributes[i] = i | (static_cast<uint32_t>(Prospero::VertexAttribFormat::k32_32Float) << 5u) |
+                      ((i % 4u) * 8u << 14u) | ((i % 3u == 0u) ? 1u << 26u : 0u);
+      buffers[4*i] = 0x10000000u + (i / 4u) * 0x1000u + count * 0x10000u;
+      buffers[4*i+1] = 64u << 16u;
+      buffers[4*i+2] = 128;
+      buffers[4*i+3] = (static_cast<uint32_t>(Prospero::BufferFormat::k32_32Float) << 12u) |
+                        DstSel(4, 5, 6, 7);
+    }
+    mapped.num_input_semantics = count;
+    mapped.scratch_size_dwords = count;
+    offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] =
+        count == 0 ? AGC_ILLEGAL_DIRECT_OFFSET : 2;
+    ShaderMapUserData(regs.es_regs.data_addr, mapped);
+    ShaderVertexInputInfo expected{};
+    kyty_local_preparation_scratch_mode.store(0);
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, expected);
+    // Simulate returning from a mesh/clip-transformed draw before a different
+    // vertex format. Only storage capacity is permitted to survive this reset.
+    actual.mesh.threads_num[0] = 64;
+    actual.clip_space.enabled = true;
+    actual.fetch_external = true;
+    kyty_local_preparation_scratch_mode.store(1);
+    PrepareProgram(regs, HW::Context{}, HW::UserConfig{}, actual);
+    Check(MakeStageStaticKey(actual) == MakeStageStaticKey(expected) &&
+              actual.resources_num == expected.resources_num &&
+              actual.buffers_num == expected.buffers_num &&
+              !actual.clip_space.enabled && !actual.stage,
+          "reused vertex preparation kept previous mesh or format state");
+    for (int i = 0; i < actual.resources_num; ++i) {
+      Check(std::memcmp(&actual.resources[i], &expected.resources[i], sizeof(actual.resources[i])) == 0 &&
+                std::memcmp(&actual.resources_dst[i], &expected.resources_dst[i], sizeof(actual.resources_dst[i])) == 0,
+            "reused vertex preparation changed an active resource or destination");
+    }
+    for (int i = 0; i < actual.buffers_num; ++i) {
+      const auto& a = actual.buffers[i]; const auto& b = expected.buffers[i];
+      Check(a.addr == b.addr && a.stride == b.stride && a.num_records == b.num_records &&
+                a.fetch_index == b.fetch_index && a.attr_num == b.attr_num &&
+                std::equal(a.attr_indices, a.attr_indices + a.attr_num, b.attr_indices) &&
+                std::equal(a.attr_offsets, a.attr_offsets + a.attr_num, b.attr_offsets),
+            "reused vertex grouping retained inactive attributes");
+    }
+  }
+  kyty_local_preparation_scratch_mode.store(saved_mode);
+}
+#endif
+
 void TestEmbeddedVertexFormatSwizzle() {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
@@ -9495,6 +9636,8 @@ void TestMeshInputAssembly() {
   };
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
+    // An indirect draw's start instance goes to the user SGPR it names (s10 here).
+    input.start_instance_sgpr = 10;
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
     mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
@@ -9543,17 +9686,19 @@ void TestMeshInputAssembly() {
     load->ReplaceUsesWith(Value(test.fetch ? 0xabcd0123u : 0u));
     ConstantPropagationPass(program.blocks);
     std::array<uint32_t, 9> vgprs{};
-    uint32_t sgpr3 = 0;
+    std::array<uint32_t, 11> sgprs{};
     for (const auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::SetVectorRegister) {
         vgprs[RegIndex(inst.Arg(0).VectorRegister())] = inst.Arg(1).Resolve().U32();
       } else if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
-        sgpr3 = inst.Arg(1).Resolve().U32();
+        sgprs[RegIndex(inst.Arg(0).ScalarRegister())] = inst.Arg(1).Resolve().U32();
       }
     }
-    Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
-              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+    // The instance ID counts from 0 (workgroup y); the draw's first instance is in the SGPR.
+    Check(sgprs[3] == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
+              vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 2 &&
+              sgprs[10] == 7,
+          "mesh prolog changed input assembly, wave counts, vertex ID, instance ID or start instance");
   }
 }
 
@@ -10829,9 +10974,42 @@ void TestNewShaderRecompilerVertexSystemInputsWithoutMirrors() {
         "vertex SPIR-V does not load gl_VertexIndex");
   Check(CountSourceOccurrences(source, "OpLoad %int %gl_InstanceIndex") == 1u,
         "vertex SPIR-V does not load gl_InstanceIndex");
+  // The instance ID counts from 0 as on the GPU: gl_InstanceIndex - gl_BaseInstance.
+  Check(CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "vertex instance ID does not count from the base instance");
   Check(!Common::ContainsStr(source, "%v5") &&
             !Common::ContainsStr(source, "%v8"),
         "vertex system values were routed through guest VGPR mirrors");
+}
+
+// An indirect draw has the CP write its start instance into a user SGPR (START_INST_LOC): the
+// shader reads that SGPR as gl_BaseInstance instead of its user data.
+void TestNewShaderRecompilerVertexStartInstanceSgpr() {
+  using StageInputKind = ShaderRecompiler::IR::StageInputKind;
+
+  const uint32_t shader[] = {
+      EncodeVop1(0x01, 0, 10), // v_mov_b32 v0, s10
+      EncodeExp0(0x0c, 0xf),
+      EncodeExp1(0, 0, 0, 0), // POS0
+      0xbf810000u,
+  };
+
+  ShaderVertexInputInfo vertex{};
+  vertex.start_instance_sgpr = 10;
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  options.dump_ir = true;
+
+  const auto result = RecompileForTest(shader, options);
+  Check(ProgramHasInput(result.program, StageInputKind::BaseInstance),
+        "vertex shader missing BaseInstance input");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(Common::ContainsStr(source, "OpCapability DrawParameters"),
+        "vertex SPIR-V lacks the DrawParameters capability");
+  Check(CountSourceOccurrences(source, "OpLoad %int %gl_BaseInstance") == 1u,
+        "start instance SGPR does not read gl_BaseInstance");
 }
 
 void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
@@ -12082,6 +12260,39 @@ void TestDirectTranslationResetsAnalysisState() {
         "direct translation reused stale provenance/resource/interface state");
 }
 
+void TestNewShaderRecompilerSharedParameterPerVertexInput() {
+  const uint32_t shader[] = {
+      EncodeVintrp(0, 6, 1, 0, 4),
+      EncodeVintrp(1, 6, 1, 0, 4),
+      EncodeVintrp(2, 12, 2, 0, 2),
+      EncodeExp0(0x00, 0xf),
+      EncodeExp1(6, 12, 6, 12),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 3;
+  ps_info.interpolator_settings[0] = 0x00000000u;
+  ps_info.interpolator_settings[1] = 0x00000001u;
+  ps_info.interpolator_settings[2] = 0x00000421u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+
+  auto result = RecompileForTest(shader, options);
+  Check(ProgramInputCount(result.program,
+                          ShaderRecompiler::IR::StageInputKind::Parameter) == 1,
+        "two pixel inputs of one vertex parameter did not share an input");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 1u) == 1,
+        "shared vertex parameter was not declared once at its location");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 2u) == 0,
+        "per-vertex reader of a shared parameter declared its own location");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 5285u),
+        "shared parameter with a per-vertex reader is not PerVertexKHR");
+  Check(SpirvContainsCapability(result.spirv, 5284u),
+        "shared per-vertex parameter did not enable FragmentBarycentricKHR");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerStageInputInfo() {
   using StageInputKind = ShaderRecompiler::IR::StageInputKind;
 
@@ -12141,14 +12352,13 @@ void TestNewShaderRecompilerStageInputInfo() {
   auto ps_result = RecompileForTest(shader, ps_options);
   Check(ProgramHasInput(ps_result.program, StageInputKind::FragCoord),
         "pixel FragCoord input missing from reflection");
-  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 2,
-        "pixel interpolant inputs missing from reflection");
+  Check(ProgramInputCount(ps_result.program, StageInputKind::Parameter) == 0,
+        "unread pixel interpolants were reflected as inputs");
   Check(SpirvHasDecorationValue(ps_result.spirv, 11u, 15u),
         "SPIR-V lacks FragCoord BuiltIn decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 0u),
-        "SPIR-V lacks interpolant Location 0 decoration");
-  Check(SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
-        "SPIR-V lacks interpolant Location 1 decoration");
+  Check(!SpirvHasDecorationValue(ps_result.spirv, 30u, 0u) &&
+            !SpirvHasDecorationValue(ps_result.spirv, 30u, 1u),
+        "unread pixel interpolants were declared as SPIR-V inputs");
   CheckSpirvBinaryValidates(ps_result.spirv);
 
   ShaderPixelInputInfo ps_pos_y_info{};
@@ -12556,12 +12766,13 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dwordx4 v[0:3]
       EncodeSopp(0x01),
   };
+  // Portable shaders read the stride from the buffer word (one more load).
   const auto wide_result = compile("wide-buffer", wide_buffer,
-                                   {.words = 807,
-                                    .instructions = 211,
+                                   {.words = 941,
+                                    .instructions = 237,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    .loads = 10,
                                     .stores = 4,
                                     .array_lengths = 2,
                                     .phis = 5,
@@ -12730,6 +12941,95 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+void TestShaderWarmupCacheFiles() {
+  const auto directory = std::filesystem::temp_directory_path() /
+      ("kyty-warmup-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+  Check(std::filesystem::create_directory(directory), "create isolated warmup test directory");
+  const auto path = directory / "cache.shaders";
+  LocalShaderWarmup::Record record;
+  record.stage = ShaderType::Compute; record.code = {0xbf810000u};
+  record.compute.threads_num[0] = 64; record.compute.threads_num[1] = record.compute.threads_num[2] = 1;
+  record.user_data_count = 16; record.push_cursor = 12;
+  BuildStageStaticKey(record.compute, record.static_key);
+  LocalShaderWarmup::Cache cache;
+  Check(cache.Open(path, "device-and-executable-A"), "empty warmup cache");
+  cache.Add(record);
+  Check(cache.Save(), "save warmup compiler input");
+  LocalShaderWarmup::Cache loaded;
+  Check(loaded.Open(path, "device-and-executable-A") && loaded.records.size() == 1,
+        "warmup compiler input not restored");
+  Check(loaded.Add(record) == 0 && loaded.records.size() == 1, "warmup duplicate input changed its index");
+  LocalShaderWarmup::PipelineRecord compute;
+  compute.compute = 0;
+  loaded.AddPipeline(compute);
+  loaded.AddPipeline(compute);
+  Check(loaded.pipelines.size() == 1, "warmup pipeline deduplication");
+  compute.compute = 99;
+  loaded.AddPipeline(compute);
+  Check(loaded.pipelines.size() == 1, "warmup accepted dangling shader index");
+  auto vertex = record;
+  vertex.stage = ShaderType::Vertex;
+  BuildStageStaticKey(vertex.vertex, vertex.static_key);
+  const auto vs = loaded.Add(vertex);
+  auto pixel = record;
+  pixel.stage = ShaderType::Pixel;
+  BuildStageStaticKey(pixel.pixel, pixel.static_key);
+  const auto ps = loaded.Add(pixel);
+  LocalShaderWarmup::PipelineRecord graphics;
+  graphics.vertex = vs; graphics.pixel = ps;
+  graphics.rendering.color_count = 1;
+  graphics.rendering.color_formats[0] = vk::Format::eR8G8B8A8Unorm;
+  graphics.state.color_mask[0] = 15;
+  graphics.state.blend_enable[0] = true;
+  graphics.state.color_srcblend[0] = 19;
+  graphics.state.topology = vk::PrimitiveTopology::eTriangleList;
+  graphics.state.stencil_front.passOp = vk::StencilOp::eReplace;
+  loaded.AddPipeline(graphics);
+  Check(loaded.pipelines.size() == 2, "warmup rejected graphics pipeline");
+  LocalShaderWarmup::PipelineRecord replay;
+  LocalShaderWarmup::Reader pipeline_reader {loaded.pipelines.back()};
+  Check(LocalShaderWarmup::VisitPipeline(pipeline_reader, replay) &&
+        replay.vertex == vs && replay.pixel == ps && replay.rendering == graphics.rendering &&
+        replay.vertex_input == graphics.vertex_input && replay.state == graphics.state,
+        "warmup changed pipeline state during serialization");
+  graphics.pixel = 0;
+  loaded.AddPipeline(graphics);
+  Check(loaded.pipelines.size() == 2, "warmup accepted compute as pixel shader");
+  loaded.StartWriter();
+  record.hash = 123;
+  loaded.Add(record);
+  bool checkpoint_before_close = false;
+  for (unsigned attempt = 0; attempt < 70 && !checkpoint_before_close; ++attempt) {
+    LocalShaderWarmup::Cache observed;
+    checkpoint_before_close = observed.Open(path, "device-and-executable-A") &&
+        observed.records.size() == 4 && observed.pipelines.size() == 2;
+    if (!checkpoint_before_close) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  Check(checkpoint_before_close, "shader inputs were not checkpointed before normal exit");
+  Check(loaded.Save(), "drain asynchronous shader writer");
+  LocalShaderWarmup::Cache checkpoint;
+  Check(checkpoint.Open(path, "device-and-executable-A") && checkpoint.records.size() == 4 &&
+        checkpoint.pipelines == loaded.pipelines, "async checkpoint lost shader/pipeline order");
+  // Fail a reopen of an already populated cache: nothing from the old identity
+  // may survive a rejected file.
+  Check(!checkpoint.Open(path, "wrong-device") && checkpoint.records.empty() && checkpoint.pipelines.empty(),
+        "failed reopen retained stale warmup entries");
+  LocalShaderWarmup::Cache incompatible;
+  Check(!incompatible.Open(path, "device-and-executable-B") && incompatible.records.empty(),
+        "warmup accepted another executable or device");
+  auto truncated = loaded.records.front(); truncated.pop_back();
+  LocalShaderWarmup::Reader reader {truncated}; LocalShaderWarmup::Record rejected;
+  Check(!LocalShaderWarmup::Visit(reader, rejected), "warmup accepted truncated specialization");
+  std::fstream corrupt(path, std::ios::binary | std::ios::in | std::ios::out);
+  corrupt.seekp(-1, std::ios::end); corrupt.put(char(0xff)); corrupt.close();
+  LocalShaderWarmup::Cache damaged;
+  Check(!damaged.Open(path, "device-and-executable-A") && damaged.records.empty(),
+        "warmup accepted a corrupted compiler input");
+  std::filesystem::remove_all(directory);
+}
+#endif
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -12737,6 +13037,9 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestShaderWarmupCacheFiles();
+#endif
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
@@ -12822,6 +13125,9 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+#ifdef KYTY_LOCAL_NATIVE_RESOURCES
+  TestPreparationVertexInputReuse();
+#endif
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();
   TestNewShaderRecompilerPrunesUnreachableSetpcMetadata();
@@ -12837,6 +13143,7 @@ int main() {
 #endif
   TestNewShaderRecompilerZeroInitialRegisterState();
   TestNewShaderRecompilerVertexSystemInputsWithoutMirrors();
+  TestNewShaderRecompilerVertexStartInstanceSgpr();
   TestNewShaderRecompilerVertexExportUsesInvocationExecMask();
   TestNewShaderRecompilerPerInvocationMasksWithoutMirrors();
   TestNewShaderRecompilerPerInvocationU64Complement();
@@ -12857,6 +13164,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestNewShaderRecompilerSharedParameterPerVertexInput();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

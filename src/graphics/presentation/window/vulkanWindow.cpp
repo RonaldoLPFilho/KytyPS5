@@ -25,6 +25,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -33,16 +34,26 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#include "frame-gen.h"
+#include "driver-address-hole.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
+#include "device-fault.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -71,6 +82,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.hostQueryReset            = VK_TRUE; // local diagnostic GPU marks
 	return features;
 }
 
@@ -90,6 +102,29 @@ static bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions,
 static bool HasExtension(const std::vector<const char*>& extensions, const char* name) {
 	return std::any_of(extensions.begin(), extensions.end(),
 	                   [name](const char* ext) { return strcmp(ext, name) == 0; });
+}
+
+// VK_KHR_pipeline_binary for the static precompile's pipelines (pipelineBinaries.h), with maintenance5
+// for the pipeline creation flags it needs. KYTY_PIPELINE_BINARIES=0: the static pipeline cache instead.
+static void AddPipelineBinaryExtensions(const std::vector<vk::ExtensionProperties>& available,
+                                        std::vector<const char*>&                   extensions) {
+	const char* setting = std::getenv("KYTY_PIPELINE_BINARIES");
+	if ((setting == nullptr || std::string_view(setting) != "0") &&
+	    HasExtension(available, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) &&
+	    HasExtension(available, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+		extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+		extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	}
+}
+
+// VK_NV_copy_memory_indirect for the upload prologues' copies (one command for a submission's, by device address).
+// KYTY_COPY_INDIRECT=0: a copy command per buffer.
+static void AddCopyMemoryIndirectExtension(const std::vector<vk::ExtensionProperties>& available,
+                                           std::vector<const char*>&                   extensions) {
+	const char* setting = std::getenv("KYTY_COPY_INDIRECT");
+	if ((setting == nullptr || std::string_view(setting) != "0") &&
+	    HasExtension(available, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME))
+		extensions.push_back(VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
 }
 
 static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char* name) {
@@ -534,6 +569,12 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 
 	physical_device.getFeatures2(&features2);
 
+	constexpr auto reductions = vk::SubgroupFeatureFlagBits::eBasic |
+	                            vk::SubgroupFeatureFlagBits::eVote |
+	                            vk::SubgroupFeatureFlagBits::eArithmetic;
+	graphics.fragment_subgroup_reduction =
+	    bool(properties11.subgroupSupportedStages & vk::ShaderStageFlagBits::eFragment) &&
+	    (properties11.subgroupSupportedOperations & reductions) == reductions;
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
@@ -543,6 +584,28 @@ static void VulkanInitSubgroupSizeControl(vk::PhysicalDevice physical_device,
 	    (graphics.required_subgroup_size_stages & vk::ShaderStageFlagBits::eCompute) &&
 	    subgroup_size_control.minSubgroupSize <= 64 &&
 	    subgroup_size_control.maxSubgroupSize >= 64;
+
+	// Wave64 compute programs on 64-lane subgroups where the driver is known to compile them: AMD RDNA3 and later (an
+	// RX 7800 XT ran them). An RX 6700 XT (RDNA2, Adrenalin 26.8.1) crashed inside the driver creating the ~21st compute
+	// pipeline at start-up (an access violation at address 1, with or without optimization; the SPIR-V validates);
+	// other GPUs run them emulated on 32-lane subgroups, the path NVIDIA GPUs always take (no 64-lane subgroups there).
+	// KYTY_COMPUTE_WAVE64=0 or 1 chooses (1 only where the GPU allows 64-lane compute subgroups).
+	const auto& device_properties = properties2.properties;
+	const auto  id                = device_properties.deviceID;
+	const bool  amd_rdna3_or_later =
+	    device_properties.vendorID == 0x1002u &&
+	    ((id >= 0x7440u && id <= 0x75ffu) || id == 0x15bfu || id == 0x15c8u || id == 0x150eu || id == 0x1586u ||
+	     id == 0x1114u);
+	const char* setting = std::getenv("KYTY_COMPUTE_WAVE64");
+	const bool  wanted  = setting != nullptr && *setting != '\0' ? std::string_view(setting) != "0" : amd_rdna3_or_later;
+	graphics.compute_wave64_native = graphics.compute_subgroup_size_control_enabled && wanted;
+	std::printf("Vulkan compute wave64: %s (%s, device 0x%04x:0x%04x)\n",
+	            graphics.SupportsComputeWave64() ? "native" : "emulated on 32-lane subgroups",
+	            setting != nullptr && *setting != '\0' ? "KYTY_COMPUTE_WAVE64"
+	            : amd_rdna3_or_later                    ? "AMD RDNA3 or later"
+	                                                    : "default",
+	            device_properties.vendorID, id);
+	std::fflush(stdout);
 
 	LOGF("Vulkan subgroup: default=%u min=%u max=%u stages=0x%08x size_control=%s wave64=%s\n",
 	     graphics.subgroup_size, graphics.min_subgroup_size, graphics.max_subgroup_size,
@@ -558,12 +621,49 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const float               queue_priorities[2] = {1.0f, 1.0f};
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.pQueuePriorities = queue_priorities;
+
+	// KYTY_READBACK_QUEUE: also a queue of a transfer-only family (the copy engine).
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
+	uint32_t                                 queue_create_count = 1;
+	graphics.readback_family                                    = static_cast<uint32_t>(-1);
+#if defined(_WIN32)
+	// A second graphics-family queue for presents (GraphicContext::present_queue).
+	{
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		if (queue_family < family_count && families[queue_family].queueCount >= 2) {
+			queue_create_infos[0].queueCount = 2;
+			graphics.present_queue_created   = true;
+		}
+	}
+#endif
+	if (const char* readback = std::getenv("KYTY_READBACK_QUEUE");
+	    readback != nullptr && readback[0] != '\0' && std::strcmp(readback, "0") != 0) {
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		const vk::QueueFlags transfer_only = vk::QueueFlagBits::eTransfer | vk::QueueFlagBits::eSparseBinding;
+		for (uint32_t family = 0; family < family_count; ++family) {
+			const auto flags = families[family].queueFlags;
+			if (family != queue_family && families[family].queueCount != 0 &&
+			    (flags & vk::QueueFlagBits::eTransfer) && (flags & ~transfer_only) == vk::QueueFlags {}) {
+				graphics.readback_family                         = family;
+				queue_create_infos[1].queueFamilyIndex           = family;
+				queue_create_count                               = 2;
+				LOGF("\treadback queue family %u\n", family);
+				break;
+			}
+		}
+	}
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
@@ -587,8 +687,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	depth_clip_control.depthClipControl = VK_TRUE;
 
+	// Indirect draws' start instance reaches the shaders as gl_BaseInstance.
+	vk::PhysicalDeviceShaderDrawParametersFeatures draw_parameters {};
+	draw_parameters.pNext                = &depth_clip_control;
+	draw_parameters.shaderDrawParameters = VK_TRUE;
+
 	auto features12  = WindowContext::RequiredVulkan12Features();
-	features12.pNext = &depth_clip_control;
+	features12.pNext = &draw_parameters;
 
 	vk::PhysicalDeviceVulkan13Features supported_features13 {};
 	supported_features13.sType = vk::StructureType::ePhysicalDeviceVulkan13Features;
@@ -644,7 +749,30 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	vk::PhysicalDeviceShaderDrawParametersFeatures supported_draw_parameters {};
+	supported_draw_parameters.pNext = supported_features2.pNext;
+	supported_features2.pNext       = &supported_draw_parameters;
+	const bool binary_extensions = HasExtension(device_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
+	vk::PhysicalDevicePipelineBinaryFeaturesKHR supported_binaries {};
+	vk::PhysicalDeviceMaintenance5FeaturesKHR   supported_maintenance5 {};
+	if (binary_extensions) {
+		supported_maintenance5.pNext = supported_features2.pNext;
+		supported_binaries.pNext     = &supported_maintenance5;
+		supported_features2.pNext    = &supported_binaries;
+	}
+	const bool copy_indirect_extension = HasExtension(device_extensions, VK_NV_COPY_MEMORY_INDIRECT_EXTENSION_NAME);
+	vk::PhysicalDeviceCopyMemoryIndirectFeaturesNV supported_copy_indirect {};
+	if (copy_indirect_extension) {
+		supported_copy_indirect.pNext = supported_features2.pNext;
+		supported_features2.pNext     = &supported_copy_indirect;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	graphics.copy_memory_indirect_enabled = copy_indirect_extension && supported_copy_indirect.indirectCopy;
+	LOGF("Vulkan indirect memory copies: %s\n", graphics.copy_memory_indirect_enabled ? "true" : "false");
+	graphics.pipeline_binaries_enabled =
+	    binary_extensions && supported_binaries.pipelineBinaries && supported_maintenance5.maintenance5;
+	// (maintenance5 is enabled with the binaries: pipelines take SPIR-V inline.)
+	ModuleStore::Enable(graphics.pipeline_binaries_enabled);
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
@@ -681,6 +809,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.fillModeNonSolid != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.shaderInt64 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.vertexPipelineStoresAndAtomics != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.drawIndirectFirstInstance != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_features2.features.multiDrawIndirect != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(supported_draw_parameters.shaderDrawParameters != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputLayer == VK_TRUE &&
 	                     supported_features12.shaderOutputLayer != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(required_features12.shaderOutputViewportIndex == VK_TRUE &&
@@ -711,8 +842,28 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.drawIndirectFirstInstance            = VK_TRUE;
+	device_features.multiDrawIndirect                    = VK_TRUE; // (indirect draws of several argument sets)
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue (the BDA page table).
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		graphics.sparse_residency_buffers =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && queue_family < family_count &&
+		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding);
+		if (graphics.sparse_residency_buffers) {
+			device_features.sparseBinding         = VK_TRUE;
+			device_features.sparseResidencyBuffer = VK_TRUE;
+		}
+	}
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
@@ -731,6 +882,20 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
 		robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
 	}
+	// Byte-exact device bounds make the shaders' own storage buffer checks redundant
+	// (ShaderRecompiler::SetDeviceStorageBufferBounds). KYTY_ROBUST_BUFFERS=0 keeps them.
+	bool device_buffer_bounds = false;
+	if (robustness2.robustBufferAccess2 == VK_TRUE) {
+		vk::PhysicalDeviceRobustness2PropertiesEXT robustness2_properties {};
+		vk::PhysicalDeviceProperties2              properties {};
+		properties.pNext = &robustness2_properties;
+		physical_device.getProperties2(&properties);
+		const char* setting  = std::getenv("KYTY_ROBUST_BUFFERS");
+		device_buffer_bounds = robustness2_properties.robustStorageBufferAccessSizeAlignment == 1 &&
+		                       !(setting != nullptr && std::string_view(setting) == "0");
+	}
+	ShaderRecompiler::SetDeviceStorageBufferBounds(device_buffer_bounds);
+	LOGF("Vulkan storage buffer bounds: %s\n", device_buffer_bounds ? "device" : "shader");
 
 	const bool subgroup_size_control_enabled =
 	    graphics.compute_subgroup_size_control_enabled &&
@@ -746,6 +911,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 #endif
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl = subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
+	features13.pipelineCreationCacheControl = supported_features13.pipelineCreationCacheControl;
+	graphics.pipeline_cache_control_enabled = features13.pipelineCreationCacheControl == VK_TRUE;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
@@ -766,20 +933,73 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
 	}
+	vk::PhysicalDevicePresentIdFeaturesKHR present_id {};
+	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		present_id.presentId = VK_TRUE;
+		present_id.pNext     = const_cast<void*>(create_info.pNext);
+		create_info.pNext    = &present_id;
+	}
+	vk::PhysicalDevicePipelineBinaryFeaturesKHR     binaries {};
+	vk::PhysicalDeviceMaintenance5FeaturesKHR       maintenance5 {};
+	vk::DevicePipelineBinaryInternalCacheControlKHR internal_cache {};
+	if (graphics.pipeline_binaries_enabled) {
+		maintenance5.maintenance5 = VK_TRUE;
+		maintenance5.pNext        = const_cast<void*>(create_info.pNext);
+		binaries.pipelineBinaries = VK_TRUE;
+		binaries.pNext            = &maintenance5;
+		create_info.pNext         = &binaries;
+		vk::PhysicalDevicePipelineBinaryPropertiesKHR binary_properties {};
+		vk::PhysicalDeviceProperties2                 properties {};
+		properties.pNext = &binary_properties;
+		physical_device.getProperties2(&properties);
+		if (!graphics.pipeline_binary_internal_cache && binary_properties.pipelineBinaryInternalCacheControl) {
+			internal_cache.disableInternalCache = VK_TRUE;
+			internal_cache.pNext                = create_info.pNext;
+			create_info.pNext                   = &internal_cache;
+		}
+	}
+	vk::PhysicalDeviceCopyMemoryIndirectFeaturesNV copy_indirect {};
+	if (graphics.copy_memory_indirect_enabled) {
+		copy_indirect.indirectCopy = VK_TRUE;
+		copy_indirect.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &copy_indirect;
+	}
+	vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority {};
+	if (graphics.memory_priority_enabled) {
+		memory_priority.memoryPriority = VK_TRUE;
+		memory_priority.pNext          = const_cast<void*>(create_info.pNext);
+		create_info.pNext              = &memory_priority;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT fault_features {};
+	const bool fault_extension = HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	if (fault_extension) {
+		fault_features.deviceFault = VK_TRUE;
+		fault_features.pNext       = const_cast<void*>(create_info.pNext);
+		create_info.pNext          = &fault_features;
+	}
 	create_info.flags                   = {};
-	create_info.pQueueCreateInfos       = &queue_create_info;
-	create_info.queueCreateInfoCount    = 1;
+	create_info.pQueueCreateInfos       = queue_create_infos.data();
+	create_info.queueCreateInfoCount    = queue_create_count;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;
 
+	// Release the range held during guest-memory setup so NVIDIA can reserve it at device creation.
+	LocalDriverHole::Release();
+
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
 		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		std::printf("vkCreateDevice failed: %s (%u extensions)\n", vk::to_string(result).c_str(),
+		            create_info.enabledExtensionCount);
+		for (uint32_t i = 0; i < create_info.enabledExtensionCount; ++i)
+			std::printf("  extension %s\n", create_info.ppEnabledExtensionNames[i]);
+		std::fflush(stdout);
 		return nullptr;
 	}
+	if (fault_extension) DeviceFault::Enable(device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 
 	return device;
 }
@@ -814,6 +1034,12 @@ static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
 	        });
 
 	r.enable_validation_layers = Config::VulkanValidationEnabled();
+	// HDR10 surface formats (VK_COLOR_SPACE_HDR10_ST2084_EXT) are listed only with this extension.
+	if (Config::HdrEnabled() &&
+	    HasExtension(r.available_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) &&
+	    !HasExtension(r.required_extensions, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+		r.required_extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+	}
 
 	if (HasExtension(r.available_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
 		r.required_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -1145,6 +1371,7 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.supports_block_texel_view = block_texel_view_props.result == vk::Result::eSuccess;
 	LOGF("Block Texel View support: %s\n", graphic_ctx.supports_block_texel_view ? "Yes" : "No");
 
+	bool checkpoints = false;
 	{
 		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
 		    "vkEnumerateDeviceExtensionProperties",
@@ -1157,22 +1384,48 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		// KYTY_SIMULATE_VRAM_MB: the start-up ballast keeps its video memory over the game's (priorities).
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB");
+		    simulate != nullptr && std::strtoull(simulate, nullptr, 10) > 0 &&
+		    HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			graphic_ctx.memory_priority_enabled = true;
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// KYTY_GPU_CHECKPOINTS (diagnostic): the pipelines a GPU hang or fault ran (device-fault.h).
+		if (DeviceFault::CheckpointsRequested() &&
+		    HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			checkpoints = true;
 		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
+		// KYTY_FRAMEGEN: Streamline enables VK_NV_low_latency2 (Reflex) without the present-id
+		// extension it requires; current drivers then refuse the device.
+		if (FrameGen::Requested() && HasExtension(available_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+		}
+		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
+	// The pipelines it makes from the static precompile's binaries would stay in the driver's own cache
+	// too; what it compiles goes to the local driver cache anyway. KYTY_PIPELINE_BINARY_INTERNAL_CACHE=1
+	// keeps it.
+	const char* internal_cache                 = std::getenv("KYTY_PIPELINE_BINARY_INTERNAL_CACHE");
+	graphic_ctx.pipeline_binary_internal_cache = internal_cache != nullptr && std::string_view(internal_cache) == "1";
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, r, queue_family,
 	                                        device_extensions, graphic_ctx);
@@ -1180,9 +1433,35 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not create device");
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::Install();
+#endif
+	// Every pipeline bind is noted for a device loss's report (device-fault.h).
+	if (checkpoints) DeviceFault::EnableCheckpoints(graphic_ctx.device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	{
+		auto bind = LocalVulkanRecording::DirectDispatch().vkCmdBindPipeline;
+		DeviceFault::InstallBindHook(&bind);
+		(void)LocalVulkanRecording::ReplaceBindPipeline(reinterpret_cast<void*>(bind));
+	}
+#else
+	DeviceFault::InstallBindHook(&VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindPipeline);
+#endif
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	DeviceFault::NoteQueue(graphic_ctx.queue, "graphics");
+	if (graphic_ctx.present_queue_created) {
+		graphic_ctx.device.getQueue(queue_family, 1, &graphic_ctx.present_queue);
+		LOGF("\tpresent queue: family %u index 1\n", queue_family);
+	}
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+		EXIT_IF(graphic_ctx.readback_queue == nullptr);
+		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
+	}
+	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
@@ -1191,6 +1470,135 @@ void WindowContext::CreateVulkan() {
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(&render_context->GetGpuResources());
 	presenter = std::make_unique<Presenter>(*this);
+}
+
+// Offline tools (xpr_replay_tests): the device CreateVulkan builds - same
+// extensions, features and allocator - without a window, surface or swapchain.
+bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx) {
+	EXIT_IF(graphic_ctx.instance != nullptr || graphic_ctx.device != nullptr);
+	static vk::detail::DynamicLoader loader;
+	const auto get_instance_proc_addr =
+	    loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+	if (get_instance_proc_addr == nullptr) return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	VulkanCheckInstanceVersion();
+
+	vk::ApplicationInfo app_info {};
+	app_info.sType            = vk::StructureType::eApplicationInfo;
+	app_info.pApplicationName = "Kyty offline";
+	app_info.pEngineName      = "Kyty";
+	app_info.apiVersion       = VULKAN_TARGET_API_VERSION; // NOLINT
+	vk::InstanceCreateInfo inst_info {};
+	inst_info.sType            = vk::StructureType::eInstanceCreateInfo;
+	inst_info.pApplicationInfo = &app_info;
+	if (vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance) != vk::Result::eSuccess)
+		return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+
+	std::vector<const char*> device_extensions = {
+	    VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+	    "VK_KHR_maintenance1"};
+#if !defined(__APPLE__)
+	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+#endif
+	// The first device with the target API and a graphics+compute queue, preferring discrete.
+	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
+	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
+		    return graphic_ctx.instance.enumeratePhysicalDevices(count, values);
+	    });
+	uint32_t queue_family = static_cast<uint32_t>(-1);
+	for (const bool discrete_only: {true, false}) {
+		for (const auto& device: devices) {
+			vk::PhysicalDeviceProperties properties {};
+			device.getProperties(&properties);
+			if (properties.apiVersion < VULKAN_TARGET_API_VERSION ||
+			    (discrete_only && properties.deviceType != vk::PhysicalDeviceType::eDiscreteGpu))
+				continue;
+			const auto families = device.getQueueFamilyProperties();
+			for (uint32_t i = 0; i < families.size(); ++i) {
+				if ((families[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+				    (families[i].queueFlags & vk::QueueFlagBits::eCompute)) {
+					graphic_ctx.physical_device = device;
+					queue_family                = i;
+					break;
+				}
+			}
+			if (graphic_ctx.physical_device) break;
+		}
+		if (graphic_ctx.physical_device) break;
+	}
+	if (!graphic_ctx.physical_device) return false;
+
+	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
+	vk::PhysicalDeviceProperties2              physical_device_properties {};
+	push_descriptor_properties.sType = vk::StructureType::ePhysicalDevicePushDescriptorProperties;
+	physical_device_properties.sType = vk::StructureType::ePhysicalDeviceProperties2;
+	physical_device_properties.pNext = &push_descriptor_properties;
+	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
+	graphic_ctx.physical_device_properties = physical_device_properties.properties;
+	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
+	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
+	const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info {
+	    .format = vk::Format::eBc1RgbaUnormBlock,
+	    .type   = vk::ImageType::e2D,
+	    .tiling = vk::ImageTiling::eOptimal,
+	    .usage  = vk::ImageUsageFlagBits::eSampled,
+	    .flags  = vk::ImageCreateFlagBits::eBlockTexelViewCompatible,
+	};
+	graphic_ctx.supports_block_texel_view =
+	    graphic_ctx.physical_device.getImageFormatProperties2(block_texel_view_info).result ==
+	    vk::Result::eSuccess;
+	{
+		auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+		    "vkEnumerateDeviceExtensionProperties",
+		    [&](uint32_t* count, vk::ExtensionProperties* values) {
+			    return graphic_ctx.physical_device.enumerateDeviceExtensionProperties(nullptr, count,
+			                                                                          values);
+		    });
+		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		// KYTY_SIMULATE_VRAM_MB: the start-up ballast keeps its video memory over the game's (priorities).
+		if (const char* simulate = std::getenv("KYTY_SIMULATE_VRAM_MB");
+		    simulate != nullptr && std::strtoull(simulate, nullptr, 10) > 0 &&
+		    HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+			graphic_ctx.memory_priority_enabled = true;
+		}
+		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME}) {
+			if (HasExtension(available_extensions, extension)) device_extensions.push_back(extension);
+		}
+		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+		    HasExtension(available_extensions,
+		                 VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		AddPipelineBinaryExtensions(available_extensions, device_extensions);
+		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+	}
+	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);
+	const VulkanExtensions no_layers {};
+	graphic_ctx.device = VulkanCreateDevice(graphic_ctx.physical_device, no_layers, queue_family,
+	                                        device_extensions, graphic_ctx);
+	if (graphic_ctx.device == nullptr) return false;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
+	FrameGen::BypassCommandHooks(graphic_ctx.device);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	LocalVulkanRecording::Install();
+#endif
+	graphic_ctx.queue_family = queue_family;
+	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1))
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	return graphic_ctx.queue != nullptr && graphic_ctx.CreateAllocator();
 }
 
 void WindowContext::RefreshSurfaceCapabilities() {
@@ -1222,8 +1630,9 @@ WindowContext::~WindowContext() {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
-		graphic_ctx.device = nullptr;
-		graphic_ctx.queue  = nullptr;
+		graphic_ctx.device         = nullptr;
+		graphic_ctx.queue          = nullptr;
+		graphic_ctx.readback_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

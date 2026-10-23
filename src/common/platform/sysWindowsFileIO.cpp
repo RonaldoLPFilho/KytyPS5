@@ -13,8 +13,25 @@
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
 
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <system_error>
 #include <vector>
+
+// A path of MAX_PATH characters or more opens only in the extended-length form (\\?\, \\?\UNC\ for a share), which
+// takes no relative path, "." or "..", nor forward slashes: a game folder deep in a user's documents (issue #13, a
+// material at 265 characters). Shorter paths go as they are.
+static std::wstring WidePath(const std::filesystem::path& path) {
+	auto wide = path.wstring();
+	if (wide.size() < MAX_PATH - 12 || wide.starts_with(L"\\\\?\\") || wide.starts_with(L"\\\\.\\")) return wide;
+	std::error_code error;
+	const auto      absolute = std::filesystem::absolute(path, error);
+	if (error) return wide;
+	const auto normal = absolute.lexically_normal().wstring();
+	if (normal.starts_with(L"\\\\")) return L"\\\\?\\UNC\\" + normal.substr(2);
+	return L"\\\\?\\" + normal;
+}
 
 // NOLINTNEXTLINE(readability-identifier-naming)
 enum sys_file_type_t {
@@ -65,7 +82,14 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
 	if (f.type == SYS_FILE_FILE) {
 		DWORD w = 0;
-		ReadFile(f.handle, data, size, &w, nullptr);
+		if (ReadFile(f.handle, data, size, &w, nullptr) == 0) {
+			// Shown: a failed read used to pass as a short one.
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+				std::printf("File: ReadFile failed (error %lu), %lu of %u bytes read\n", GetLastError(), w, size);
+				std::fflush(stdout);
+			}
+		}
 		if (bytes_read != nullptr) {
 			*bytes_read = w;
 		}
@@ -142,7 +166,7 @@ void SysFileWrite(uint32_t n, sys_file_t& f) {
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
@@ -158,7 +182,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
 	                     GetCacheAccessType(cache_type), nullptr);
@@ -201,7 +225,7 @@ sys_file_t* SysFileCreate() {
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file        = CreateFileW(
 	    wide.c_str(), static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE),
@@ -222,7 +246,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = WidePath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
@@ -273,7 +297,7 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	LARGE_INTEGER             s;
 	WIN32_FILE_ATTRIBUTE_DATA a;
 
-	auto wide = file_name.wstring();
+	auto wide = WidePath(file_name);
 	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
 		return 0;
 	}
@@ -348,32 +372,43 @@ bool SysFileIsError(sys_file_t& f) {
 	       (f.type == SYS_FILE_FILE && f.handle == INVALID_HANDLE_VALUE);
 }
 
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	WIN32_FILE_ATTRIBUTE_DATA a {};
+	auto                      wide = WidePath(name);
+	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
+		return false;
+	}
+	*is_file = (a.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u;
+	*size    = *is_file ? (static_cast<uint64_t>(a.nFileSizeHigh) << 32u) | a.nFileSizeLow : 0;
+	return true;
+}
+
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto  wide = path.wstring();
+	auto  wide = WidePath(path);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto  wide = name.wstring();
+	auto  wide = WidePath(name);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = WidePath(path);
 	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
 }
 
 bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = WidePath(path);
 	return RemoveDirectoryW(wide.c_str()) != 0;
 }
 
 bool SysFileDeleteFile(const std::filesystem::path& name) {
-	auto wide = name.wstring();
+	auto wide = WidePath(name);
 	return DeleteFileW(wide.c_str()) != 0;
 }
 
@@ -490,7 +525,7 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 	HANDLE           h = nullptr;
 	WIN32_FIND_DATAW data;
 
-	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	auto wide_pattern = WidePath(std::filesystem::path(pattern));
 	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
@@ -527,17 +562,12 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 }
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	std::string real_path = Common::ReplaceChar(Common::PathToGenericString(path), '\\', '/');
-	if (!Common::EndsWith(real_path, "/")) {
-		real_path += "/";
-	}
-
-	std::string pattern = real_path + "*";
-
 	HANDLE           h = nullptr;
 	WIN32_FIND_DATAW data;
 
-	auto wide_pattern = std::filesystem::path(pattern).wstring();
+	// The pattern from the path itself: a UTF-8 string of it made a path again went through the ANSI code page (a
+	// non-ASCII game folder listed nothing, so its modules were not loaded).
+	auto wide_pattern = WidePath(path / "*");
 	h                 = FindFirstFileW(wide_pattern.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
@@ -560,19 +590,19 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 }
 
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = WidePath(src);
+	auto dst_wide = WidePath(dst);
 	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
 }
 
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = WidePath(src);
+	auto dst_wide = WidePath(dst);
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
-	auto wide = name.wstring();
+	auto wide = WidePath(name);
 	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &
 	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
 }

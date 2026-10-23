@@ -24,21 +24,26 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/stringUtils.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "loader/demonsSoulsWarp.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
+#include "graphics/presentation/window/startupProgress.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "frame-gen.h"
 #include "kytyGitVersion.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -250,6 +255,20 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 			case SDLK_F11:
 				if (!key.repeat) {
 					ToggleDesktopFullscreen();
+				}
+				break;
+			// Debug warp (loader/demonsSoulsWarp.h): F9/F10 pick a spawn point, F8 arms or cancels.
+			case SDLK_F8:
+				if (!key.repeat) {
+					Loader::DemonsSoulsWarp::ToggleSelected();
+				}
+				break;
+			case SDLK_F9: Loader::DemonsSoulsWarp::Select(-1); break;
+			case SDLK_F10: Loader::DemonsSoulsWarp::Select(1); break;
+			// F6: the player's position appended to a route file (automated tours replay it).
+			case SDLK_F6:
+				if (!key.repeat) {
+					Loader::DemonsSoulsWarp::RecordWaypoint();
 				}
 				break;
 			case SDLK_RETURN:
@@ -511,6 +530,12 @@ void WindowContext::ProcessEvent(double time_s) {
 			HostInputToggleMouseToJoystick();
 		}
 		return;
+	}
+	if (event->type == SDL_KEYDOWN && event->key.repeat == 0 && event->key.keysym.sym == SDLK_F1) {
+		if (FrameGen::ToggleFpsHud()) return;
+	}
+	if (event->type == SDL_KEYDOWN && event->key.repeat == 0 && event->key.keysym.sym == SDLK_F2) {
+		if (FrameGen::ToggleFrameGeneration()) return;
 	}
 	if (ProcessSystemOverlayInput(*event)) {
 		return;
@@ -817,6 +842,9 @@ static void WindowCreate(WindowContext& context) {
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+	// Pixel-exact windows and swapchains on scaled displays: without per-monitor awareness a
+	// 200% desktop gets a half-size swapchain that the compositor stretches back (blurry).
+	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #endif
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
@@ -824,6 +852,19 @@ static void WindowCreate(WindowContext& context) {
 	}
 	HostInputInit();
 	InitializeSystemOverlayInput();
+
+	// A window larger than the screen it opens on (2560x1440 on a 1080p or 1440p one) would hang
+	// off it, title bar included: the same shape scaled into the usable area, 5% of its height
+	// left for the title bar.
+	if (SDL_Rect usable {}; !Config::FullscreenEnabled() && SDL_GetDisplayUsableBounds(0, &usable) == 0) {
+		const double scale = std::min(usable.w / static_cast<double>(width), usable.h * 0.95 / height);
+		if (scale < 1.0) {
+			width                             = static_cast<int>(width * scale) & ~1;
+			height                            = static_cast<int>(height * scale) & ~1;
+			context.graphic_ctx.screen_width  = static_cast<uint32_t>(width);
+			context.graphic_ctx.screen_height = static_cast<uint32_t>(height);
+		}
+	}
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
@@ -854,6 +895,11 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
+#if defined(_WIN32)
+	// KYTY_FRAMEGEN: Streamline must be initialized before SDL loads Vulkan with the window, and
+	// then becomes that loader (the instance and device are created through it).
+	Libs::Graphics::FrameGen::Initialize();
+#endif
 	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, KYTY_SDL_WINDOWPOS_CENTERED,
 	                                  KYTY_SDL_WINDOWPOS_CENTERED, width, height, window_flags);
 
@@ -863,6 +909,10 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
 	context.UpdateIcon();
+	// SDL2 starts text input with the video subsystem, which keeps the IME attached to the
+	// window: with a Japanese/Chinese IME on, letter keys (the default Cross, WASD...) never
+	// reach the game. The system overlay starts text input itself while it needs it.
+	SDL_StopTextInput();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
@@ -883,7 +933,10 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
 	window->graphic_ctx.screen_height = height;
 
 	WindowCreate(*window);
+	// The pipeline cache's start-up work (warmup) runs in CreateVulkan: its progress in the window.
+	StartupProgressShow(window->window);
 	window->CreateVulkan();
+	StartupProgressHide();
 	auto& presenter = *window->presenter;
 	g_window        = std::move(window);
 	return presenter;
@@ -941,7 +994,7 @@ struct WindowIcon {
 
 static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
 	Common::File f;
-	if (!f.Open(path, Common::File::Mode::Read)) {
+	if (!f.Open(Common::PathFromUtf8(path), Common::File::Mode::Read)) { // (UTF-8: SystemContentGetIconPath)
 		EXIT("Can't open icon file %s\n", path.c_str());
 	}
 
@@ -1016,10 +1069,13 @@ void WindowContext::UpdateTitle() {
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, FrameGen::RuntimeStatus());
+	if (const auto waypoints = Loader::DemonsSoulsWarp::RecordedWaypoints(); waypoints != 0) {
+		text += fmt::format(", waypoints: {}", waypoints);
+	}
 
 	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
 }

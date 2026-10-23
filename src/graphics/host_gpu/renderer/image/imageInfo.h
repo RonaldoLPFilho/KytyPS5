@@ -28,12 +28,16 @@ struct ImageMetadataInfo {
 	bool                stencil_compressed = false;
 	bool                dcc_clear_register_valid = false;
 	bool                dcc_alpha_msb            = true;
+	bool                operator==(const ImageMetadataInfo&) const = default;
 };
 
 struct ImageSubresources {
 	uint32_t levels                                      = 1;
 	uint32_t layers                                      = 1;
 	auto     operator<=>(const ImageSubresources&) const = default;
+	[[nodiscard]] constexpr bool Contains(const ImageSubresources& other) const noexcept {
+		return levels >= other.levels && layers >= other.layers;
+	}
 };
 
 struct ImageSubresourceRange {
@@ -362,7 +366,19 @@ struct VideoOutFormatPolicy {
 	VideoOutPixelFormatInfo info;
 };
 
-inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {{
+// 10-bit buffers whose pixels are BT.2100 PQ (HDR10): presented as they are on an HDR10 swapchain.
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ = 0x8100070422000000ull;
+inline constexpr uint64_t VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ = 0x8100070400000000ull;
+
+[[nodiscard]] constexpr bool IsHdrVideoOutPixelFormat(uint64_t format) {
+	switch (format) {
+		case VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ:
+		case VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ: return true;
+		default: return false;
+	}
+}
+
+inline constexpr std::array<VideoOutFormatPolicy, 8> VIDEO_OUT_FORMAT_POLICIES {{
     {0x8000000022000000ull,
      {vk::Format::eR8G8B8A8Srgb, Prospero::BufferFormat::k8_8_8_8Srgb, 4, false}},
     {0x8000000000000000ull,
@@ -370,6 +386,10 @@ inline constexpr std::array<VideoOutFormatPolicy, 6> VIDEO_OUT_FORMAT_POLICIES {
     {0x8100000022000000ull,
      {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0x8100000000000000ull,
+     {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_R10_G10_B10_A2_BT2100_PQ,
+     {vk::Format::eA2B10G10R10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
+    {VIDEO_OUT_PIXEL_FORMAT_B10_G10_R10_A2_BT2100_PQ,
      {vk::Format::eA2R10G10B10UnormPack32, Prospero::BufferFormat::k10_10_10_2UNorm, 4, false}},
     {0xc001000622000000ull,
      {vk::Format::eR16G16B16A16Sfloat, Prospero::BufferFormat::k16_16_16_16Float, 8, false}},
@@ -481,6 +501,42 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 	}
 	clear = next;
 	return true;
+}
+
+// The clear of a texel whose memory a uniform fill wrote with one 32-bit word: a 32-bit texel as the packed
+// clear above, a 64- or 128-bit one holds the word in each of its 32-bit parts.
+[[nodiscard]] inline bool DecodeFilledColorClear(vk::Format format, uint32_t word, vk::ClearColorValue& clear) {
+	const auto half = [](uint32_t bits) {
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		const uint32_t mantissa = bits & 0x3ffu;
+		const float    value    = std::ldexp(static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+		                                     static_cast<int>(std::max(exponent, 1u)) - 25);
+		return (bits & 0x8000u) != 0 ? -value : value;
+	};
+	switch (format) {
+		// A clear does not keep an infinity or NaN bit pattern.
+		case vk::Format::eR16G16B16A16Sfloat:
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) return false;
+			clear.float32 = std::array {half(word), half(word >> 16u), half(word), half(word >> 16u)};
+			return true;
+		case vk::Format::eR16G16B16A16Uint:
+			clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
+			return true;
+		case vk::Format::eR16G16Sfloat:
+			if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u) return false;
+			clear.float32 = std::array {half(word), half(word >> 16u), 0.0f, 0.0f};
+			return true;
+		case vk::Format::eR16G16Uint: clear.uint32 = std::array {word & 0xffffu, word >> 16u, 0u, 0u}; return true;
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+			if ((word & 0x7f800000u) == 0x7f800000u) return false;
+			clear.float32 = std::array {std::bit_cast<float>(word), std::bit_cast<float>(word),
+			                            std::bit_cast<float>(word), std::bit_cast<float>(word)};
+			return true;
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint: clear.uint32 = std::array {word, word, word, word}; return true;
+		default: return DecodePackedColorClear(format, word, clear);
+	}
 }
 
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {

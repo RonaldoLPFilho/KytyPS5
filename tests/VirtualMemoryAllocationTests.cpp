@@ -12,6 +12,8 @@
 #include "loader/systemContent.h"
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -354,6 +356,132 @@ void TestGuestAddressSpaceOwnsReservationsBeforeBacking() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPrtBackingConcurrentPoolResidency() {
+	const char* test = "PrtBackingConcurrentPoolResidency";
+	namespace Memory = Libs::LibKernel::Memory;
+	constexpr uint64_t page = SceKernelMemoryPoolCommitLen;
+	constexpr uint32_t cycles = 2000;
+	int64_t pool_offset = -1;
+	CheckOk(test, Memory::KernelMemoryPoolExpand(0, Memory::KernelGetDirectMemorySize(), page,
+	    SceKernelMemoryPoolAlignment, &pool_offset), "KernelMemoryPoolExpand");
+	void* arena = nullptr;
+	CheckOk(test, Memory::KernelMemoryPoolReserve(reinterpret_cast<void*>(0x1040000000ull),
+	    SceKernelMemoryPoolReserveLen, 0, 0, &arena), "KernelMemoryPoolReserve");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, Memory::KernelSetPrtAperture(2, arena, page * 3), "KernelSetPrtAperture");
+
+	std::atomic<bool> start {false}, done {false};
+	int writer_error = OK;
+	uint32_t completed = 0;
+	bool committed = false;
+	std::thread writer([&] {
+		while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+		for (; completed < cycles; ++completed) {
+			writer_error = Memory::KernelMemoryPoolCommit(arena, page, SceKernelMtypeC,
+			    SceKernelProtCpuRw, 0);
+			if (writer_error != OK) break;
+			committed = true;
+			writer_error = Memory::KernelMemoryPoolDecommit(arena, page, 0);
+			if (writer_error != OK) break;
+			committed = false;
+		}
+		done.store(true, std::memory_order_release);
+	});
+	std::vector<uint8_t> output(page * 3, 0x5a);
+	uint64_t attempts = 0, failures = 0;
+	start.store(true, std::memory_order_release);
+	do {
+		// Logical ownership and aperture stay valid for the entire test. Only
+		// residency changes; both committed bytes and zero holes are legal.
+		// There are no concurrent CPU writes into the mapped payload.
+		++attempts;
+		if (!Memory::TryReadPrtBacking(base, output.data(), output.size())) ++failures;
+	} while (!done.load(std::memory_order_acquire));
+	writer.join();
+	CheckOk(test, Memory::KernelSetPrtAperture(2, nullptr, 0), "KernelSetPrtAperture(clear)");
+	if (committed)
+		CheckOk(test, Memory::KernelMemoryPoolDecommit(arena, page, 0), "residency cleanup");
+	CheckOk(test, Memory::KernelMunmap(base, SceKernelMemoryPoolReserveLen), "reservation cleanup");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(pool_offset, page), "pool cleanup");
+	std::printf("[host]    %s: cycles=%u reads=%llu transient_failures=%llu\n", test,
+	    completed, static_cast<unsigned long long>(attempts), static_cast<unsigned long long>(failures));
+	CheckOk(test, writer_error, "concurrent commit/decommit");
+	Check(test, completed == cycles && attempts != 0, "residency exercise did not complete");
+	Check(test, failures == 0, "valid PRT residency transitions exposed incomplete mapping publication");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void CheckPrtBackingConcurrentMapping(unsigned kind) {
+	const char* test = kind == 0 ? "PrtBackingConcurrentDirectResidency" :
+	    kind == 1 ? "PrtBackingConcurrentFlexibleResidency" : "PrtBackingConcurrentPoolRetag";
+	namespace Memory = Libs::LibKernel::Memory;
+	constexpr uint64_t page = 0x10000, arena_size = 0x200000;
+	constexpr uint32_t cycles = 2000;
+	int64_t physical = -1;
+	CheckOk(test, Memory::KernelAllocateDirectMemory(0, Memory::KernelGetDirectMemorySize(),
+	    page, page, 0, &physical), "direct allocation");
+	void* arena = reinterpret_cast<void*>(0x1080000000ull);
+	CheckOk(test, Memory::KernelReserveVirtualRange(&arena, arena_size, 0, arena_size),
+	        "reserve PRT arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, Memory::KernelSetPrtAperture(2, arena, 3 * page), "set PRT aperture");
+	std::atomic<bool> start {false}, done {false};
+	uint32_t completed = 0;
+	int writer_error = OK;
+	std::thread writer([&] {
+		while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+		for (; completed < cycles; ++completed) {
+			void* address = arena;
+			if (kind == 0) {
+				writer_error = Memory::KernelMapDirectMemory(&address, page, SceKernelProtCpuRw,
+				    SceKernelMapFixed, physical, page);
+			} else if (kind == 1) {
+				writer_error = Memory::KernelMapNamedFlexibleMemory(&address, page, SceKernelProtCpuRw,
+				    SceKernelMapFixed, "prt_transition");
+			} else {
+				writer_error = Memory::KernelMemoryPoolReserve(arena, arena_size, arena_size,
+				    SceKernelMapFixed, &address);
+			}
+			if (writer_error != OK) break;
+			writer_error = Memory::KernelReserveVirtualRange(&address,
+			    kind == 2 ? arena_size : page, SceKernelMapFixed, page);
+			if (writer_error != OK) break;
+		}
+		done.store(true, std::memory_order_release);
+	});
+	std::vector<uint8_t> output(3 * page);
+	uint64_t attempts = 0, failures = 0, logical_holes = 0, missing_backing = 0;
+	start.store(true, std::memory_order_release);
+	do {
+		// Before and after both operations the complete span is owned: a mapped
+		// first page or its reserved placeholder, followed by two reserved pages.
+		// No CPU payload writer races this read; committed bytes or holes are valid.
+		const char* reason = nullptr;
+		++attempts;
+		if (!Memory::TryReadPrtBacking(base, output.data(), output.size(), &reason)) {
+			++failures;
+			logical_holes += reason && std::strcmp(reason, "missing-logical-ownership") == 0;
+			missing_backing += reason && std::strcmp(reason, "missing-committed-backing") == 0;
+		}
+	} while (!done.load(std::memory_order_acquire));
+	writer.join();
+	CheckOk(test, Memory::KernelSetPrtAperture(2, nullptr, 0), "clear PRT aperture");
+	CheckOk(test, Memory::KernelMunmap(base, arena_size), "release arena");
+	CheckOk(test, Memory::KernelReleaseDirectMemory(physical, page), "release physical memory");
+	std::printf("[host]    %s: cycles=%u reads=%llu transient_failures=%llu logical_holes=%llu missing_backing=%llu\n",
+	    test, completed, static_cast<unsigned long long>(attempts),
+	    static_cast<unsigned long long>(failures), static_cast<unsigned long long>(logical_holes),
+	    static_cast<unsigned long long>(missing_backing));
+	CheckOk(test, writer_error, "concurrent mapping / reservation");
+	Check(test, completed == cycles && attempts != 0, "residency exercise did not complete");
+	Check(test, failures == 0, "valid PRT transitions exposed incomplete publication");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestPrtBackingConcurrentDirectResidency() { CheckPrtBackingConcurrentMapping(0); }
+void TestPrtBackingConcurrentFlexibleResidency() { CheckPrtBackingConcurrentMapping(1); }
+void TestPrtBackingConcurrentPoolRetag() { CheckPrtBackingConcurrentMapping(2); }
+
 void TestPrtBackingReadPreservesSparseResidency() {
 	const char*        test         = "PrtBackingReadPreservesSparseResidency";
 	constexpr uint64_t commit_size  = SceKernelMemoryPoolCommitLen;
@@ -411,9 +539,14 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	        Libs::LibKernel::Memory::KernelSetPrtAperture(
 	            2, reinterpret_cast<void*>(unowned_prt), commit_size),
 	        "KernelSetPrtAperture(unowned)");
+	const char* failure_reason = nullptr;
 	Check(test,
-	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size),
+	      !Libs::LibKernel::Memory::TryReadPrtBacking(unowned_prt, bytes.data(), commit_size,
+	                                                &failure_reason),
 	      "PRT backing read accepted an unowned virtual range");
+	Check(test, failure_reason != nullptr &&
+	            std::strcmp(failure_reason, "missing-logical-ownership") == 0,
+	      "PRT failure diagnostic did not identify missing virtual ownership");
 	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
 	        "KernelSetPrtAperture(clear)");
 
@@ -549,6 +682,58 @@ void TestFlexibleMemoryUsesSharedBacking() {
 
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+// The host protection of one page as "rw", "r-" or "--", from /proc/self/maps.
+std::string HostProtection(uint64_t addr) {
+	std::string result;
+	if (std::FILE* maps = std::fopen("/proc/self/maps", "r"); maps != nullptr) {
+		char line[512];
+		while (result.empty() && std::fgets(line, sizeof(line), maps) != nullptr) {
+			unsigned long start = 0, end = 0;
+			char          perms[8] {};
+			if (std::sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3 && addr >= start &&
+			    addr < end) {
+				result.assign(perms, 2);
+			}
+		}
+		std::fclose(maps);
+	}
+	return result;
+}
+
+void TestPartialUnmapKeepsNeighbourViews() {
+	const char* test = "PartialUnmapKeepsNeighbourViews";
+	const auto  base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw, "partial");
+	const auto  last = base + SceKernelPageSize * 2;
+	// The GPU tracker write-protects the pages it uploaded.
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
+	                                                      Common::VirtualMemory::Mode::Read),
+	      "tracker protection failed");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+	Check(test, HostProtection(base) == "r-" && HostProtection(last) == "rw",
+	      "a partial unmap reset the protection of the pages around it");
+	constexpr uint64_t value = 0x5352554f42484749ull;
+	Check(test,
+	      Libs::LibKernel::Memory::TryWriteBacking(base, &value, sizeof(value)) &&
+	          Libs::LibKernel::Memory::TryWriteBacking(last, &value, sizeof(value)),
+	      "the pages around a partial unmap lost their backing entries");
+	Check(test,
+	      !Libs::LibKernel::Memory::TryWriteBacking(base + SceKernelPageSize, &value,
+	                                                sizeof(value)),
+	      "the unmapped page kept its backing entry");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize,
+	                                                      Common::VirtualMemory::Mode::ReadWrite),
+	      "tracker unprotection failed");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize), "KernelMunmap(first)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(last, SceKernelPageSize), "KernelMunmap(last)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
 
 void TestFlexibleDmemCompatAndAlignmentFlags() {
 	const char* test     = "FlexibleDmemCompatAndAlignmentFlags";
@@ -765,6 +950,14 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 	Check(test, AvailableFlexibleMemory(test) == baseline,
 	      "private guest stack changed flexible backing capacity");
 
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestGuestStackExitLifecycle() {
+	const char* test = "GuestStackExitLifecycle";
+	Check(test, Libs::LibKernel::TestGuestStackExitLifecycle(),
+	      "normal return or explicit pthread exit lost its host frame/TLS/return "
+	      "value");
 	std::printf("[host]    %-48s ok\n", test);
 }
 
@@ -1026,6 +1219,8 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	const auto phys = static_cast<uint64_t>(phys_addr);
 	Check(test, Libs::LibKernel::Memory::TestGuestAddressRangeIsOwned(base, SceKernelPageSize * 4),
 	      "direct mapping escaped the guest owner");
+	Check(test, Libs::LibKernel::Memory::IsUniqueGuestBackingRange(base, SceKernelPageSize),
+	      "single mapping should establish a unique backing range");
 	void* alias = nullptr;
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
@@ -1033,6 +1228,9 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            "prospero_direct_alias"),
 	        "KernelMapNamedDirectMemory(alias)");
 	const auto alias_base = reinterpret_cast<uint64_t>(alias);
+	Check(test, !Libs::LibKernel::Memory::IsUniqueGuestBackingRange(base, SceKernelPageSize) &&
+	      !Libs::LibKernel::Memory::IsUniqueGuestBackingRange(alias_base, SceKernelPageSize),
+	      "new physical alias must invalidate cached uniqueness");
 
 	constexpr uint64_t alias_test_value = 0x4b595459444d454dull; // "KYTYDMEM"
 	*reinterpret_cast<uint64_t*>(base)  = alias_test_value;
@@ -1104,6 +1302,8 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	    test,
 	    Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize * 2),
 	    "KernelMunmap(direct right cleanup)");
+	Check(test, Libs::LibKernel::Memory::IsUniqueGuestBackingRange(alias_base, SceKernelPageSize),
+	      "removing original mappings must invalidate cached alias ranges");
 	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(alias_base, SceKernelPageSize * 4),
 	        "KernelMunmap(direct alias cleanup)");
 	CheckOk(test,
@@ -1349,6 +1549,23 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	Check(test,
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x100, 0x200) == 0x200,
 	      "ClampRangeSize did not cross adjacent committed mappings");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x100,
+	      "cached committed interval changed a contained request");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(cached right mapping)");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x80,
+	      "unmap retained a cached committed interval");
+	right = reinterpret_cast<void*>(base + SceKernelPageSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &right, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "adjacent_right"),
+	        "KernelMapNamedFlexibleMemory(remap cached right)");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0x80, 0x100) == 0x100,
+	      "remap did not restore the complete committed interval");
 	Check(test,
 	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize * 2,
 	                                                      Common::VirtualMemory::Mode::Read),
@@ -2510,6 +2727,25 @@ void TestModuleRelocationUsesWritableHostMapping() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+	if (argc == 2 && std::strcmp(argv[1], "--prt-direct-concurrent-only") == 0) {
+		RunTest(TestPrtBackingConcurrentDirectResidency);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--prt-publication-only") == 0) {
+		RunTest(TestPrtBackingConcurrentDirectResidency);
+		RunTest(TestPrtBackingConcurrentFlexibleResidency);
+		RunTest(TestPrtBackingConcurrentPoolRetag);
+		RunTest(TestPrtBackingConcurrentPoolResidency);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--prt-concurrent-only") == 0) {
+		RunTest(TestPrtBackingConcurrentPoolResidency);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+	if (argc == 2 && std::strcmp(argv[1], "--guest-stack-exit-only") == 0) {
+		RunTest(TestGuestStackExitLifecycle);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -2519,14 +2755,22 @@ int main(int argc, char** argv) {
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
+	RunTest(TestPrtBackingConcurrentPoolResidency);
+	RunTest(TestPrtBackingConcurrentDirectResidency);
+	RunTest(TestPrtBackingConcurrentFlexibleResidency);
+	RunTest(TestPrtBackingConcurrentPoolRetag);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
 	RunTest(TestFlexibleMemoryUsesSharedBacking);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	RunTest(TestPartialUnmapKeepsNeighbourViews);
+#endif
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
+	RunTest(TestGuestStackExitLifecycle);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);
 	RunTest(TestFragmentedBackingUnmapRollback);

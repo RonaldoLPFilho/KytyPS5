@@ -15,10 +15,21 @@ SamplerCache::~SamplerCache() {
 }
 
 vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
-	Common::LockGuard lock(m_mutex);
-
 	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+	// Samplers live as long as the cache: a thread's recent lookups need neither the lock nor
+	// the map.
+	struct Recent {
+		const SamplerCache* owner = nullptr;
+		SamplerKey          key {};
+		vk::Sampler         sampler;
+	};
+	thread_local std::array<Recent, 64> recent {};
+	auto& slot = recent[SamplerKeyHash {}(key) % recent.size()];
+	if (slot.owner == this && slot.key == key) return slot.sampler;
+
+	Common::LockGuard lock(m_mutex);
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
+		slot = {this, key, iter->second};
 		return iter->second;
 	}
 
@@ -154,6 +165,7 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess || vk_sampler == nullptr);
 
 	m_samplers.emplace(key, vk_sampler);
+	slot = {this, key, vk_sampler};
 	return vk_sampler;
 }
 

@@ -1,5 +1,7 @@
 #include "common/hostException.h"
 
+#include "common/guardedCopy.h"
+
 #include <atomic>
 #include <cstdio>
 
@@ -82,8 +84,27 @@ bool InitializeThreadSignalStack() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static std::atomic<GuardPageHandler> g_guard_page_handler {nullptr};
+
+void SetGuardPageHandler(GuardPageHandler handler) {
+	g_guard_page_handler.store(handler, std::memory_order_release);
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
+
+	if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+		const auto handler = g_guard_page_handler.load(std::memory_order_acquire);
+		return handler != nullptr && exception_record->NumberParameters >= 2 &&
+		               handler(exception_record->ExceptionInformation[1], exception->ContextRecord)
+		           ? EXCEPTION_CONTINUE_EXECUTION
+		           : EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	// A guarded copy reached a page without access: it stops there (never the guest's fault).
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ResumeGuardedCopy(exception->ContextRecord)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
 	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {

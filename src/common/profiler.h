@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
@@ -23,18 +24,32 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 namespace Profiler {
 
+// Set while the Tracy profiler runs (--profiler-direction Network). Blocks check it inline:
+// without a profiler a block costs one load, not calls into the common and Tracy libraries.
+inline std::atomic<bool> g_active {false};
+
 class ScopedBlock {
 public:
-	explicit ScopedBlock(const tracy::SourceLocationData* source_location);
+	explicit ScopedBlock(const tracy::SourceLocationData* source_location) {
+		if (g_active.load(std::memory_order_relaxed)) {
+			Begin(source_location);
+		}
+	}
 	ScopedBlock(const ScopedBlock&)            = delete;
 	ScopedBlock& operator=(const ScopedBlock&) = delete;
 	ScopedBlock(ScopedBlock&&)                 = delete;
 	ScopedBlock& operator=(ScopedBlock&&)      = delete;
-	~ScopedBlock();
+	~ScopedBlock() {
+		if (m_zone.has_value()) {
+			End();
+		}
+	}
 
 	void End();
 
 private:
+	void Begin(const tracy::SourceLocationData* source_location);
+
 	std::optional<tracy::ScopedZone> m_zone;
 };
 

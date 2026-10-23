@@ -70,6 +70,9 @@ void SetAxis(int id, Axis axis, int value);
 void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void ResetInputState();
+// Scripted input (live `pad`, automated tours): for `seconds` from now the game reads these stick values (0..255, 128
+// centre; -1: the host's) and these buttons OR-ed into the host's.
+void SetScriptedInput(int left_x, int left_y, int right_x, int right_y, uint32_t buttons, double seconds);
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);

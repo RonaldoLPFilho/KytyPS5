@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -98,8 +99,9 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 } // namespace
 
 ResourcePlan::~ResourcePlan() {
+	// Plan values only refer to each other (CompileResult clones them), so they die together.
 	for (auto& inst: value_storage) {
-		inst.Invalidate();
+		inst.DropLinks();
 	}
 }
 
@@ -112,12 +114,15 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 }
 
 Program::~Program() {
-	// Values may cross block boundaries. Detach all arguments before any block starts destroying
-	// its instruction storage so reverse-use links always point to live definitions.
-	for (auto* block: blocks) {
+	// Values cross block boundaries and the plan values: drop every link before any storage is destroyed,
+	// all at once rather than unlinking edge by edge.
+	for (auto& block: block_storage) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropLinks();
 		}
+	}
+	for (auto& inst: value_storage) {
+		inst.DropLinks();
 	}
 }
 
@@ -131,12 +136,15 @@ Program& Program::operator=(Program&& other) noexcept {
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
 	CompiledShaderInfo result {
+	    .bda_read_plan = BuildBdaReadPlan(*this),
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
 	    .wave_size       = wave_size,
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
+	    .table_mode      = table_mode,
+	    .table_plan      = std::move(table_plan),
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
@@ -149,7 +157,9 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 }
 
 bool EquivalentValue(const ResourcePlan& program, Value left, Value right) {
-	std::vector<std::pair<const Inst*, const Inst*>> visited;
+	// Called per candidate pair while planning: one allocation per thread, not per call.
+	thread_local std::vector<std::pair<const Inst*, const Inst*>> visited;
+	visited.clear();
 	return EquivalentValue(program, left, right, visited);
 }
 
@@ -182,6 +192,11 @@ Value ResolveInvariantPhi(const ResourcePlan& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+bool ValidationEnabled() {
+	static const bool enabled = KYTY_BUILD != KYTY_BUILD_RELEASE || std::getenv("KYTY_IR_VALIDATE") != nullptr;
+	return enabled;
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

@@ -5,7 +5,9 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <utility>
@@ -25,6 +27,9 @@ enum class MemoryUsage : uint8_t {
 	Upload,
 	Download,
 	Stream,
+	// Video memory bound page by page as it is used (Buffer::MakeResident); a page with none reads zero and drops writes
+	// (GraphicContext::sparse_residency_buffers).
+	SparseDeviceLocal,
 };
 
 inline constexpr vk::BufferUsageFlags ReadFlags =
@@ -46,6 +51,7 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	[[nodiscard]] bool               HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
 	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
@@ -67,12 +73,26 @@ public:
 	                                                   vk::AccessFlagBits::eMemoryWrite,
 	              vk::AccessFlags destination_after  = vk::AccessFlagBits::eMemoryRead |
 	                                                   vk::AccessFlagBits::eMemoryWrite);
+	// A guest copy in a run of copies (CommandBuffer::CopyRunHandle: the run's barriers).
+	void CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset, uint64_t destination_offset,
+	               uint64_t size);
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
+	// MemoryUsage::SparseDeviceLocal: binds video memory to the pages of [offset, offset + size) without any and zeroes
+	// them (a fill recorded in the current command buffer, whose submission waits for the binding on the GPU:
+	// CommandScheduler::WaitBeforeNextSubmit). Other buffers: nothing.
+	void MakeResident(uint64_t offset, uint64_t size);
 
-	// BufferCache state lives directly on the resource.
-	bool   is_deleted   = false;
+	// BufferCache state lives directly on the resource (is_deleted also read by a speculative translation's thread).
+	std::atomic<bool> is_deleted {false};
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// A shader read it through the BDA page table while no buffer held its pages (FaultManager): such reads touch no
+	// LRU entry, so the stale-buffer retirement passes it over (BufferCache::RunGarbageCollector).
+	bool bda_read = false;
+	// The command buffer (CommandScheduler::CommandSerial) that last recorded a copy or fill into it or an image's
+	// bytes (TextureCache::DownloadImageData): writes that need not synchronize their pages first (a shader's write
+	// does, BufferCache::ObtainBuffer). Uploads into it then stay in order in that buffer (UploadPrologue).
+	uint64_t written_serial = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -93,17 +113,22 @@ private:
 	uint64_t                      m_size;
 	bool                          m_coherent = false;
 	std::span<uint8_t>            m_mapped;
+	struct Sparse;
+	std::unique_ptr<Sparse> m_sparse;
 };
 
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, vk::BufferUsageFlags flags = AllFlags);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+	// What was fenced with `pending` (a speculative translation's work: CommandScheduler::PendingTick and up) gets
+	// `tick`.
+	void ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept;
 
 private:
 	friend struct StreamBufferTestAccess;

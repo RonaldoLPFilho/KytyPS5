@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/memoryTracker.h"
+#include "live-counters.h"
 
 #include "common/assert.h"
 
@@ -68,20 +69,61 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+// The bit queries read under the region lock's sequence (TrackingSpinLock::ReadShared): every
+// change of the bits holds the lock.
+template <typename Query>
+static bool QueryRegion(RegionManager* manager, Query&& query) {
+	return manager->lock.ReadShared(query);
+}
+
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu>(offset, bytes); });
 	});
 }
 
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
-		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
+		return QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu>(offset, bytes); });
 	});
+}
+
+bool MemoryTracker::IsRegionFullyCpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// (Missing regions were never tracked: all CPU-dirty.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Cpu, true>(offset, bytes); });
+	});
+}
+
+bool MemoryTracker::IsRegionFullyGpuModified(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// Missing regions start CPU-dirty, so they must also participate in this test.
+	return !Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		return !QueryRegion(manager, [&] { return manager->IsModified<DirtySource::Gpu, true>(offset, bytes); });
+	});
+}
+
+bool MemoryTracker::TryInvalidateCpuWriteWindow(uint64_t fault, uint64_t begin, uint64_t size,
+                                                std::unique_lock<TrackingSpinLock>* handoff) noexcept {
+	CheckNotInUploadCallback();
+	if (!GuestRange {begin, size}.Valid() || size <= TRACKER_PAGE_SIZE ||
+	    begin % TRACKER_PAGE_SIZE || size % TRACKER_PAGE_SIZE || fault < begin ||
+	    fault - begin >= size ||
+	    begin / TRACKER_REGION_SIZE != (begin + size - 1) / TRACKER_REGION_SIZE)
+		return false;
+	auto* manager = m_regions[begin / TRACKER_REGION_SIZE].load(std::memory_order_acquire);
+	if (!manager) return false;
+	std::scoped_lock lock(manager->lock);
+	if (handoff != nullptr) handoff->unlock();
+	if (manager->IsModified<DirtySource::Gpu>(begin - manager->GetCpuAddr(), size)) return false;
+	// The GPU ownership check and permission change share one region lock.
+	manager->ChangeState<DirtySource::Cpu, true>(begin, size);
+	LiveCounters::Add(LiveCounters::WindowPages, size / TRACKER_PAGE_SIZE);
+	LiveCounters::AddGranule(begin, LiveCounters::GWindowPages, size / TRACKER_PAGE_SIZE);
+	return true;
 }
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
@@ -90,6 +132,20 @@ void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
 	});
+}
+
+bool MemoryTracker::MarkRegionAsCpuDirtyKeepProtection(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	if (IsRegionGpuModified(vaddr, size)) return false;
+	// (Untracked regions are all CPU-dirty; a page the GPU marks meanwhile is the GPU thread's, which calls this.)
+	return !Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		return !manager->MarkCpuDirtyKeepProtection(manager->GetCpuAddr() + offset, bytes);
+	});
+}
+
+void MemoryTracker::NoteHostWrite(uint64_t vaddr, uint64_t size) {
+	Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t, uint64_t) { manager->NoteHostWrite(); });
 }
 
 void MemoryTracker::MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {

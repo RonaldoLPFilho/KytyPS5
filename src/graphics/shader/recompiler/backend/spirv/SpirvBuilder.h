@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
@@ -61,6 +62,10 @@ private:
 	static void AppendInstruction(std::vector<uint32_t>& section, uint32_t opcode,
 	                              std::initializer_list<uint32_t> operands);
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
+	uint32_t    Type(uint32_t opcode, const uint32_t* operands, size_t count);
+	uint32_t    Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count);
+	// The id of the declaration m_key describes, or 0 after reserving a new one for it.
+	uint32_t    FindOrReserveDeclaration(uint32_t& id);
 	void        AddCapability(std::initializer_list<uint32_t> operands);
 	void        AddExtension(const char* name);
 	void        AddExtInstImport(uint32_t id, const char* name);
@@ -81,7 +86,16 @@ private:
 	std::set<uint32_t>                        m_required_capabilities;
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
-	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
+	struct WordsHash {
+		size_t operator()(const std::vector<uint32_t>& words) const noexcept {
+			uint64_t hash = 0x9E3779B97F4A7C15ull ^ words.size();
+			for (const auto word: words) hash = (hash ^ word) * 0xFF51AFD7ED558CCDull;
+			return static_cast<size_t>(hash ^ (hash >> 32u));
+		}
+	};
+	// Only looked up (ids are assigned in first-use order), so hashed; m_key is the lookup key's scratch.
+	std::unordered_map<std::vector<uint32_t>, uint32_t, WordsHash> m_declaration_ids;
+	std::vector<uint32_t>                     m_key;
 	size_t                                    m_unpatched_phi_incomings = 0;
 };
 

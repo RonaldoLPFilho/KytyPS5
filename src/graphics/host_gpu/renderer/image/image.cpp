@@ -7,15 +7,37 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "kernel/memory.h"
+#include "live-trace.h"
+#include "speculation-state.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <xxhash.h>
+
+extern "C" {
+// 1: drop a repeated-write barrier that repeats an identical transition of the
+// same image inside one transit group.
+volatile std::atomic<uint32_t> kyty_local_image_barrier_dedupe {0};
+}
 
 namespace Libs::Graphics {
 
 namespace {
+
+// A group is opened and read by the thread that records the commands (each translating thread its own; ids are
+// unique across them). Zero means no group is open, so nothing can match it and nothing is skipped.
+thread_local uint64_t g_transit_group = 0;
+std::atomic<uint64_t> g_transit_group_next {1};
+
+std::atomic<uint64_t> g_image_serial_next {1};
+
+std::atomic<uint64_t> g_image_state_epoch {1};
+
+[[nodiscard]] inline bool DedupeTransitGroups() {
+	return kyty_local_image_barrier_dedupe.load(std::memory_order_relaxed) != 0;
+}
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
@@ -97,23 +119,108 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
-Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
+// A speculative translation's image state (speculation-state.h): its own, from the image's when it first used it;
+// the open segment notes how it found it.
+Spec::ImageEntry* Image::SpeculativeEntry() {
+	auto* spec = Spec::Current();
+	if (spec == nullptr) return nullptr;
+	const auto [found, inserted] = spec->overlay_index.try_emplace(this, spec->overlay.size());
+	Spec::ImageEntry* entry      = nullptr;
+	if (inserted) {
+		// (As a speculation before it not committed yet leaves it: the commit then finds it there.)
+		const auto* chain = spec->ChainImage(this, serial);
+		entry             = &spec->overlay.emplace_back();
+		entry->image      = this;
+		entry->serial     = serial;
+		if (chain != nullptr) {
+			entry->state        = chain->state;
+			entry->subresources = chain->subresources;
+			entry->group        = chain->group;
+		} else {
+			const StateLock lock(*this);
+			entry->state        = backing.state;
+			entry->subresources = backing.subresource_states;
+			entry->group        = transit_group;
+		}
+	} else {
+		entry = &spec->overlay[found->second];
+	}
+	if (!entry->used) {
+		entry->used               = true;
+		entry->found              = entry->state;
+		entry->found_subresources = entry->subresources;
+		entry->found_group        = entry->group;
+		spec->used.push_back(found->second);
+	}
+	return entry;
+}
+
+const Image::Barriers& Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	auto& state              = backing.state;
-	auto& subresource_states = backing.subresource_states;
+	auto* const entry = SpeculativeEntry();
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
-
 	const bool partial =
 	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
-	const bool has_subresource_states = !subresource_states.empty();
 
-	Barriers barriers;
+	// Reused per thread (each caller records the barriers before the next transition): a vector
+	// per transition was one of the render thread's most frequent allocations.
+	thread_local Barriers barriers;
+	barriers.clear();
+	// Guest draws and dispatches repeating a shader write in the same layout and access are ordered by the
+	// guest's own barriers (partial flushes and cache events record full barriers, EmitGlobalBarrier), as on
+	// the console, where nothing else orders the storage writes of consecutive draws: no barrier between them
+	// (each was also a render pass break: ~800 per frame in the deferred decal pass). A repeated write after
+	// any other access (an upload, a copy, the emulator's own compute) keeps its barrier.
+	const bool     guest        = g_transit_group != 0;
+	constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite |
+	                              vk::AccessFlagBits2::eMemoryWrite;
+	const auto     in_place     = [&](const VulkanImageState& state, uint64_t group) {
+		const bool repeated_write = static_cast<bool>(state.access_mask & write_access);
+		return state.layout == destination_layout && state.access_mask == destination_access &&
+		       (!repeated_write || (guest && state.guest) ||
+		        (DedupeTransitGroups() && g_transit_group != 0 && group == g_transit_group));
+	};
+	// An image already in the layout and access as a whole (a table draw's textures, every draw): nothing changes, so
+	// neither the state lock nor the state epoch, which moving made every table draw after it check and transit its
+	// images again. The barrier state's writer is this thread (the presentation's own transitions run under the
+	// renderer's lock); a speculation's thread only reads it, under the lock.
+	if (entry == nullptr && !partial && backing.subresource_states.empty() && in_place(backing.state, transit_group))
+		return barriers;
+	// The same for a part of it (a view's levels or layers: textures streamed in from their small levels, sampled from
+	// a base level above 0), read only: the image, as a whole or in each subresource of the part, already in the layout
+	// with that access, as is its whole-image state. Before, such a transition took the lock, moved the state epoch
+	// (every table draw after it checked and transited its images again) and split a uniform image into subresource
+	// states for good, which every later transition of it walked.
+	if (entry == nullptr && partial && !static_cast<bool>(destination_access & write_access) &&
+	    backing.state.layout == destination_layout && backing.state.access_mask == destination_access) {
+		bool all = true;
+		for (uint32_t level = range->base_level;
+		     all && !backing.subresource_states.empty() && level < range->base_level + range->level_count; ++level)
+			for (uint32_t layer = range->base_layer; layer < range->base_layer + range->layer_count; ++layer) {
+				const auto index = level * info.resources.layers + layer;
+				if (index >= backing.subresource_states.size() || backing.subresource_states[index].layout != destination_layout ||
+				    backing.subresource_states[index].access_mask != destination_access) {
+					all = false;
+					break;
+				}
+			}
+		if (all) return barriers;
+	}
+	std::optional<StateLock> lock;
+	if (entry == nullptr) {
+		lock.emplace(*this);
+		MoveImageStateEpoch();
+	}
+	auto&      state                  = entry != nullptr ? entry->state : backing.state;
+	auto&      subresource_states     = entry != nullptr ? entry->subresources : backing.subresource_states;
+	auto&      group                  = entry != nullptr ? entry->group : transit_group;
+	const bool has_subresource_states = !subresource_states.empty();
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
 			subresource_states.resize(info.resources.levels * info.resources.layers, state);
@@ -129,11 +236,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				EXIT_IF(index >= subresource_states.size());
 				auto& subresource_state = subresource_states[index];
 
-				constexpr auto write_access = vk::AccessFlagBits2::eTransferWrite |
-				                              vk::AccessFlagBits2::eShaderWrite |
-				                              vk::AccessFlagBits2::eMemoryWrite;
-				const bool     repeated_write =
-				    static_cast<bool>(subresource_state.access_mask & write_access);
+				const bool repeated_write =
+				    static_cast<bool>(subresource_state.access_mask & write_access) &&
+				    !(guest && subresource_state.guest);
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -152,7 +257,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 					barrier.subresourceRange.baseArrayLayer = layer;
 					barrier.subresourceRange.layerCount     = 1;
 					barriers.push_back(barrier);
-					subresource_state = {destination_stage, destination_access, destination_layout};
+					subresource_state = {destination_stage, destination_access, destination_layout, guest};
 				}
 			}
 		}
@@ -161,14 +266,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 			subresource_states.clear();
 		}
 	} else {
-		constexpr auto write_access   = vk::AccessFlagBits2::eTransferWrite |
-		                                vk::AccessFlagBits2::eShaderWrite |
-		                                vk::AccessFlagBits2::eMemoryWrite;
-		const bool     repeated_write = static_cast<bool>(state.access_mask & write_access);
-		if (state.layout == destination_layout && state.access_mask == destination_access &&
-		    !repeated_write) {
-			return {};
-		}
+		if (in_place(state, group)) return barriers;
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;
@@ -188,12 +286,99 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
-	state = {destination_stage, destination_access, destination_layout};
+	state = {destination_stage, destination_access, destination_layout, guest};
+	group = g_transit_group;
 	return barriers;
+}
+
+const VulkanImageState& Image::CurrentState() const {
+	if (const auto* spec = Spec::Current()) {
+		if (const auto found = spec->overlay_index.find(this); found != spec->overlay_index.end())
+			return spec->overlay[found->second].state;
+		if (const auto* chain = spec->ChainImage(this, serial)) return chain->state;
+	}
+	return backing.state;
+}
+
+void Image::RestoreState(const VulkanImageState& state, const std::vector<VulkanImageState>& subresources,
+                         vk::CommandBuffer command_buffer) {
+	const StateLock       lock(*this);
+	MoveImageStateEpoch();
+	thread_local Barriers barriers;
+	barriers.clear();
+	const auto add = [&](const VulkanImageState& from, const VulkanImageState& to, uint32_t level, uint32_t levels,
+	                     uint32_t layer, uint32_t layers) {
+		if (from.layout == to.layout && from.access_mask == to.access_mask && from.pl_stage == to.pl_stage) return;
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = from.pl_stage;
+		barrier.srcAccessMask       = from.access_mask;
+		barrier.dstStageMask        = to.pl_stage;
+		barrier.dstAccessMask       = to.access_mask;
+		barrier.oldLayout           = from.layout;
+		barrier.newLayout           = to.layout;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = backing.image;
+		barrier.subresourceRange    = {FullAspectMask(backing.format), level, levels, layer, layers};
+		barriers.push_back(barrier);
+	};
+	if (backing.subresource_states.empty() && subresources.empty()) {
+		add(backing.state, state, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
+	} else {
+		const uint32_t layers = info.resources.layers;
+		const uint32_t count  = info.resources.levels * layers;
+		EXIT_IF((!backing.subresource_states.empty() && backing.subresource_states.size() != count) ||
+		        (!subresources.empty() && subresources.size() != count));
+		for (uint32_t index = 0; index < count; ++index)
+			add(backing.subresource_states.empty() ? backing.state : backing.subresource_states[index],
+			    subresources.empty() ? state : subresources[index], index / layers, 1, index % layers, 1);
+	}
+	backing.state              = state;
+	backing.subresource_states = subresources;
+	if (barriers.empty()) return;
+	m_scheduler.EndRendering();
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
+	dependency.pImageMemoryBarriers    = barriers.data();
+	command_buffer.pipelineBarrier2(dependency);
+}
+
+uint64_t ImageStateEpoch() noexcept {
+	return g_image_state_epoch.load(std::memory_order_acquire);
+}
+
+void MoveImageStateEpoch() noexcept {
+	g_image_state_epoch.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void BeginTransitGroup() noexcept {
+	// Groups are only compared for equality: each thread takes a block of numbers at a time (an atomic add per group
+	// was 0.6% of the render thread).
+	constexpr uint64_t    Block = uint64_t {1} << 20u;
+	thread_local uint64_t next = 0, end = 0;
+	if (next == end) {
+		next = g_transit_group_next.fetch_add(Block, std::memory_order_relaxed);
+		end  = next + Block;
+	}
+	g_transit_group = next++;
+}
+
+void EndTransitGroup() noexcept {
+	g_transit_group = 0;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	if (LiveTrace::WriteTicks()) {
+		constexpr auto writes = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
+		                        vk::AccessFlagBits2::eColorAttachmentWrite |
+		                        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+		                        vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite;
+		LiveTrace::Event(LiveTrace::ImageUse, info.data.address,
+		                 (info.data.size & 0xffffffffu) |
+		                     (static_cast<bool>(destination_access & writes) ? uint64_t {1} << 63u : 0) |
+		                     static_cast<uint64_t>(destination_layout) << 32u);
+	}
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -205,7 +390,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 		destination_stage |=
 		    vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
 	}
-	const auto barriers =
+	const auto& barriers =
 	    GetBarriers(destination_layout, destination_access, destination_stage, range);
 	if (barriers.empty()) {
 		return;
@@ -231,7 +416,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};
@@ -271,7 +456,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	buffer_barrier.buffer              = buffer;
 	buffer_barrier.offset              = offset;
 	buffer_barrier.size                = size;
-	const auto image_barriers =
+	const auto& image_barriers =
 	    GetBarriers(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	                vk::PipelineStageFlagBits2::eCopy, {});
 	vk::DependencyInfo dependency {};
@@ -652,7 +837,8 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
-    : info(image_info), m_graphics(graphics), m_scheduler(scheduler) {
+    : serial(g_image_serial_next.fetch_add(1, std::memory_order_relaxed)), info(image_info),
+      m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
 	m_cpu_dirty =
@@ -690,6 +876,36 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+}
+
+void Image::PrepareReuse(const ImageInfo& image_info) {
+	info               = image_info;
+	m_cpu_dirty        = !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
+	m_maybe_cpu_dirty  = false;
+	m_maybe_hash_valid = false;
+	m_maybe_cpu_hash   = 0;
+	m_gpu_modified     = false;
+	m_buffer_modified  = false;
+	m_stencil_modified = false;
+	m_partial_dirty    = false;
+	m_dirty_ranges.clear();
+	usage               = {};
+	binding             = {};
+	guest_alias         = false;
+	query_epoch         = 0;
+	track_addr          = 0;
+	track_addr_end      = 0;
+	untracked_holes.clear();
+	partial_hashes.clear();
+	depth_id            = {};
+	frame_accessed_last = 0;
+	staged_ring         = nullptr;
+	staged_offset       = 0;
+	staged_serial       = 0;
+	level_view          = UINT32_MAX;
+	level_begin         = 0;
+	level_end           = 0;
+	++validity;
 }
 
 uint64_t Image::HashGuestEdges() const {

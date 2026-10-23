@@ -22,6 +22,8 @@ struct RedZonePatchResult {
 	uint64_t control_flow_memory_instruction_count    = 0;
 	uint64_t unrelocatable_memory_instruction_count   = 0;
 	uint64_t indirect_red_zone_function_count         = 0;
+	uint64_t swept_instruction_count                  = 0;
+	uint64_t live_call_count                          = 0;
 };
 
 void RegisterRedZonePatchModule(void* module_ptr, uint64_t module_size, void* trampoline_area_ptr,

@@ -55,6 +55,10 @@ bool FullscreenEnabled() {
 	return g_config->fullscreen_enabled;
 }
 
+bool HdrEnabled() {
+	return g_config->hdr_enabled;
+}
+
 uint32_t GetVblankFrequency() {
 	return std::clamp(g_config->vblank_frequency, 30u, 360u);
 }

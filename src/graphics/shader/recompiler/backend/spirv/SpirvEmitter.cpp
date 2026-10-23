@@ -4,8 +4,11 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include "graphics/shader/recompiler/ir/passes/FunctionLdsLayout.h"
+
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -34,7 +37,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
-	if (!program.info.buffers.empty()) {
+	if (!program.info.buffers.empty() && !program.table_mode) {
 		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -74,6 +77,12 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (uses_gds) {
 		Expect(Kind::Gds);
 	}
+	if (program.bindings.lod_stats_count != 0) {
+		if (program.stage != ShaderType::Pixel || program.bindings.lod_stats_count != program.info.images.size()) {
+			Fail(program, "LOD feedback metadata does not match pixel images");
+		}
+		Expect(Kind::LodStats);
+	}
 	if (program.info.uses_dma) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
@@ -83,7 +92,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_search_iterations != 0u;
 	     });
-	if (uses_flattened_runtime) {
+	if (uses_flattened_runtime && !program.table_mode) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
@@ -109,7 +118,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_offset_count != (program.table_mode ? 0 : program.info.buffers.size()) ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
@@ -248,7 +257,8 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 				}
 			}
 			switch (inst.GetOpcode()) {
-				case IR::ValueOpcode::Ballot: MarkBallot(); break;
+				case IR::ValueOpcode::Ballot:
+				case IR::ValueOpcode::AnyLane: MarkBallot(); break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
@@ -317,14 +327,21 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	if (IR::ValidationEnabled()) IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
-	state.stage = program.stage;
+	state.stage     = program.stage;
+	state.lod_stats_subgroup = program.bindings.lod_stats_count != 0 &&
+	    input_info.pixel != nullptr && input_info.pixel->lod_stats_subgroup;
+
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
-	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
-	        ? 2u
-	        : 1u;
+	// (A lane-local wave64 program: one GCN lane per invocation, each 32-wide subgroup a half wave.)
+	state.lane_count = workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+	                           !program.lane_local
+	                       ? 2u
+	                       : 1u;
+	const auto function_lds = IR::PlanFunctionLdsLayout(program);
+	state.function_lds_slots = function_lds.slots;
+	state.compact_lds_dwords = function_lds.dwords;
 	state.inputs.reserve(program.info.inputs.size());
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());

@@ -16,12 +16,19 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/demonsSoulsIdle.h"
+#include "loader/demonsSoulsCopy.h"
+#include "loader/demonsSoulsGpuPages.h"
+#include "loader/demonsSoulsRenderSize.h"
+#include "loader/demonsSoulsSceneGuard.h"
+#include "loader/demonsSoulsTouchGuard.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
+#include "live-trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -779,11 +786,64 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+static RuntimeLinker* g_faulting_linker = nullptr;
+
+static std::string DescribeGuestAddress(uint64_t vaddr) {
+	if (g_faulting_linker == nullptr || vaddr == 0) {
+		return "unmapped";
+	}
+	const auto* program = g_faulting_linker->FindProgramByAddr(vaddr);
+	if (program == nullptr) {
+		return "outside any loaded module";
+	}
+	return fmt::format("{}+0x{:x}", program->file_name.filename().string(),
+	                   vaddr - program->base_vaddr);
+}
+
+std::string DescribeGuestAddressForDiagnostics(uint64_t vaddr) {
+	if (g_faulting_linker == nullptr || vaddr == 0 || g_faulting_linker->FindProgramByAddr(vaddr) == nullptr) return {};
+	return DescribeGuestAddress(vaddr);
+}
+
+static std::string DescribeGuestCode(uint64_t vaddr) {
+	if (g_faulting_linker == nullptr || g_faulting_linker->FindProgramByAddr(vaddr) == nullptr) {
+		return {};
+	}
+	std::string bytes;
+	for (uint64_t offset = 0; offset < 16u; offset++) {
+		if (g_faulting_linker->FindProgramByAddr(vaddr + offset) == nullptr) {
+			break;
+		}
+		bytes += fmt::format("{:02x}", *reinterpret_cast<const uint8_t*>(vaddr + offset));
+	}
+	return bytes;
+}
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		return true;
+	}
+
+	// The game's debug break after a failed assertion (an audio plugin's assert(0) ended 4 of ~420 runs):
+	// no debugger, so the guest goes on.  TrySkipDebugBreak gates on the instruction bytes themselves
+	// (guest "cd 41"), so no vaddr signature can let a real null access through here.
+	//   * Windows/macOS raised the assert with the wildcard address SIZE_MAX.
+	//   * On x86-64 Linux a ring-3 "int 0x41" is a #GP with no faulting address: the kernel reports
+	//     si_addr == 0 (and the #GP error code's IDT bit reads back as "write"), which otherwise
+	//     shows up in the report as a fake "write to address 0".
+	if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+	    (info->access_violation_vaddr == UINT64_MAX || info->access_violation_vaddr == 0) &&
+	    g_faulting_linker != nullptr &&
+	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+	    Loader::X64InstructionEmulator::TrySkipDebugBreak(info->native_context)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+			std::printf("Guest debug break (int 0x41) at %s skipped: no debugger\n",
+			            DescribeGuestAddress(info->exception_address).c_str());
+			std::fflush(stdout);
+		}
 		return true;
 	}
 
@@ -797,7 +857,39 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// Live trace: which guest code touches tracked pages (a readback or an invalidation follows).
+		LiveTrace::Event(LiveTrace::FaultSite, info->exception_address,
+		                 info->access_violation_vaddr | (access == GpuAccess::Write ? uint64_t {1} << 63u : 0));
+		// Host code (a runtime copy or the emulator itself): the return address at the stack
+		// top names the caller of a leaf routine such as memcpy.
+		if (LiveTrace::g_on.load(std::memory_order_relaxed) && info->rsp != 0 &&
+		    (info->exception_address < 0x800000000ull || info->exception_address >= 0x100000000000ull)) {
+			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
+			                 info->exception_address);
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
+			return true;
+		}
+	}
+	// Guest code that touched memory another thread is mapping back (a partial unmap on Windows unmaps the
+	// whole view and maps its other parts again): once that is done the address is mapped and the access
+	// runs again. Texture streaming unmaps parts of pool views every frame; a read in the gap exited.
+	// A thread faulting again and again on the same address is a real fault.
+	if (info->type == Common::HostException::ExceptionType::AccessViolation && g_faulting_linker != nullptr &&
+	    g_faulting_linker->FindProgramByAddr(info->exception_address) != nullptr &&
+	    Libs::LibKernel::Memory::IsGuestMappedAfterChanges(info->access_violation_vaddr)) {
+		thread_local uint64_t last_fault = 0;
+		thread_local uint32_t repeats    = 0;
+		repeats    = info->access_violation_vaddr == last_fault ? repeats + 1 : 0;
+		last_fault = info->access_violation_vaddr;
+		if (repeats < 64) {
+			static std::atomic<uint32_t> reported {0};
+			if (repeats == 0 && reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("Guest access to memory being mapped again retried: %s reading/writing 0x%016" PRIx64 "\n",
+				            DescribeGuestAddress(info->exception_address).c_str(), info->access_violation_vaddr);
+				std::fflush(stdout);
+			}
 			return true;
 		}
 	}
@@ -835,12 +927,81 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		// GPU write-backs (Memory::WriteBacking) over the pages the registers and the stack top point at:
+		// a structure the game broke may have been overwritten by stale GPU data.
+		{
+			std::vector<uint64_t> pages;
+			const auto note = [&](uint64_t value) {
+				if (value >= 0x10000 && value < 0x10000000000ull) pages.push_back(value & ~uint64_t {0xfff});
+			};
+			for (const auto value: {info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
+			                         info->r8, info->r9, info->r10, info->r11, info->r12, info->r13, info->r14,
+			                         info->r15, info->access_violation_vaddr})
+				note(value);
+			if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t)))
+				for (int i = 0; i < 32; i++) note(reinterpret_cast<const uint64_t*>(info->rsp)[i]);
+			std::sort(pages.begin(), pages.end());
+			pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+			std::printf("GPU write-backs onto the pages registers and stack point at (%zu pages):\n", pages.size());
+			bool any = false;
+			for (const auto page: pages) any |= Libs::LibKernel::Memory::PrintWriteBacksOverlapping(page, 0x1000);
+			if (!any) std::printf("  none\n");
+		}
+		// The memory the registers point at (the object a bad pointer came from: its fields and lists).
+		{
+			const std::pair<const char*, uint64_t> registers[] {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx}, {"rsi", info->rsi},
+			    {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8", info->r8},   {"r9", info->r9},   {"r10", info->r10},
+			    {"r11", info->r11}, {"r12", info->r12}, {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			for (const auto& [name, value]: registers) {
+				const auto begin = (value & ~uint64_t {7}) - 0x40;
+				if (value < 0x10000 || value >= 0x10000000000ull || !IsReadableRange(begin, 0xc0)) continue;
+				const auto* words = reinterpret_cast<const uint64_t*>(begin);
+				std::printf("[%s-0x40..+0x80]:", name);
+				for (int i = 0; i < 24; i++) std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", words[i]);
+				std::printf("\n");
+			}
+		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The host frames, by their unwind tables (the emulator's resolve with its linker map;
+		// guest code has none, which ends the walk), and the state of the faulting page.
+		if (info->native_context != nullptr) {
+			auto context = *static_cast<const CONTEXT*>(info->native_context);
+			std::printf("host frames (emulator at %p):", static_cast<void*>(GetModuleHandleA(nullptr)));
+			for (int i = 0; i < 32 && context.Rip != 0; i++) {
+				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", static_cast<uint64_t>(context.Rip));
+				DWORD64     image_base = 0;
+				auto*       function   = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+				if (function == nullptr) {
+					// Only the faulting frame can be a leaf function: its return address on top.
+					if (i != 0 || !IsReadableRange(context.Rsp, sizeof(DWORD64))) break;
+					context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+					context.Rsp += sizeof(DWORD64);
+					continue;
+				}
+				void*   handler_data = nullptr;
+				DWORD64 frame        = 0;
+				RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context, &handler_data,
+				                 &frame, nullptr);
+			}
+			std::printf("\n");
+		}
+		MEMORY_BASIC_INFORMATION page {};
+		if (info->type == Common::HostException::ExceptionType::AccessViolation &&
+		    VirtualQuery(reinterpret_cast<const void*>(info->access_violation_vaddr), &page, sizeof(page)) != 0) {
+			std::printf("fault page: state=0x%lx protect=0x%lx type=0x%lx region=%p+0x%zx\n", page.State,
+			            page.Protect, page.Type, page.BaseAddress, page.RegionSize);
+		}
+#endif
 		std::fflush(stdout);
 	}
-	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
-	     " access=%u address=0x%016" PRIx64 "\n",
+	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
+	     " access=%u address=0x%016" PRIx64 " (%s) code=%s\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	     DescribeGuestAddress(info->exception_address).c_str(),
+	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr,
+	     DescribeGuestAddress(info->access_violation_vaddr).c_str(),
+	     DescribeGuestCode(info->exception_address).c_str());
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {
@@ -1456,6 +1617,12 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	DemonsSoulsIdle::Install(m_programs.empty() ? nullptr : m_programs.front());
+	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
+	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
+	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
@@ -1479,6 +1646,9 @@ void RuntimeLinker::Clear() {
 
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
+	DemonsSoulsIdle::Clear();
+	DemonsSoulsCopy::Clear();
+	DemonsSoulsGpuPages::Clear();
 
 	for (auto* p: m_programs) {
 		DeleteProgram(p);
@@ -2058,6 +2228,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		LOGF("tls_handler_size       = 0x%016" PRIx64 "\n", tls_handler_size);
 	}
 
+	g_faulting_linker = program->rt;
 	if (!Common::HostException::InstallHandler(KytyExceptionHandler)) {
 		EXIT("Failed to install the required vectored exception handler\n");
 	}
@@ -2158,6 +2329,17 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.stack_dependent_memory_instruction_count,
 			     result.control_flow_memory_instruction_count,
 			     result.unrelocatable_memory_instruction_count);
+			std::printf("Red-zone patching %s: functions=%" PRIu64 " red_zone=%" PRIu64 " memory=%" PRIu64
+			            " patched=%" PRIu64 " stack=%" PRIu64 " control=%" PRIu64 " unrelocatable=%" PRIu64
+			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 "\n",
+			            Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
+			            result.red_zone_function_count, result.memory_instruction_count,
+			            result.patched_memory_instruction_count,
+			            result.stack_dependent_memory_instruction_count,
+			            result.control_flow_memory_instruction_count,
+			            result.unrelocatable_memory_instruction_count,
+			            result.indirect_red_zone_function_count, result.swept_instruction_count,
+			            result.live_call_count);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
 		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,

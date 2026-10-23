@@ -15,6 +15,10 @@
 namespace Libs::Graphics {
 
 struct VulkanImage;
+class PipelineBinaries;
+class PipelineBinaryWriter;
+class PipelineCacheBlobs;
+class PipelineCacheBlobWriter;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
@@ -27,22 +31,59 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
+	bool                               memory_priority_enabled               = false;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
+	// With subgroup size control: wave64 compute programs run on 64-lane subgroups (else emulated on 32-lane ones, two
+	// guest lanes an invocation). VulkanInitSubgroupSizeControl decides it (KYTY_COMPUTE_WAVE64).
+	bool                               compute_wave64_native                 = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	// VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT is usable.
+	bool                               pipeline_cache_control_enabled        = false;
+	// The static precompile's pipelines (PipelineCache): looked up first when a pipeline is
+	// created, never compiled into outside the precompile.
+	vk::PipelineCache                  static_pipeline_cache                 = nullptr;
+	// VK_KHR_pipeline_binary (and maintenance5's create flags) is enabled: the static precompile's
+	// pipelines are its binaries instead (pipelineBinaries.h); in the precompile, its output.
+	bool                               pipeline_binaries_enabled             = false;
+	// VK_NV_copy_memory_indirect: an upload prologue's copies are one command (BufferCache::UploadDirtyRanges).
+	bool                               copy_memory_indirect_enabled          = false;
+	// False (the emulator): the driver keeps no copy of its own of the pipelines it makes (the
+	// precompile's captures of static cache hits come from that copy).
+	bool                               pipeline_binary_internal_cache        = true;
+	const PipelineBinaries*            pipeline_binaries                     = nullptr;
+	PipelineBinaryWriter*              pipeline_binary_writer                = nullptr;
+	// Without pipeline binaries: the static precompile's pipelines as each one's own pipeline cache data, keyed by
+	// its identity (pipelineCacheBlobs.h); in the precompile, its output.
+	const PipelineCacheBlobs*          pipeline_blobs                        = nullptr;
+	PipelineCacheBlobWriter*           pipeline_blob_writer                  = nullptr;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
 	uint32_t                           max_subgroup_size                     = 0;
 	uint32_t                           max_push_descriptors                  = 0;
+	// Fragment shaders support subgroup vote/arithmetic (LOD statistics reduction).
+	bool                               fragment_subgroup_reduction           = false;
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// KYTY_READBACK_QUEUE (set at device creation): a transfer-only queue for guest readback
+	// copies (src/local/readback-queue.h); buffers are then shared with its family.
+	uint32_t                           readback_family = static_cast<uint32_t>(-1);
+	vk::Queue                          readback_queue  = nullptr;
+	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
+	// driver can block a present in the kernel until earlier GPU work on its queue is done;
+	// on the graphics queue that held queue_mutex against the very submissions that work
+	// waited for. Null: presents use `queue` under queue_mutex.
+	Common::Mutex                      present_queue_mutex;
+	vk::Queue                          present_queue = nullptr;
+	bool                               present_queue_created = false; // queue index 1 of queue_family
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;
@@ -82,8 +123,9 @@ struct GraphicContext {
 		return it->second.first;
 	}
 
+	// Wave64 compute programs run natively: chosen with subgroup size control, else when every subgroup has 64 lanes.
 	[[nodiscard]] bool SupportsComputeWave64() const noexcept {
-		return subgroup_size == 64u || compute_subgroup_size_control_enabled;
+		return compute_subgroup_size_control_enabled ? compute_wave64_native : subgroup_size == 64u;
 	}
 
 	[[nodiscard]] vk::DeviceSize StorageMinAlignment() const {
@@ -96,9 +138,34 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	// The driver's usage figures read again (VMA otherwise refreshes them every 30 of its own allocations: memory
+	// the driver takes itself, such as pipelines, shows late).
+	void                   RefreshMemoryBudget();
+	// Windows' figures for the process's video memory (LocalPlatform::QueryVideoMemory) without the simulation's
+	// ballast; false where there are none.
+	[[nodiscard]] bool     QueryLocalVideoMemory(uint64_t* usage, uint64_t* budget) const;
+	// A log line on where the video memory goes (Windows' and VMA's figures): diagnostics.
+	void                   LogVideoMemory(const char* label) const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
+	// Frees the images kept for reuse (KYTY_IMAGE_POOL): video memory ran out.
+	void                   TrimImagePool();
+	void                   ReportMemoryFallback(const char* what, uint64_t bytes) const;
+	// KYTY_SIMULATE_VRAM_MB: the video memory taken at start-up (left out of the budget and usage above).
+	// A budget under 12 GiB (CreateAllocator): less than the game's working set (Boletaria ~11 GB). Textures yield video
+	// memory to render targets and buffers (CreateImage); the pipeline warmup leaves its pipelines to first use.
+	bool                          small_video_memory = false;
+	// Sparse residency buffers whose pages without memory read zero, bound on the graphics queue
+	// (MemoryUsage::SparseDeviceLocal).
+	bool                          sparse_residency_buffers = false;
+	// An image only sampled and copied (CreateImage places these apart on such a GPU).
+	[[nodiscard]] static bool     IsTextureUsage(vk::ImageUsageFlags usage) {
+		return !(usage & (vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eDepthStencilAttachment |
+		                  vk::ImageUsageFlagBits::eStorage));
+	}
+	std::vector<vk::DeviceMemory> simulation_ballast;
+	uint64_t                      simulation_ballast_bytes = 0;
 	void                   AppendHardwareRayTracingDeviceExtensions(
 	    const std::vector<vk::ExtensionProperties>& available_extensions,
 	    std::vector<const char*>&                   device_extensions);
@@ -121,6 +188,7 @@ struct VulkanImageState {
 	vk::PipelineStageFlags2 pl_stage    = vk::PipelineStageFlagBits2::eAllCommands;
 	vk::AccessFlags2        access_mask = vk::AccessFlagBits2::eNone;
 	vk::ImageLayout         layout      = vk::ImageLayout::eUndefined;
+	bool                    guest       = false; // set by a guest draw's or dispatch's bindings (a transit group)
 };
 
 struct VulkanImage {
@@ -142,6 +210,9 @@ struct VulkanImage {
 };
 
 
+
+// Offline tools: the emulator's device without a window (vulkanWindow.cpp).
+bool CreateHeadlessGraphicContext(GraphicContext& graphic_ctx);
 
 } // namespace Libs::Graphics
 

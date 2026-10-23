@@ -39,6 +39,11 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+// Guard-page violations (Windows): the touched address and the native context; true resumes the faulting thread.
+using GuardPageHandler = bool (*)(uint64_t address, void* native_context);
+
+void SetGuardPageHandler(GuardPageHandler handler);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
 #endif

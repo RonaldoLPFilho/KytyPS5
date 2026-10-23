@@ -117,7 +117,12 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+// A guest stack of stack_size bytes above a guard page, for guest code the emulator runs off a
+// thread's own stack (fibers): its low end, 0 when the stack area is exhausted.
+uint64_t MapGuestStack(size_t stack_size);
+void     UnmapGuestStack(uint64_t stack_addr, size_t stack_size);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
+bool TestGuestStackExitLifecycle();
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);
 #endif

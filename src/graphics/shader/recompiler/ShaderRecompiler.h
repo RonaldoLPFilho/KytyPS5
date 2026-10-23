@@ -19,6 +19,8 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        enable_lod_stats           = false;
+	bool                        table_mode                 = false; // IR::EnterTableMode
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -37,6 +39,11 @@ struct CompileResult {
 	std::string            ir_dump;
 	IR::Program            program;
 };
+
+// Storage buffer accesses without an explicit bounds check where the device checks them the same
+// way: robustBufferAccess2 with byte-exact ranges (robustStorageBufferAccessSizeAlignment 1) reads
+// zero out of bounds and drops the stores. Set with the device, before any program compiles.
+void SetDeviceStorageBufferBounds(bool enabled);
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

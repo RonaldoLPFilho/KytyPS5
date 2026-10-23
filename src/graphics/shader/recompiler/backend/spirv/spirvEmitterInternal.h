@@ -49,10 +49,13 @@ enum : uint32_t {
 	CapabilityImageQuery                     = 50,
 	CapabilityStorageImageWriteWithoutFormat = 56,
 	CapabilityGroupNonUniform                = 61,
+	CapabilityGroupNonUniformVote            = 62,
+	CapabilityGroupNonUniformArithmetic      = 63,
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilityShaderLayer                    = 69,
 	CapabilityShaderViewportIndex            = 70,
+	CapabilityDrawParameters                 = 4427,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
 	CapabilityFragmentBarycentricKHR         = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
@@ -98,6 +101,7 @@ enum : uint32_t {
 	BuiltInSampleId                  = 18,
 	BuiltInSampleMask                = 20,
 	BuiltInFragDepth                 = 22,
+	BuiltInHelperInvocation          = 23,
 	BuiltInWorkgroupId               = 26,
 	BuiltInLocalInvocationId         = 27,
 	BuiltInGlobalInvocationId        = 28,
@@ -105,6 +109,7 @@ enum : uint32_t {
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
+	BuiltInBaseInstance              = 4425,
 	BuiltInBaryCoordKHR              = 5286,
 	BuiltInBaryCoordNoPerspKHR       = 5287,
 };
@@ -210,6 +215,7 @@ enum : uint32_t {
 	OpSMulExtended                 = 152,
 	OpAny                          = 154,
 	OpAll                          = 155,
+	OpIsNan                        = 156,
 	OpLogicalNotEqual              = 165,
 	OpLogicalOr                    = 166,
 	OpLogicalAnd                   = 167,
@@ -273,6 +279,10 @@ enum : uint32_t {
 	OpKill                         = 252,
 	OpReturn                       = 253,
 	OpReturnValue                  = 254,
+	OpGroupNonUniformElect         = 333,
+	OpGroupNonUniformAllEqual      = 336,
+	OpGroupNonUniformIAdd          = 349,
+	OpGroupNonUniformUMin          = 354,
 	OpGroupNonUniformBallot        = 339,
 	OpGroupNonUniformBallotFindLSB = 343,
 	OpGroupNonUniformShuffle       = 345,
@@ -296,8 +306,10 @@ enum : uint32_t {
 	GlslSqrt            = 31,
 	GlslInverseSqrt     = 32,
 	GlslFMin            = 37,
+	GlslUMin            = 38,
 	GlslFMax            = 40,
 	GlslFClamp          = 43,
+	GlslSClamp          = 45,
 	GlslLdexp           = 53,
 	GlslFma             = 50,
 	GlslPackSnorm2x16   = 56,
@@ -350,6 +362,20 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// A buffer's runtime format (IR::BufferWord fields; spirvEmitterMemory.cpp), decoded once at the entry.
+struct RuntimeFormat {
+	uint32_t word         = 0;
+	uint32_t layout       = 0;
+	uint32_t type         = 0; // Format::ComponentType
+	uint32_t packed       = 0; // bool: a packed bit-field layout
+	uint32_t count        = 0; // components
+	uint32_t log_bytes    = 0; // log2 of a byte-aligned layout's component bytes
+	uint32_t packed_shift = 0; // a packed layout's component bit offsets, a byte each
+	uint32_t packed_bits  = 0; // and widths
+	uint32_t one          = 0; // the value of dst_sel 1 for this type
+	uint32_t is_signed    = 0; // bool: Sint, Snorm or Sscaled (the even types)
+};
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -365,15 +391,32 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> buffer_words {}; // IR::BufferWord, when used
+	std::array<RuntimeFormat, IR::ShaderInfo::MaxBuffers> runtime_formats {}; // by buffer word
+	// Table mode (IR::Program::table_mode, EmitTableMode): each read slot's value (0: not read), each buffer's
+	// device address, size in dwords, stride and buffer word, at the function's entry.
+	std::vector<uint32_t>                            table_slot_values;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_buffer_words {}; // of runtime format buffers
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_bases {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_lengths {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> table_strides {};
+	bool table_guarded = false; // a table mode subword store inside its bounds check (StoreSubwordInBounds)
+	uint32_t table_block = 0;   // the block's device address (EmitTableBlockLoad)
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
 	uint32_t                                         gds_variable            = 0;
+	uint32_t                                         lod_stats_variable      = 0;
+	bool                                             lod_stats_subgroup      = false;
+	uint32_t                                         lod_helper_variable     = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	uint32_t                                         compact_lds_dwords      = 0;
+	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
+	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
 	uint32_t                   sampler_variable                      = 0;
@@ -428,6 +471,7 @@ uint32_t TypeStorageBufferU64Pointer(EmitterState& state);
 uint32_t TypeStorageBufferU64ElementPointer(EmitterState& state);
 uint32_t TypeDeviceAddressStoragePointer(EmitterState& state);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
+uint32_t TypePhysicalU64Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
 uint32_t TypeU32ArrayPointer(EmitterState& state, uint32_t storage_class, uint32_t dwords);
 uint32_t TypeU32ElementPointer(EmitterState& state, uint32_t storage_class);
@@ -651,8 +695,18 @@ uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryIn
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
 
 void EmitMemoryOffsets(EmitterState& state);
+void EmitTableMode(ValueEmitContext& ctx);
+// Table mode: the block's dword `index` (an id: an indirect image's key mapping), by its device address.
+uint32_t EmitTableBlockLoad(EmitterState& state, uint32_t index);
+
+// The buffer word (IR::BufferWord) of a buffer access's resource, loaded at function entry.
+uint32_t RuntimeBufferWord(const EmitterState& state, const IR::MemoryInfo& mem);
+
+// At function entry: the runtime formats of the buffers that decode theirs (spirvEmitterMemory.cpp).
+void EmitRuntimeFormats(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+uint32_t LdsStorageDwordCount(const EmitterState& state);
 
 struct MemoryResourceAccess {
 	IR::ResourceKind kind             = IR::ResourceKind::None;
@@ -661,6 +715,7 @@ struct MemoryResourceAccess {
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
+	uint32_t         bda_base         = 0; // table mode: the buffer's device address (EmitTableMode)
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);
@@ -673,8 +728,14 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 uint32_t EmitMemoryElementIndex(EmitterState& state, const MemoryResourceAccess& access,
                                 uint32_t raw_index);
 
+// True where the access is in bounds; a constant for storage buffers whose bounds the device
+// checks (SetDeviceStorageBufferBounds). Atomics keep the explicit check.
 uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                    uint32_t index);
+uint32_t EmitMemoryElementInBoundsExplicit(EmitterState& state, const MemoryResourceAccess& access,
+                                           uint32_t index);
+// Storage buffer accesses of this kind are bounds-checked by the device (SetDeviceStorageBufferBounds).
+bool DeviceStorageBufferBounds(IR::ResourceKind kind);
 
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
@@ -694,6 +755,9 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
+
+uint32_t PackFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                             uint32_t component, uint32_t raw);
 
 void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
 
@@ -778,6 +842,10 @@ void DefineGetBdaPointer(EmitterState& state);
 // These templates accept local lambdas from several emitter translation units.
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		fn();
+		return;
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
@@ -791,6 +859,9 @@ void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
+	if (condition == ConstantBool(state, true)) {
+		return fn();
+	}
 	const auto then_label  = state.builder.AllocateId();
 	const auto then_exit   = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();

@@ -770,6 +770,22 @@ static bool TryEmulateMonitorxMwaitx(ucontext_t* context) {
 
 #endif
 
+bool TrySkipDebugBreak(void* native_context) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto& rip = static_cast<PCONTEXT>(native_context)->Rip;
+#elif !defined(__APPLE__)
+	auto& rip = static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_RIP];
+#else
+	uint64_t rip = 0;
+	(void)native_context;
+	return false;
+#endif
+	const auto* code = reinterpret_cast<const uint8_t*>(rip);
+	if (code == nullptr || code[0] != 0xcd || code[1] != 0x41) return false;
+	rip += 2;
+	return true;
+}
+
 bool TryEmulate(void* native_context) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	auto* context = static_cast<PCONTEXT>(native_context);

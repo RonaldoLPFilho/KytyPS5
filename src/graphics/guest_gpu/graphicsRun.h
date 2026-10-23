@@ -7,6 +7,7 @@
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 
+#include <optional>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -19,6 +20,7 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+class Speculation;
 
 class GuestGpu final {
 public:
@@ -40,6 +42,13 @@ public:
 	[[nodiscard]] int GetFrameNum() const;
 
 	[[nodiscard]] static bool IsGpuThread() noexcept;
+	// The GPU thread, or the speculation's thread while the GPU thread waits for its translation (KYTY_SPECULATE=2):
+	// what reads the GPU thread's caches to translate (not what may fault: only the GPU thread reads back).
+	[[nodiscard]] static bool IsTranslatingThread() noexcept;
+	static void               SetSpeculationThread(bool speculation) noexcept;
+
+	// Offline tools (xpr_replay_tests) run the renderer on their own thread.
+	static void SetOfflineGpuThread(bool gpu_thread) noexcept;
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -48,7 +57,7 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Graphics, Compute, FlipPreparation };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, FrameBoundary };
 
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
@@ -63,10 +72,18 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  frame_epoch       = 0;
+		uint64_t                  serial            = 0; // its place in its queue (from 1)
+		// KYTY_SPECULATE=4: the chunk committed next; whether the one it is in is translated the normal way, up to where
+		// the next begins (none: to the end).
+		uint32_t                    spec_chunk  = 0;
+		bool                        spec_normal = false;
+		std::optional<Pm4Execution> spec_end;
 	};
 
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	bool              CanProcessSubmission(const Submission& submission) const;
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -82,7 +99,11 @@ private:
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
+	std::array<uint64_t, QueueCount>               m_serials {};
 	uint32_t                                       m_submission_count  = 0;
+	// Producer epoch is owned by m_submission_mutex; consumed epoch by m_queue_mutex.
+	uint64_t                                       m_submitted_frame   = 0;
+	uint64_t                                       m_consumed_frame    = 0;
 	bool                                           m_processing        = false;
 	bool                                           m_graphics_done     = true;
 	bool                                           m_accepting         = true;
@@ -90,6 +111,9 @@ private:
 	bool                                           m_shutdown_complete = false;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
+	// KYTY_SPECULATE (speculation.h): made at the first graphics command buffer it translates.
+	std::unique_ptr<Speculation>                                     m_speculation;
+	std::atomic<Speculation*>                                        m_ahead {nullptr}; // KYTY_SPECULATE=4's
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;

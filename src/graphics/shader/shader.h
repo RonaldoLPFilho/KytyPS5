@@ -116,6 +116,9 @@ struct ShaderVertexInputInfo {
 	ShaderMeshInputInfo      mesh;
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
+	// The user SGPR (s8 + GS user data index) holding the draw's start instance, which an indirect draw
+	// has the CP write; -1: the user data value.
+	int32_t                 start_instance_sgpr = -1;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -129,6 +132,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 };
 
 struct ShaderPixelInputInfo {
+	bool                                           lod_stats_subgroup           = false;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       ps_system_input_base         = 0;
@@ -175,6 +179,8 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterDefault(const ShaderPixelInputInfo& info, uint32_t input,
+                                     uint32_t component, uint32_t& bits);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;
@@ -272,6 +278,12 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// Offline capture: the registered data for a shader address, if any.
+bool ShaderLookupMappedData(uint64_t addr, ShaderMappedData* out);
+// Moves with every registration (ShaderMapUserData): what was compiled for an address may be stale.
+[[nodiscard]] uint64_t ShaderMapGeneration();
+// The hash the pipeline cache knows the shader registered at `addr` by (the code's), 0 when none is.
+[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

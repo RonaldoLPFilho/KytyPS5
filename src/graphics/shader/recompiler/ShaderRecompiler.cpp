@@ -16,10 +16,14 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/WaterfallDescriptor.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <fmt/format.h>
 #include <map>
 #include <span>
@@ -50,6 +54,80 @@ const char* StageName(ShaderType stage) {
 		case ShaderType::Mesh: return "MS";
 		case ShaderType::Pixel: return "PS";
 		default: return "unknown";
+	}
+}
+
+// KYTY_SHADER_DUMP_ONLY=<hash,hash,...>: KYTY_SHADER_DUMP writes only these programs.
+bool DumpSelected(uint64_t hash) {
+	static const std::string only = [] {
+		const char* value = std::getenv("KYTY_SHADER_DUMP_ONLY");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	return only.empty() || only.find(fmt::format("{:016x}", hash)) != std::string::npos;
+}
+
+// KYTY_SHADER_DUMP=<dir>: the guest ISA and its disassembly for every translated shader, once
+// per stage and hash (<dir>/<stage>_<hash>.bin and .rdna2), without the debug logging.
+void DumpDecodedShader(const CompileOptions& options, std::span<const uint32_t> code,
+                       const Decoder::Program& decoded) {
+	static const char* const dir = std::getenv("KYTY_SHADER_DUMP");
+	if (dir == nullptr || *dir == '\0' || !DumpSelected(options.shader_hash)) {
+		return;
+	}
+	const auto      base = std::filesystem::path(dir) /
+	                  fmt::format("{}_{:016x}", StageName(options.stage), options.shader_hash);
+	std::error_code error;
+	if (std::filesystem::exists(base.string() + ".rdna2", error)) {
+		return;
+	}
+	std::filesystem::create_directories(dir, error);
+	if (FILE* file = std::fopen((base.string() + ".bin").c_str(), "wb")) {
+		std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+		std::fclose(file);
+	}
+	const auto text = Decoder::ProgramToString(decoded);
+	if (FILE* file = std::fopen((base.string() + ".rdna2").c_str(), "wb")) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
+	}
+}
+
+// With KYTY_SHADER_DUMP: the renderer-facing resource table (index = the slot a frame capture
+// reports) and the final IR, as <stage>_<hash>.ir, once per stage and hash.
+void DumpShaderIr(const CompileOptions& options, const IR::Program& ir) {
+	static const char* const dir = std::getenv("KYTY_SHADER_DUMP");
+	if (dir == nullptr || *dir == '\0' || !DumpSelected(options.shader_hash)) {
+		return;
+	}
+	const auto path = std::filesystem::path(dir) /
+	                  fmt::format("{}_{:016x}.ir", StageName(options.stage), options.shader_hash);
+	std::error_code error;
+	if (std::filesystem::exists(path, error)) {
+		return;
+	}
+	std::string text;
+	for (size_t i = 0; i < ir.info.images.size(); ++i) {
+		const auto& image = ir.info.images[i];
+		text += fmt::format("image[{}] source={} class={} numeric={} dim={} mips={} read={} written={} "
+		                    "atomic={} depth_compare={} cube={} first_pc=0x{:x}\n",
+		                    i, image.source, static_cast<int>(image.resource_class),
+		                    static_cast<int>(image.numeric_class), static_cast<int>(image.dimension),
+		                    image.mip_count, image.read, image.written, image.atomic,
+		                    image.depth_compare, image.cube, image.first_use_pc);
+	}
+	for (size_t i = 0; i < ir.info.buffers.size(); ++i) {
+		const auto& buffer = ir.info.buffers[i];
+		text += fmt::format("buffer[{}] source={} format={} stride={} extent={} read={} written={} "
+		                    "atomic={} scalar={} first_pc=0x{:x}\n",
+		                    i, buffer.source, static_cast<int>(buffer.descriptor_format),
+		                    buffer.packed_stride, buffer.max_byte_extent, buffer.read, buffer.written,
+		                    buffer.atomic, buffer.scalar, buffer.first_use_pc);
+	}
+	text += fmt::format("samplers={}\n\n", ir.info.samplers.size());
+	text += IR::ProgramToString(ir);
+	if (FILE* file = std::fopen(path.string().c_str(), "wb")) {
+		std::fwrite(text.data(), 1, text.size(), file);
+		std::fclose(file);
 	}
 }
 
@@ -529,6 +607,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, decoded);
 	}
+	DumpDecodedShader(options, joined_code.empty() ? code : std::span<const uint32_t> {joined_code},
+	                  decoded);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -643,8 +723,22 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	const auto waterfalls = IR::RewriteWaterfallDescriptors(ir);
+	if (waterfalls != 0) {
+		LOGF("%s waterfall descriptor de-scalarization: stage=%s hash=0x%016" PRIx64
+		     " loops=%" PRIu32 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, waterfalls);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
+	if (options.dump_ir && options.early_dump) {
+		LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+		     IR::ProgramToString(ir).c_str());
+	}
 	IR::TrackResources(ir);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
@@ -681,7 +775,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	info_options.pixel   = pixel;
 	info_options.compute = compute;
 	IR::CollectShaderInfo(ir, info_options);
-	IR::AllocateBindings(ir, push_data_start_dword);
+	if (options.table_mode) IR::EnterTableMode(ir);
+	IR::AllocateBindings(ir, push_data_start_dword, options.enable_lod_stats);
+	DumpShaderIr(options, ir);
 	Spirv::AnalyzeProgramRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {

@@ -16,6 +16,11 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Block;
 class Inst;
 
+// Whether translations run the IR consistency checks (ValidateProgram, duplicate uses): debug builds, or
+// KYTY_IR_VALIDATE in release. They only ever stop the emulator, and they were a fifth of a release
+// translation's time (the first-encounter hitches).
+bool ValidationEnabled();
+
 class Value {
 public:
 	Value() = default;
@@ -128,6 +133,8 @@ public:
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void ReplaceOpcode(ValueOpcode opcode);
 	void Invalidate();
+	// Invalidate without unlinking the uses: only when every value of the IR is destroyed together.
+	void DropLinks();
 
 	template <typename T>
 	requires(sizeof(T) <= sizeof(uint64_t) && std::is_trivially_copyable_v<T>)

@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 
@@ -595,6 +599,17 @@ void Translator::WriteU32Pair(const Decoder::Operand&       operand,
 }
 
 IR::U1 Translator::ThreadBit(const std::array<IR::U32, 2>& mask) {
+	const auto constant_bit = [](IR::U32 word) -> std::optional<bool> {
+		if (!word.IsImmediate() || (word.U32() != 0u && word.U32() != UINT32_MAX)) {
+			return std::nullopt;
+		}
+		return word.U32() != 0u;
+	};
+	const auto low  = constant_bit(mask[0]);
+	const auto high = program.wave_size == 64u ? constant_bit(mask[1]) : low;
+	if (low && high && *low == *high) {
+		return IR::U1(IR::Value(*low));
+	}
 	const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto word = program.wave_size == 64u
 	                      ? ir.Select(ir.ULessThan(lane, IR::U32(IR::Value(32u))), mask[0], mask[1])
@@ -747,17 +762,15 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetVcc())); break;
+		case CFG::BranchCondition::VccNonZero: condition = ir.AnyLane(ir.GetVcc()); break;
+		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetExec())); break;
+		case CFG::BranchCondition::ExecNonZero: condition = ir.AnyLane(ir.GetExec()); break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;
@@ -933,6 +946,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	IR::Program result;
 	result.stage               = options.stage;
 	result.wave_size           = options.wave_size;
+	if (options.stage == ShaderType::Compute && options.wave_size == 64u) {
+		// (KYTY_LANE_LOCAL=0: every wave64 program two lanes per invocation, as before; KYTY_LANE_LOCAL_LOG: why not.)
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_LANE_LOCAL");
+			return value == nullptr || std::string_view(value) != "0";
+		}();
+		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
+		std::string reason;
+		result.lane_local = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr);
+		if (log)
+			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
+			            result.lane_local ? "yes" : reason.c_str());
+	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
 	result.user_data_count     = options.user_data_count;
@@ -1028,7 +1054,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			total_threads = std::max(workgroup->threads_num[0], 1u) *
 			                std::max(workgroup->threads_num[1], 1u) *
 			                std::max(workgroup->threads_num[2], 1u);
-			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u &&
+			if (options.wave_size == 64u && workgroup->host_subgroup_size == 32u && !result.lane_local &&
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
@@ -1150,9 +1176,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			     entry_ir.IMul(index_bytes, u32(8))}));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-			entry_ir.SetVectorReg(
-			    static_cast<IR::VectorReg>(8),
-			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
+			// The instance ID counts from 0; the start instance is the draw's.
+			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
+			                      builtin(IR::StageInputKind::WorkgroupId, 1));
+			if (options.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.vertex->start_instance_sgpr),
+				                      draw(2));
+			}
 		} else if (options.stage == ShaderType::Pixel) {
 			const auto* ps = options.pixel;
 			if (ps->ps_perspective_center_vgpr != UINT32_MAX) {
@@ -1190,10 +1220,16 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
+			// The instance ID counts from 0; the start instance is Vulkan's base instance.
+			const auto base_instance = builtin(IR::StageInputKind::BaseInstance);
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),
-			                      builtin(IR::StageInputKind::InstanceIndex));
+			                      entry_ir.ISub(builtin(IR::StageInputKind::InstanceIndex), base_instance));
+			if (options.vertex->start_instance_sgpr >= 0) {
+				entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(options.vertex->start_instance_sgpr),
+				                      base_instance);
+			}
 		}
 	}
 	for (const auto& cfg_block: cfg.blocks) {
@@ -1229,7 +1265,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
 	}
-	IR::ValidateProgram(result, false);
+	if (IR::ValidationEnabled()) IR::ValidateProgram(result, false);
 	return result;
 }
 

@@ -9,12 +9,18 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// 1: reuse PreparedBindings storage across operations (fresh contents each time).
+extern "C" volatile std::atomic_uint32_t kyty_local_binding_scratch_mode;
+// 1: table dispatches (src/local/table-xpr.inc, KYTY_TABLE_DISPATCH).
+extern "C" volatile std::atomic_uint32_t kyty_local_table_dispatch_mode;
 
 struct ShaderStageRuntime;
 
@@ -69,8 +75,8 @@ template <typename T>
 [[nodiscard]] bool
 IsSupportedSampledVideoOutView(const ShaderRecompiler::IR::ImageResource& resource,
                                const ShaderTextureResource& descriptor, const Image& image);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+[[nodiscard]] std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& resource,
+                                               const ShaderTextureResource& descriptor, uint64_t size);
 
 } // namespace Libs::Graphics
 

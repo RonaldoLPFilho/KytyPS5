@@ -1,0 +1,15 @@
+# Extra emulator switches for A/B tests, read by launcher.cmd (one KEY=VALUE per line).
+# Remove the '#' in front of a line to turn it on, put it back to turn it off.
+
+# Old behaviour: no slReflexSleep call (DLSS-G presents blocked ~34 ms -> game 30 fps with FG)
+#KYTY_FRAMEGEN_REFLEX_SLEEP=0
+
+# Reflex mode: off | on (default) | boost
+#KYTY_FRAMEGEN_REFLEX=off
+
+# Old behaviour: present on the vblank thread instead of the present worker
+#KYTY_FRAMEGEN_SYNC_PRESENT=1
+
+# Old behaviour: only the hand-made camera shader list (no learning) / no camera hold
+#KYTY_FRAMEGEN_LEARN=0
+#KYTY_FRAMEGEN_CAMERA_HOLD=0

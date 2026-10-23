@@ -172,6 +172,30 @@ void TestWatchAndUnwatch() {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
+void TestReapplyProtection() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  // A guest mprotect over the watched page and its unwatched neighbours.
+  DWORD old_protection = 0;
+  Check(VirtualProtect(memory, page_size * 2, PAGE_READWRITE,
+                       &old_protection) != 0 &&
+            VirtualProtect(memory + page_size * 2, page_size, PAGE_NOACCESS,
+                           &old_protection) != 0,
+        "guest protection change failed");
+  manager.ReapplyProtection(address, page_size * 3);
+  Check(Protection(memory) == PAGE_READONLY,
+        "reapply did not restore the write watch");
+  Check(IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "reapply changed the protection of unwatched pages");
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestSharedWatcherCounts() {
   PageManager manager;
   const auto page_size = manager.GetPageSize();
@@ -342,6 +366,11 @@ void TestRegionMaskWatcherRanges() {
 
   g_protection_calls = 0;
   manager.UpdatePageWatchersForRegion<true, true>(region_base, sparse_mask);
+  Check(manager.HasReadWatchers(region_base + page_size + 3, 4) &&
+	        manager.HasReadWatchers(region_base + page_size - 1, 2) &&
+	        !manager.HasReadWatchers(region_base + page_size * 2, page_size) &&
+	        !manager.HasReadWatchers(region_base, 0) && !manager.HasReadWatchers(UINT64_MAX - 2, 8),
+	    "read hints lost page rounding, sparse gaps or invalid range checks");
   Check(g_protection_calls == 2 &&
             Protection(reinterpret_cast<void *>(region_base + page_size)) ==
                 PAGE_NOACCESS &&
@@ -351,6 +380,7 @@ void TestRegionMaskWatcherRanges() {
   g_protection_calls = 0;
   g_protection_ranges.clear();
   manager.UpdatePageWatchersForRegion<false, true>(region_base, sparse_mask);
+  Check(!manager.HasReadWatchers(region_base, region_size), "read unwatch retained stale hints");
   Check(g_protection_calls == 1 && g_protection_ranges.size() == 1 &&
             g_protection_ranges[0].size == page_size * 3,
         "sparse read unmask did not bridge a compatible gap");
@@ -580,6 +610,7 @@ int main(int argc, char **argv) {
     RunDeathCase(argv[2]);
   }
   TestWatchAndUnwatch();
+  TestReapplyProtection();
   TestSharedWatcherCounts();
   TestCrossRegionRange();
   TestBatchedWatcherRanges();

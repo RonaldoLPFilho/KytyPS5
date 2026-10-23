@@ -7,7 +7,9 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "live-counters.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -137,14 +139,20 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The parser counts every record but stores MaxPageFaults - 1 (fault_buffer_process.comp): past them the area
+		// holds no records of this batch (another batch's, or nothing), and those pages fault again next time.
+		const auto count = std::min<uint32_t>(static_cast<uint32_t>(faults[0]), MaxPageFaults - 1);
+		LiveCounters::Add(LiveCounters::BdaFaultPages, count);
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// Unmapped since the GPU recorded the access (GpuResourceManager::UnmapMemory no
+			// longer waits for this processing): no buffer over memory that is gone.
+			if (!m_buffer_cache.IsGpuMapped(start, end - start)) return;
+			m_buffer_cache.GetBuffer(m_buffer_cache.FindBuffer(start, end - start)).bda_read = true;
 		});
 		m_fault_areas[area] = 0;
 	});

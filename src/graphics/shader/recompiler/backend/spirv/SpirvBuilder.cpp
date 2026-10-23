@@ -58,24 +58,33 @@ uint32_t Builder::Import(const char* name) {
 	return id;
 }
 
+uint32_t Builder::FindOrReserveDeclaration(uint32_t& id) {
+	if (const auto it = m_declaration_ids.find(m_key); it != m_declaration_ids.end()) {
+		return it->second;
+	}
+	id = AllocateId();
+	m_declaration_ids.emplace(m_key, id);
+	return 0;
+}
+
 uint32_t Builder::Type(uint32_t opcode, std::initializer_list<uint32_t> operands) {
-	return Type(opcode, std::vector<uint32_t>(operands));
+	return Type(opcode, operands.begin(), operands.size());
 }
 
 uint32_t Builder::Type(uint32_t opcode, const std::vector<uint32_t>& operands) {
-	std::vector<uint32_t> key;
-	key.reserve(operands.size() + 2u);
-	key.push_back(opcode);
-	key.push_back(static_cast<uint32_t>(operands.size()));
-	key.insert(key.end(), operands.begin(), operands.end());
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
-		return it->second;
+	return Type(opcode, operands.data(), operands.size());
+}
+
+uint32_t Builder::Type(uint32_t opcode, const uint32_t* operands, size_t count) {
+	m_key.assign({opcode, static_cast<uint32_t>(count)});
+	m_key.insert(m_key.end(), operands, operands + count);
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
 	}
-	const auto id = AllocateId();
-	m_declaration_ids.emplace(std::move(key), id);
-	std::vector<uint32_t> words {opcode, id};
-	words.insert(words.end(), operands.begin(), operands.end());
-	AppendInstructionWords(m_declarations, words.data(), words.size());
+	m_declarations.push_back((static_cast<uint32_t>(count + 2u) << 16u) | opcode);
+	m_declarations.push_back(id);
+	m_declarations.insert(m_declarations.end(), operands, operands + count);
 	return id;
 }
 
@@ -84,19 +93,18 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
 	if (annotations.size() == 0) {
 		return Type(opcode, operands);
 	}
-	std::vector<uint32_t> key {opcode, static_cast<uint32_t>(operands.size())};
-	key.insert(key.end(), operands.begin(), operands.end());
-	key.push_back(static_cast<uint32_t>(annotations.size()));
+	m_key.assign({opcode, static_cast<uint32_t>(operands.size())});
+	m_key.insert(m_key.end(), operands.begin(), operands.end());
+	m_key.push_back(static_cast<uint32_t>(annotations.size()));
 	for (const auto& annotation: annotations) {
-		key.push_back(annotation.opcode);
-		key.push_back(static_cast<uint32_t>(annotation.operands.size()));
-		key.insert(key.end(), annotation.operands.begin(), annotation.operands.end());
+		m_key.push_back(annotation.opcode);
+		m_key.push_back(static_cast<uint32_t>(annotation.operands.size()));
+		m_key.insert(m_key.end(), annotation.operands.begin(), annotation.operands.end());
 	}
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
-		return it->second;
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
 	}
-	const auto id = AllocateId();
-	m_declaration_ids.emplace(std::move(key), id);
 	std::vector<uint32_t> words {opcode, id};
 	words.insert(words.end(), operands.begin(), operands.end());
 	AppendInstructionWords(m_declarations, words.data(), words.size());
@@ -110,23 +118,24 @@ uint32_t Builder::DecoratedType(uint32_t opcode, std::initializer_list<uint32_t>
 
 uint32_t Builder::Constant(uint32_t opcode, uint32_t type,
                            std::initializer_list<uint32_t> operands) {
-	return Constant(opcode, type, std::vector<uint32_t>(operands));
+	return Constant(opcode, type, operands.begin(), operands.size());
 }
 
 uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const std::vector<uint32_t>& operands) {
-	std::vector<uint32_t> key;
-	key.reserve(operands.size() + 2u);
-	key.push_back(opcode);
-	key.push_back(type);
-	key.insert(key.end(), operands.begin(), operands.end());
-	if (const auto it = m_declaration_ids.find(key); it != m_declaration_ids.end()) {
-		return it->second;
+	return Constant(opcode, type, operands.data(), operands.size());
+}
+
+uint32_t Builder::Constant(uint32_t opcode, uint32_t type, const uint32_t* operands, size_t count) {
+	m_key.assign({opcode, type});
+	m_key.insert(m_key.end(), operands, operands + count);
+	uint32_t id = 0;
+	if (const auto found = FindOrReserveDeclaration(id); found != 0) {
+		return found;
 	}
-	const auto id = AllocateId();
-	m_declaration_ids.emplace(std::move(key), id);
-	std::vector<uint32_t> words {opcode, type, id};
-	words.insert(words.end(), operands.begin(), operands.end());
-	AppendInstructionWords(m_declarations, words.data(), words.size());
+	m_declarations.push_back((static_cast<uint32_t>(count + 3u) << 16u) | opcode);
+	m_declarations.push_back(type);
+	m_declarations.push_back(id);
+	m_declarations.insert(m_declarations.end(), operands, operands + count);
 	return id;
 }
 

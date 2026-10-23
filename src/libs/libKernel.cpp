@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "time-census.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -1122,6 +1123,18 @@ static int KYTY_SYSV_ABI KernelRemoveExceptionHandler(int signum) {
 static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	constexpr int POSIX_SIGUSR1 = 30;
 
+	{
+		// Diagnostic: how often the guest interrupts its threads (each delivery may land on a
+		// guest red zone on Windows).
+		static std::atomic<uint64_t> calls {0};
+		const auto                   n = calls.fetch_add(1, std::memory_order_relaxed);
+		if (n < 8 || (n & (n - 1)) == 0) {
+			std::printf("sceKernelRaiseException #%" PRIu64 ": signum=%d target=%p caller=%p\n", n + 1,
+			            signum, static_cast<void*>(thread), __builtin_return_address(0));
+			std::fflush(stdout);
+		}
+	}
+
 	if (signum != POSIX_SIGUSR1 || thread == nullptr) {
 		return KERNEL_ERROR_EINVAL;
 	}
@@ -1803,6 +1816,7 @@ static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(PosixClockGettime, static_cast<uint64_t>(clock_id));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1865,6 +1879,7 @@ int KYTY_SYSV_ABI getpagesize() {
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(PosixClockGettime, static_cast<uint64_t>(clock_id));
 
 	return POSIX_CALL(LibKernel::KernelClockGettime(clock_id, time));
 }
@@ -1882,6 +1897,7 @@ struct KernelTimezone {
 
 int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* timezone) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(Gettimeofday, 1);
 
 	if (time != nullptr) {
 		int result = LibKernel::KernelGettimeofday(time);
@@ -1902,6 +1918,9 @@ int KYTY_SYSV_ABI gettimeofday(LibKernel::KernelTimeval* time, KernelTimezone* t
 int KYTY_SYSV_ABI nanosleep(const LibKernel::KernelTimespec* rqtp,
                             LibKernel::KernelTimespec*       rmtp) {
 	PRINT_NAME();
+	KYTY_TIME_CENSUS(Nanosleep, rqtp != nullptr ? static_cast<uint64_t>(rqtp->tv_sec) * 1000000u +
+	                                                  static_cast<uint64_t>(rqtp->tv_nsec) / 1000u
+	                                            : 0);
 
 	return POSIX_CALL(LibKernel::KernelNanosleep(rqtp, rmtp));
 }
@@ -2285,6 +2304,13 @@ constexpr uint32_t FIBER_MAGIC_END         = 0xb37592a0;
 constexpr uint32_t FIBER_OPT_MAGIC         = 0xbb40e64d;
 constexpr uint64_t FIBER_STACK_MAGIC       = 0x7149f2ca7149f2ca;
 constexpr uint64_t FIBER_CONTEXT_MIN_SIZE  = 512;
+// Guest code is not alone on a fiber's stack here: every guest write to a tracked page raises a
+// Windows exception whose frame and handler use the faulting stack (about 5 KiB), and HLE calls
+// run on it. Demon's Souls packs 128 fiber stacks of 16 KiB back to back, so that depth ran past
+// the bottom into the next fiber's live frames (garbage pointers and return addresses, a broken
+// lock wait block). A fiber runs on a guest stack of its own, this much larger and above a guard
+// page, like guest threads (PTHREAD_STACK_EXTRA); the game's context memory keeps the magic only.
+constexpr uint64_t FIBER_STACK_EXTRA       = 0x40000;
 constexpr size_t   FIBER_MAX_NAME_LENGTH   = 31;
 constexpr uint32_t FIBER_STATE_RUNNING     = 1;
 constexpr uint32_t FIBER_STATE_IDLE        = 2;
@@ -2390,7 +2416,9 @@ static uint64_t FiberGetOwner(FiberObject* fiber) {
 	return it != g_fiber_owner_thread.end() ? it->second : 0;
 }
 
-static void FiberSetCurrentFiber(FiberObject* fiber) {
+// Fibers may resume on another host thread. Resolve TLS inside this call,
+// rather than reusing a thread pointer cached before saving the context.
+__attribute__((noinline)) static void FiberSetCurrentFiber(FiberObject* fiber) {
 	g_current_fiber = fiber;
 
 	std::lock_guard lock(g_fiber_owner_mutex);
@@ -2402,7 +2430,7 @@ static void FiberSetCurrentFiber(FiberObject* fiber) {
 	}
 }
 
-static void FiberStoreState(FiberObject* fiber, uint32_t state) {
+__attribute__((noinline)) static void FiberStoreState(FiberObject* fiber, uint32_t state) {
 	std::atomic_ref<uint32_t>(fiber->state).store(state, std::memory_order_release);
 	if (state == FIBER_STATE_RUNNING) {
 		FiberSetOwner(fiber);
@@ -2415,7 +2443,7 @@ static void FiberDeferIdle(FiberObject* fiber) {
 	g_pending_idle_fiber = fiber;
 }
 
-static void FiberCommitDeferredIdle() {
+__attribute__((noinline)) static void FiberCommitDeferredIdle() {
 	auto* fiber          = g_pending_idle_fiber;
 	g_pending_idle_fiber = nullptr;
 	if (fiber != nullptr) {
@@ -2485,6 +2513,30 @@ static void FiberSetContextValid(FiberObject* fiber, bool valid) {
 	fiber->context       = valid ? &fiber->saved_context : nullptr;
 }
 
+// The stacks fibers run on (FIBER_STACK_EXTRA) by fiber object: one initialized again without
+// sceFiberFinalize gives its old stack back first.
+static std::mutex                                                         g_fiber_stack_mutex;
+static std::unordered_map<const FiberObject*, std::pair<uint64_t, uint64_t>> g_fiber_stacks;
+
+static void FiberUnmapStack(const FiberObject* fiber) {
+	std::pair<uint64_t, uint64_t> stack {};
+	{
+		std::lock_guard lock(g_fiber_stack_mutex);
+		if (auto node = g_fiber_stacks.extract(fiber)) stack = node.mapped();
+	}
+	if (stack.first != 0) LibKernel::UnmapGuestStack(stack.first, stack.second);
+}
+
+static uint64_t FiberMapStack(const FiberObject* fiber, uint64_t size) {
+	FiberUnmapStack(fiber);
+	const auto stack = LibKernel::MapGuestStack(size);
+	if (stack != 0) {
+		std::lock_guard lock(g_fiber_stack_mutex);
+		g_fiber_stacks[fiber] = {stack, size};
+	}
+	return stack;
+}
+
 #if defined(__x86_64__) || defined(_M_X64)
 [[gnu::naked,
   gnu::returns_twice]] static KYTY_SYSV_ABI int FiberSaveContext(FiberCpuContext* /*ctx*/) {
@@ -2538,8 +2590,7 @@ static void FiberRestoreContext(FiberCpuContext* ctx, uint64_t ret) {
 
 [[noreturn]] static void FiberStartOnGuestStack(FiberObject* fiber) {
 	FiberCpuContext ctx {};
-	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->addr_context) +
-	                            static_cast<uintptr_t>(fiber->size_context);
+	const auto      stack_top = reinterpret_cast<uintptr_t>(fiber->context_end);
 	auto            rsp       = (stack_top & ~static_cast<uintptr_t>(0x0f));
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	rsp -= 4u * sizeof(uint64_t);
@@ -2612,9 +2663,14 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 	fiber->addr_context      = addr_context;
 	fiber->size_context      = size_context;
 	fiber->flags             = (build_version >= 0x03500000 ? FIBER_FLAG_SET_FPU_REGS : 0);
-	fiber->context_start     = addr_context;
-	fiber->context_end =
-	    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
+	if (const auto stack = FiberMapStack(fiber, size_context + FIBER_STACK_EXTRA); stack != 0) {
+		fiber->context_start = reinterpret_cast<void*>(stack);
+		fiber->context_end   = reinterpret_cast<uint8_t*>(stack) + size_context + FIBER_STACK_EXTRA;
+	} else {
+		fiber->context_start = addr_context;
+		fiber->context_end =
+		    (addr_context != nullptr ? static_cast<uint8_t*>(addr_context) + size_context : nullptr);
+	}
 	std::memset(&fiber->saved_context, 0, sizeof(fiber->saved_context));
 	FiberSetContextValid(fiber, false);
 	fiber->magic_end = FIBER_MAGIC_END;
@@ -2672,6 +2728,7 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	FiberUnmapStack(fiber);
 
 	return OK;
 }

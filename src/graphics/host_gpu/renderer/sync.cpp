@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/videoOut.h"
+#include "live-trace.h"
 #include "kernel/eventQueue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -78,6 +79,7 @@ static void RecordEndOfPipeWrite(uint64_t submit_id, CommandBuffer& buffer, uint
                                  uint32_t context_id = 0) {
 	EXIT_IF(destination == 0);
 	(void)buffer.Handle();
+	LiveTrace::Event(LiveTrace::LabelWrite, destination, (value & 0xffffffffffffull) | uint64_t {1} << 56u);
 
 	const auto width      = static_cast<uint32_t>(size);
 	const auto value_low  = static_cast<uint32_t>(value);
@@ -185,6 +187,7 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 		    video_out.SubmitFlipFromGpu(buffer, handle, index, flip_mode, flip_arg, request_id);
 		if (result == OK) {
 			EXIT_IF(request_id == 0);
+			buffer.GetContext().GetGpuResources().NoteGpuFlip();
 			return request_id;
 		}
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {

@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "slow-log.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -26,6 +27,9 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +45,10 @@
 #ifdef max
 #undef max
 #endif
+
+extern "C" {
+[[gnu::used]] volatile std::atomic_uint32_t kyty_local_binding_scratch_mode {0};
+}
 
 namespace Libs::Graphics {
 
@@ -65,7 +73,8 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::BdaPagetable:
 		case BindingKind::FaultBuffer:
 		case BindingKind::FlattenedSrt:
-		case BindingKind::ShaderData: return vk::DescriptorType::eStorageBuffer;
+		case BindingKind::ShaderData:
+		case BindingKind::LodStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -148,13 +157,18 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
-	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+	if ((resource.atomic && adjustment % sizeof(uint32_t) != 0) ||
+	    adjustment >= 256 || size > max_range - adjustment) {
+		EXIT("storage buffer offset adjustment is unsupported: stage=%s slot=%u "
+		     "guest=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64
+		     " alignment=0x%" PRIx64 " adjustment=0x%" PRIx64 " max=0x%" PRIx64 "\n",
+		     ShaderStageResourceName(stage), slot, address, size, offset,
+		     static_cast<uint64_t>(alignment), adjustment, static_cast<uint64_t>(max_range));
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.formatted && resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+		context.GetTextureCache().InvalidateMemoryFromGPU(address, size, "storage-buffer");
 	}
 	const char* access = "Read";
 	if (resource.written && resource.read) {
@@ -232,36 +246,35 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
-static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
-                                        const ShaderTextureResource& descriptor, const Image& image,
-                                        vk::Format view_format, uint64_t size) {
+// The report of a depth image sampled in a way these paths do not support; empty when supported.
+static std::string UnsupportedSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                                                  const ShaderTextureResource& descriptor, const Image& image,
+                                                  vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	const bool encoding_ok = IsSupportedDepthTextureEncoding(descriptor, resource.r128);
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
-		return;
+		return {};
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth image: resource=%d encoding=%d view=%d "
-	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
-	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
-	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
-	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-	     resource_ok, encoding_ok, view_ok,
-	     static_cast<uint32_t>(resource.resource_class),
-	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
-	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
-	     resource.depth_compare, static_cast<uint32_t>(descriptor.Format()),
-	     descriptor.DstSelXYZW(), static_cast<int>(image.info.pixel_format),
-	     static_cast<int>(view_format), image.info.resources.layers,
-	     static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(), descriptor.Depth(),
-	     descriptor_pitch, image.info.pitch, descriptor.Base40(), size, descriptor.fields[0],
-	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	return fmt::format(
+	    "unsupported sampled depth image: resource={:d} encoding={:d} view={:d} class={} numeric={} "
+	    "dimension={} mip_mode={} read={:d} written={:d} atomic={:d} compare={:d} guest_format={} "
+	    "swizzle=0x{:03x} image_format={} view_format={} image_layers={} descriptor_type={} base_array={} "
+	    "depth={} descriptor_pitch={} target_pitch={} addr=0x{:016x} size=0x{:016x} "
+	    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+	    resource_ok, encoding_ok, view_ok, static_cast<uint32_t>(resource.resource_class),
+	    static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
+	    static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
+	    resource.depth_compare, static_cast<uint32_t>(descriptor.Format()), descriptor.DstSelXYZW(),
+	    static_cast<int>(image.info.pixel_format), static_cast<int>(view_format), image.info.resources.layers,
+	    static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(), descriptor.Depth(), descriptor_pitch,
+	    image.info.pitch, descriptor.Base40(), size, descriptor.fields[0], descriptor.fields[1],
+	    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+	    descriptor.fields[6], descriptor.fields[7]);
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
@@ -361,8 +374,9 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
 }
 
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size) {
+// The report of a storage texture these paths do not support; empty when supported.
+std::string StorageTextureReport(const ShaderRecompiler::IR::ImageResource& resource,
+                                 const ShaderTextureResource& descriptor, uint64_t size) {
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
@@ -378,15 +392,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
 	     (!resource.atomic || format == Prospero::BufferFormat::k32UInt));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
-		return;
+		return {};
 	}
-	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
-	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
-	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
-	     "depth_tile_bpe=%u swizzle_ok=%d "
-	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
-	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	return fmt::format("unsupported storage texture: resource={:d} descriptor={:d} encoding={:d} format={:d} "
+	     "class={} numeric={} dimension={} mip_mode={} atomic={:d} compare={:d} "
+	     "base_level={} last_level={} max_mip={} min_lod={} base_array={} bc={} msaa={:d} "
+	     "depth_tile_bpe={} swizzle_ok={:d} "
+	     "addr=0x{:016x}" " size=0x{:016x}"
+	     " extent={}x{}x{} type={} format={} tile={} swizzle=0x{:03x} read={:d} written={:d} "
+	     "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
@@ -428,6 +442,31 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
 	desc.view_info.type       = vk::ImageViewType::e2D;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			desc.info.type      = Prospero::ImageType::kColor1D;
+			desc.view_info.type = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			desc.info.type      = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
+			desc.info.samples = 4;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			desc.info.samples   = 4;
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		default: break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -479,6 +518,125 @@ static void PopulateTextureMipLayout(ImageInfo& info) {
 		    padded[level].height >> texel_shift,
 		};
 	}
+}
+
+// The guest texture of the levels `first`.. of `full`, its larger levels left out: the tiled layout puts the mip tail
+// first and then the levels from the smallest up, so a 2D texture's levels from `first` on are the first bytes of its
+// memory, laid out as the texture of its size >> first with that many fewer levels. False where that does not hold
+// byte for byte (every level's offset, size and padding is compared).
+static bool TextureFromLevel(const ImageInfo& full, uint32_t first, ImageInfo& out) {
+	if (first == 0 || first >= full.resources.levels || full.resources.levels > full.mip_layout.size()) return false;
+	const auto shift = [&](uint32_t value) { return std::max((value + (1u << first) - 1u) >> first, 1u); };
+	out                  = full;
+	out.extent.width     = shift(full.extent.width);
+	out.extent.height    = shift(full.extent.height);
+	out.resources.levels = full.resources.levels - first;
+	// (A tiling the smaller texture has no layout for: TileGetTextureSize would end the emulator. 10-13, 2-2: format 182,
+	// tile 27, the levels from 1 of a texture as 67x1, one level.)
+	if (TileSurfaceLayout probe {}; full.tile_mode != Prospero::TileMode::kLinear &&
+	                                !TileGetTiledTextureLayout({full.guest_format, full.tile_mode, TileSurfaceDimension::Dim2D,
+	                                                            out.extent.width, out.extent.height, 1,
+	                                                            out.resources.levels, 1},
+	                                                           probe)) {
+		return false;
+	}
+	out.pitch            = TileGetTexturePitch(full.guest_format, out.extent.width, full.tile_mode);
+	TileSizeAlign size {};
+	if (!TileGetTextureTotalSize(full.guest_format, out.extent.width, out.extent.height, 1, out.resources.levels,
+	                             full.tile_mode, false, size) ||
+	    size.size == 0 || size.size >= full.data.size || size.align == 0 || full.data.address % size.align != 0) {
+		return false;
+	}
+	out.data       = {full.data.address, size.size};
+	out.mip_layout = {};
+	PopulateTextureMipLayout(out);
+	for (uint32_t level = 0; level < out.resources.levels; ++level) {
+		const auto& mip = out.mip_layout[level];
+		if (mip != full.mip_layout[first + level] || mip.size == 0 || mip.offset + mip.size > out.data.size) return false;
+	}
+	return true;
+}
+
+// KYTY_TEXTURE_PREFIX=1|0 (default: on with less than 12 GiB of video memory): a sampled 2D texture whose T# starts at
+// level k > 0 is held as the texture of its levels k.. (TextureFromLevel), not whole. The game streams a texture in from
+// its smallest levels and samples a larger one once it is loaded: at 1-1 on an 8 GB laptop 495 of the 913 textures
+// were never sampled from level 0, their larger levels 1.7 GB of the 3.9 GB the textures took, on a card holding 10 GB
+// in its 7.3 GB budget. An image of the whole texture, or of the texture from a lower level, serves the view as before;
+// when the game samples a larger level, the lookup makes the texture from that level (or the whole), and the smaller
+// image goes unused (a new image over its memory ends the resolution cache's hold on it).
+static bool TexturePrefixEnabled(bool small_video_memory) {
+	static const char* const value = std::getenv("KYTY_TEXTURE_PREFIX");
+	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+}
+
+static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+	const auto  base = desc.view_info.base_level;
+	const auto& full = desc.info;
+	if (base == 0 || !TexturePrefixEnabled(small_video_memory) || full.resources.layers != 1 || full.samples != 1 ||
+	    full.type != Prospero::ImageType::kColor2D || full.IsVolume() || full.IsDepth() || full.HasMetadata() ||
+	    full.HasStencil() || full.tile_mode == Prospero::TileMode::kLinear ||
+	    full.tile_mode == Prospero::TileMode::kDepth || full.tile_mode == Prospero::TileMode::kRenderTarget ||
+	    cache.HoldsImage(full)) {
+		return;
+	}
+	ImageInfo from {};
+	for (uint32_t first = 1; first < base; ++first) {
+		if (TextureFromLevel(full, first, from) && cache.HoldsImage(from)) {
+			desc.info                 = from;
+			desc.view_info.base_level = base - first;
+			return;
+		}
+	}
+	if (!TextureFromLevel(full, base, from)) return;
+	desc.info                 = from;
+	desc.view_info.base_level = 0;
+}
+
+// KYTY_TEXTURE_LAYER_RANGE=1|0 (default: on with less than 12 GiB of video memory): a sampled array texture of one
+// level whose view starts past its first layer is held as the array of the layers the view reads, not whole. The
+// game's streamed texture pool is one T# of ~1700 1024x1024 BC layers (1.7 GB at 0x1009000000, over the shadow-map
+// pool's lent layers) of which a view samples one (base layer 737 at 2-3, 1617 at 4-1): the whole array was made, its
+// buffer joined from 8 others (3 s), and that buffer over the shadow-map layers refused their partial uploads, which
+// became whole 320 MiB uploads: frames of 5 and 17 s on an 8 GB laptop. Not a view of more than half the layers (an
+// array view from layer 17 of 1585 at 4-2): an image of nearly all of it beside the whole one other views take.
+static bool TextureLayerRangeEnabled(bool small_video_memory) {
+	static const char* const value = std::getenv("KYTY_TEXTURE_LAYER_RANGE");
+	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
+}
+
+static void HoldLayerRange(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
+	const auto& full  = desc.info;
+	const auto  first = desc.view_info.base_layer;
+	const auto  count = desc.view_info.layer_count;
+	if (first == 0 || count == 0 || full.resources.layers < 2 || first + count > full.resources.layers ||
+	    count > full.resources.layers / 2 ||
+	    !TextureLayerRangeEnabled(small_video_memory) || full.resources.levels != 1 || full.samples != 1 ||
+	    full.IsVolume() || full.IsDepth() || full.HasMetadata() || full.HasStencil() || full.mip_layout.empty() ||
+	    full.mip_layout[0].offset != 0 || full.mip_layout[0].size != full.data.size ||
+	    full.data.size % full.resources.layers != 0 || cache.HoldsImage(full)) {
+		return;
+	}
+	// One level with nothing before or after it: the layers are whole slices, one after another.
+	const uint64_t slice = full.data.size / full.resources.layers;
+	ImageInfo      from  = full;
+	from.data             = {full.data.address + slice * first, slice * count};
+	from.resources.layers = count;
+	from.mip_layout       = {};
+	PopulateTextureMipLayout(from);
+	if (from.data.address % (uint64_t {64} << 10u) != 0 || from.mip_layout[0].offset != 0 ||
+	    from.mip_layout[0].size != from.data.size) {
+		return;
+	}
+	if (full.data.size >= (uint64_t {256} << 20u)) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("TextureCache: array view held as layers %u..%u of %u (0x%llx, %llu of %llu MiB)\n", first,
+			            first + count - 1, full.resources.layers, static_cast<unsigned long long>(from.data.address),
+			            static_cast<unsigned long long>(from.data.size >> 20u),
+			            static_cast<unsigned long long>(full.data.size >> 20u));
+	}
+	desc.info                 = from;
+	desc.view_info.base_layer = 0;
 }
 
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
@@ -540,8 +698,50 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
+// Sampled-texture resolutions, keyed by resource and descriptor words and valid
+// while the texture cache's resolution epoch is unchanged.
+struct RenderExecutor::TextureResolveCache {
+	struct Entry {
+		ShaderRecompiler::IR::DescriptorValue value;
+		ShaderRecompiler::IR::ImageResource   resource;
+		TextureBinding                        binding;
+		uint64_t                              epoch = 0;
+	};
+	std::array<Entry, 4096> entries;
+};
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
+	if (resource.written || resource.atomic || resource.depth_compare ||
+	    resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+		return ResolveTextureUncached(resource, value);
+	}
+	if (!m_texture_resolve_cache) {
+		m_texture_resolve_cache = std::make_shared<TextureResolveCache>();
+	}
+	uint64_t hash = resource.source ^ (uint64_t {resource.first_use_pc} << 32u);
+	for (const auto word: value.dwords) {
+		hash = (hash ^ word) * 0x9e3779b97f4a7c15ull;
+	}
+	auto&      entry       = m_texture_resolve_cache->entries[(hash ^ (hash >> 32u)) & 4095u];
+	auto&      cache       = m_context.GetTextureCache();
+	const bool key_matches = entry.epoch && entry.value == value && entry.resource == resource;
+	if (key_matches &&
+	    cache.TryReuseSampledImage(entry.binding.image_id, entry.binding.desc, entry.epoch)) {
+		return entry.binding;
+	}
+	auto epoch  = cache.ResolutionEpoch();
+	auto result = ResolveTextureUncached(resource, value);
+	// Discovery may insert/merge an owner. Publish only after a lookup with stable identity.
+	if (cache.TryReuseSampledImage(result.image_id, result.desc, epoch)) {
+		entry = {value, resource, result, epoch};
+	}
+	return result;
+}
+
+TextureBinding RenderExecutor::ResolveTextureUncached(
+    const ShaderRecompiler::IR::ImageResource& resource,
+    const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
 	if (storage) {
@@ -573,22 +773,37 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
 	const bool msaa_array = type == Prospero::ImageType::kColor2DMsaaArray;
+	// A stale descriptor in a slot the shader does not sample (seen while a level loads) can be
+	// invalid; it is bound as a null image like an unrepresentable one. A storage view loses its writes
+	// that way, which beats the game ending over one binding (they exited before).
+	const auto bind_null = [&](const std::string& report) -> TextureBinding {
+		if (m_unrepresentable_textures.insert(address).second) {
+			if (storage) {
+				std::printf("TextureCache: %s, storage view bound as null\n", report.c_str());
+				std::fflush(stdout);
+			}
+			LOGF("TextureCache: %s, bound as null\n", report.c_str());
+		}
+		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                    : TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	};
 	if ((!multisampled && (base_level > view_last_level || view_last_level >= levels)) ||
 	    (multisampled &&
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
+		return bind_null(fmt::format(
+		    "unsupported texture mip view: base={} last={} levels={} max={} type={} tile={} class={} "
+		    "numeric={} dimension={} mip_mode={} read={} written={} addr=0x{:016x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    base_level, last_level, levels, descriptor.MaxMip(), static_cast<uint32_t>(descriptor.Type()),
+		    static_cast<uint32_t>(tile), static_cast<uint32_t>(resource.resource_class),
+		    static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
+		    static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, address,
+		    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+		    descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]));
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto view_levels =
@@ -613,7 +828,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto    image_layers = layered ? depth : 1u;
 	uint32_t      pitch        = 0;
 	TileSizeAlign size {};
-	if (multisampled) {
+	const auto& limits    = m_context.GetGraphics().GetPhysicalDeviceProperties().limits;
+	const char* rejection = nullptr;
+	if (volume ? depth > limits.maxImageDimension3D : image_layers > limits.maxImageArrayLayers) {
+		rejection = "exceeds host image limits";
+	} else if (multisampled) {
 		const auto bytes = Prospero::NumBytesPerElement(format);
 		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
 		                              : TileGetRenderTargetPitch(width, bytes, last_level);
@@ -622,15 +841,66 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			EXIT("unsupported multisample texture layout\n");
 		}
 		size.size *= image_layers;
+	} else if (TileTextureElementLayout element {}; !TileGetTextureElementLayout(format, element)) {
+		// A stale descriptor (a compute pass while Latria loaded, format 129) has no layout to size.
+		rejection = "format without a texel layout";
 	} else {
 		pitch = TileGetTexturePitch(format, width, tile);
-		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels, tile,
-		                        volume, size);
+		if (!TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers, levels,
+		                             tile, volume, size)) {
+			rejection = "footprint exceeds 32 bits";
+		}
 	}
-	EXIT_NOT_IMPLEMENTED(size.size == 0 || size.align == 0 ||
-	                     (address & (static_cast<uint64_t>(size.align) - 1u)) != 0);
+	if (rejection != nullptr) {
+		const auto report = fmt::format(
+		    "unrepresentable texture ({}): {}x{} depth={} layers={} levels={} format={} tile={} "
+		    "type={} base_array={} array_pitch={} max_mip={} kind={} dimension={} source={} "
+		    "first_use_pc=0x{:08x} indirect_root={} addr=0x{:016x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    rejection, width, height, depth, image_layers, levels, static_cast<uint32_t>(format),
+		    static_cast<uint32_t>(tile), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		    descriptor.ArrayPitch(), descriptor.MaxMip(), static_cast<uint32_t>(resource.resource_class),
+		    static_cast<uint32_t>(resource.dimension), resource.source, resource.first_use_pc,
+		    resource.indirect_root, address, descriptor.fields[0], descriptor.fields[1],
+		    descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		    descriptor.fields[6], descriptor.fields[7]);
+		return bind_null(report);
+	}
+	if (tile == Prospero::TileMode::kDepth && m_depth_tiled_reports.insert(address).second) {
+		LOGF("TextureCache: depth-tiled sampled view: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " %ux%u depth=%u layers=%u levels=%u format=%u type=%u base_array=%u kind=%u"
+		     " storage=%d dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		     address, static_cast<uint64_t>(size.size), width, height, depth, image_layers, levels,
+		     static_cast<uint32_t>(format), static_cast<uint32_t>(type), descriptor.BaseArray5(),
+		     static_cast<uint32_t>(resource.resource_class), storage ? 1 : 0, descriptor.fields[0],
+		     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
+		     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	}
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		// A sampled view whose guest address misses the alignment the tile table
+		// asks for cannot be described. Storage views carry compute results back,
+		// so they still have to be exact and keep aborting; a sampled view can
+		// degrade the same way an unrepresentable one already does, which keeps
+		// the emulator running instead of killing the session.
+		if (storage) {
+			return bind_null(fmt::format("misaligned storage view addr=0x{:016x} size=0x{:x} align=0x{:x}", address,
+			                             static_cast<uint64_t>(size.size), static_cast<uint64_t>(size.align)));
+		}
+		if (m_unrepresentable_textures.insert(address).second) {
+			LOGF("TextureCache: misaligned sampled view addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " align=0x%016" PRIx64 ", bound as null\n",
+			     address, static_cast<uint64_t>(size.size),
+			     static_cast<uint64_t>(size.align));
+		}
+		auto       desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+		const auto id   = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
 	if (storage) {
-		ValidateStorageTexture(resource, descriptor, size.size);
+		if (auto report = StorageTextureReport(resource, descriptor, size.size); !report.empty()) {
+			return bind_null(report);
+		}
 	}
 
 	auto pixel_format = surface_format.vk_format;
@@ -646,6 +916,19 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
+	// (A descriptor of no guest memory, which the texture cache would stop the emulator over: once in a 1-1 walk a
+	// normal-path indirect draw's T# held 0x503f80000000.)
+	if (address >= TRACKER_ADDRESS_SIZE || size.size > TRACKER_ADDRESS_SIZE - address) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+			std::printf("TextureCache: texture data outside guest memory addr=0x%llx size=0x%llx, bound as null\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size));
+		return bind_null(fmt::format("texture data outside guest memory: addr=0x{:x} size=0x{:x} "
+		                             "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		                             address, static_cast<uint64_t>(size.size), descriptor.fields[0], descriptor.fields[1],
+		                             descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+		                             descriptor.fields[6], descriptor.fields[7]));
+	}
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, size.size};
 	desc.info.pixel_format = pixel_format;
@@ -667,6 +950,13 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.metadata.kind          = ImageMetadataKind::Dcc;
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
+		const auto& meta                 = desc.info.metadata.range;
+		if (meta.address == 0 || meta.address >= TRACKER_ADDRESS_SIZE ||
+		    meta.size > TRACKER_ADDRESS_SIZE - meta.address) {
+			return bind_null(fmt::format("DCC metadata outside guest memory: meta=0x{:x} size=0x{:x} "
+			                             "addr=0x{:016x}",
+			                             meta.address, meta.size, address));
+		}
 	}
 	if (samples > 1) {
 		desc.info.mip_layout[0] = {0, size.size, pitch, height};
@@ -676,7 +966,34 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	if (static const bool log_views = std::getenv("KYTY_UPLOAD_LOG") != nullptr; log_views && levels > 1 && !storage) {
+		std::printf("[tsc %llu] TSHARP addr=0x%llx size=0x%llx fmt=%u %ux%u levels=%u base=%u last=%u min_lod=%u warn=%u "
+		            "stats=%d\n",
+		            static_cast<unsigned long long>(__rdtsc()), static_cast<unsigned long long>(address),
+		            static_cast<unsigned long long>(size.size), static_cast<uint32_t>(format), width, height, levels,
+		            static_cast<uint32_t>(base_level), static_cast<uint32_t>(view_last_level),
+		            static_cast<uint32_t>(descriptor.MinLod()), static_cast<uint32_t>(descriptor.MinLodWarn5()),
+		            descriptor.MipStatsCntEn() ? 1 : 0);
+	}
+	// (Diagnostics: a view of 1 GiB or more, a few, with its T#: 10-11 a 1649-layer view of the 0x1009000000 pool.)
+	if (size.size >= (uint64_t {1} << 30u)) {
+		static std::atomic<uint32_t> reports {0};
+		if (reports.fetch_add(1, std::memory_order_relaxed) < 8) {
+			std::printf("TextureCache: large texture view addr=0x%llx size=0x%llx %ux%u layers=%u levels=%u base_array=%u "
+			            "fmt=%u tile=%u type=%u storage=%d pc=0x%x dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            static_cast<unsigned long long>(address), static_cast<unsigned long long>(size.size), width, height,
+			            image_layers, levels, static_cast<uint32_t>(descriptor.BaseArray5()), static_cast<uint32_t>(format),
+			            static_cast<uint32_t>(tile), static_cast<uint32_t>(type), storage ? 1 : 0, resource.first_use_pc,
+			            descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3],
+			            descriptor.fields[4], descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+			std::fflush(stdout);
+		}
+	}
 
+	if (!storage && type == Prospero::ImageType::kColor2D) {
+		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
+	}
+	if (!storage) HoldLayerRange(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -685,9 +1002,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
 		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
+			return bind_null(fmt::format("depth target bound as a storage image addr=0x{:016x}", address));
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		if (auto report = UnsupportedSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		    !report.empty()) {
+			return bind_null(report);
+		}
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -716,7 +1036,7 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	EXIT_IF(data.empty());
 	auto& command_buffer = context.GetCommandScheduler().Current();
 	EXIT_IF(command_buffer.IsInvalid());
-	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	auto&      buffer = context.GetBufferCache().GetShaderUploadBuffer();
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
@@ -743,6 +1063,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
+	if (!image.binding.is_target) ++image.validity;
 	image.binding.is_target = true;
 	TrackImageBinding(id);
 }
@@ -757,11 +1078,32 @@ void RenderExecutor::ResetBindings() {
 }
 
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+	PreparedBindings prepared;
+	PrepareBindingsInto(runtime, prepared);
+	return prepared;
+}
+
+void RenderExecutor::PrepareBindingsInto(const ShaderStageRuntime& runtime,
+                                         PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = runtime.resources;
-	PreparedBindings prepared;
+	SlowLog::Scope slow([&](double ms) {
+		std::printf("SLOW PrepareBindingsInto %.1f ms shader=0x%016llx images=%zu buffers=%zu samplers=%zu\n", ms,
+		            static_cast<unsigned long long>(program.shader_hash), snapshot.images.size(),
+		            snapshot.buffers.size(), snapshot.samplers.size());
+	});
+	// Retain vector capacity only. Every resource and upload belongs to this
+	// invocation; previous handles, shader data and stage associations are stale.
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
+	prepared.images.clear();
+	prepared.samplers.clear();
+	prepared.shader_data.clear();
+	prepared.gds = vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt = vk::DescriptorBufferInfo {};
+	prepared.shader_data_buffer = vk::DescriptorBufferInfo {};
 	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
@@ -782,7 +1124,6 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
-	return prepared;
 }
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
@@ -806,6 +1147,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			continue;
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		if (size == 0) { // unmapped: bound as a null buffer
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -823,6 +1168,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	for (uint32_t i = 0; i < layout.lod_stats_count; ++i) {
+		const auto desc = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+		prepared.shader_data[layout.LodStatsDword() + i] = desc.MipStatsCntEn()
+		    ? (0x80000000u | desc.MipStatsCntId() | (uint32_t(desc.BaseLevel()) << 8u) |
+		       (uint32_t(desc.MinLodWarn5()) << 12u)) : 0u;
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -835,6 +1186,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
+	for (uint32_t i = 0; i < layout.buffer_word_count; i++) {
+		prepared.shader_data[layout.BufferWordDword() + i] =
+		    ShaderRecompiler::IR::BufferDescriptorWord(snapshot.buffers[i]);
+	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
@@ -845,6 +1200,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
+// What FindTexture requires of a bound image.
+bool RenderExecutor::AcquirableImage(const TextureBinding& binding) {
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && !image->binding.needs_rebind &&
+	       (image->info.data.Empty() || (image->registered && !image->depth_id));
+}
+
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
@@ -852,21 +1214,81 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	const auto& snapshot = prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
-	auto& texture_cache = m_context.GetTextureCache();
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
+	auto&      texture_cache = m_context.GetTextureCache();
+	const auto acquirable    = [&](const TextureBinding& binding) { return AcquirableImage(binding); };
+	// (Diagnostics: the views that take each other's away, once per binding that falls back, for a few bindings.)
+	bool       reported = false;
+	const auto report   = [&] {
+		static std::atomic<uint32_t> bindings {0};
+		if (reported || bindings.fetch_add(1, std::memory_order_relaxed) >= 6) return;
+		reported = true;
+		for (uint32_t j = 0; j < images.size(); j++) {
+			const auto& info  = images[j].desc.info;
+			bool        alias = !acquirable(images[j]);
+			for (uint32_t k = 0; k < images.size() && !alias; k++) {
+				const auto& other = images[k].desc.info;
+				alias = k != j && !acquirable(images[k]) && !info.data.Empty() && !other.data.Empty() &&
+				        info.data.address < other.data.End() && other.data.address < info.data.End();
 			}
-			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+			if (!alias) continue;
+			const auto& w    = snapshot.images[j].dwords;
+			const auto& view = images[j].desc.view_info;
+			std::printf("RebindImages: shader 0x%016" PRIx64 " image %u held=%d addr=0x%llx size=0x%llx fmt=%u %ux%u "
+			            "levels=%u layers=%u tile=%u binding=%u view=%u+%u/%u+%u "
+			            "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+			            program.shader_hash, j, acquirable(images[j]) ? 1 : 0,
+			            static_cast<unsigned long long>(info.data.address),
+			            static_cast<unsigned long long>(info.data.size), static_cast<uint32_t>(info.guest_format),
+			            info.extent.width, info.extent.height, info.resources.levels, info.resources.layers,
+			            static_cast<uint32_t>(info.tile_mode), static_cast<uint32_t>(images[j].desc.type),
+			            view.base_level, view.level_count, view.base_layer, view.layer_count, w[0], w[1], w[2], w[3],
+			            w[4], w[5], w[6], w[7]);
 		}
+		std::fflush(stdout);
+	};
+	// Resolving one image (discovery can merge or replace owners) or acquiring one (a refresh) can take
+	// another one's away: both repeat until every image holds (a stale image met only at its acquisition
+	// ended a load at 1-1 with "texture requires rediscovery"). Views of aliased memory that the texture cache
+	// cannot keep as one image take each other's away for ever (the Shrine, 10-05): past half the passes, an
+	// image that still does not hold is bound as a null image.
+	for (uint32_t attempt = 0;; ++attempt) {
+		for (uint32_t pass = 0; !std::ranges::all_of(images, acquirable); ++pass) {
+			if (pass + attempt == 16) EXIT("RebindImages: the images of a binding do not settle\n");
+			const bool null = pass + attempt >= 8;
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				if (acquirable(images[i])) continue;
+				if (auto* old_image = texture_cache.m_slot_images.try_get(images[i].image_id)) {
+					old_image->binding = {};
+				}
+				if (null) {
+					report();
+					static std::atomic<uint32_t> reports {0};
+					if (reports.fetch_add(1, std::memory_order_relaxed) < 16)
+						std::printf("RebindImages: shader 0x%016" PRIx64 " image %u does not settle, bound as null\n",
+						            program.shader_hash, i);
+					const auto& resource = program.info.images[i];
+					auto        desc     = NullTextureDesc(resource, resource.written ? TextureCache::BindingType::Storage
+					                                                                  : TextureCache::BindingType::Texture);
+					const auto  id       = texture_cache.FindImage(desc);
+					images[i]            = {id, nullptr, std::move(desc)};
+				} else {
+					images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+				}
+				BindImage(images[i].image_id, images[i].desc.type == TextureCache::BindingType::Storage);
+			}
+		}
+		if (AcquireImages(prepared) && std::ranges::all_of(images, acquirable)) return;
 	}
+}
+
+bool RenderExecutor::AcquireImages(PreparedBindings& prepared) {
+	const auto& program       = *prepared.runtime->program;
+	auto&       images        = prepared.images;
+	auto&       texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
+		// An earlier acquisition took this image away: RebindImages resolves and acquires again.
+		if (!AcquirableImage(binding)) return false;
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
@@ -889,28 +1311,44 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (storage && !image.usage.storage) ++image.validity;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+		const auto host_view =
+		    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+		if (host_view != image.views.end()) {
+			auto& sampled = program.stage == ShaderType::Pixel
+			                    ? image.binding.pixel_sampled_aspects
+			                    : image.binding.other_sampled_aspects;
+			sampled |= host_view->info.aspect;
+		}
 	}
+	return true;
 }
 
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
-	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
-	};
+	GraphicsBindings bindings;
+	PrepareGraphicsBindingsInto(vertex, pixel, pixel_active, bindings);
+	return bindings;
+}
+
+void RenderExecutor::PrepareGraphicsBindingsInto(const ShaderStageRuntime& vertex,
+                                                  const ShaderStageRuntime& pixel,
+                                                  bool pixel_active, GraphicsBindings& bindings) {
+	PrepareBindingsInto(vertex, bindings.vertex);
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		if (!bindings.pixel) bindings.pixel.emplace();
+		PrepareBindingsInto(pixel, *bindings.pixel);
+	} else {
+		bindings.pixel.reset();
 	}
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
 	}
-	if (bindings.vertex.runtime->program->info.uses_dma ||
-	    (bindings.pixel && bindings.pixel->runtime->program->info.uses_dma)) {
-		m_context.GetGpuResources().PrepareBda();
-	}
+	PrepareBdaBindings(bindings.vertex, bindings.pixel ? &*bindings.pixel : nullptr);
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -919,15 +1357,41 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
 	}
-	return bindings;
 }
+
+void RenderExecutor::PrepareBdaBindings(const PreparedBindings& first, const PreparedBindings* second) {
+	const bool first_dma = first.runtime->program->info.uses_dma;
+	const bool second_dma = second && second->runtime->program->info.uses_dma;
+	if (!first_dma && !second_dma) return;
+	// (Reused per thread: every dispatch with flat or global reads prepares them.)
+	thread_local std::vector<GuestRange> first_ranges, second_ranges;
+	first_ranges.clear();
+	second_ranges.clear();
+	const bool bounded = (!first_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
+	    first.runtime->program->bda_read_plan, first.runtime->resources, first_ranges)) &&
+	    (!second_dma || ShaderRecompiler::IR::EvaluateBdaReadPlan(
+	    second->runtime->program->bda_read_plan, second->runtime->resources, second_ranges));
+	if (bounded) {
+		first_ranges.insert(first_ranges.end(), second_ranges.begin(), second_ranges.end());
+		if (m_context.GetGpuResources().PrepareBdaReadRanges(first_ranges)) return;
+	}
+	m_context.GetGpuResources().PrepareBda();
+}
+
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-descriptor-packet.inc"
+#endif
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
+                                    std::span<PreparedBindings* const> prepared_bindings, bool compute_chain) {
+	// Every transition below prepares the one draw or dispatch that follows this
+	// call, and none of them records a command, so repeats inside it are safe to
+	// drop.
+	const TransitGroup transit_group;
 	KYTY_PROFILER_FUNCTION();
-	auto   vk_buffer        = buffer.Handle();
+	auto   vk_buffer        = compute_chain ? buffer.ChainHandle() : buffer.Handle();
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	ShaderRecompiler::IR::PushData push_data;
@@ -998,12 +1462,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const bool depth_feedback =
 					    layout == vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
 					    program.stage == ShaderType::Pixel;
+					const bool general = layout == vk::ImageLayout::eGeneral;
 					const bool depth_read =
-					    depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
+					    general || depth_feedback || layout == vk::ImageLayout::eDepthReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
 					const bool stencil_read =
-					    layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
+					    general || layout == vk::ImageLayout::eStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthStencilReadOnlyOptimal ||
 					    layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal;
 					if ((aspect & vk::ImageAspectFlagBits::eDepth && !depth_read) ||
@@ -1034,6 +1499,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			binding.layout = image.backing.state.layout;
 		}
 
+	}
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (RecordLocalDescriptors(m_context, vk_buffer, pipeline_bind_point, pipeline,
+	                           prepared_bindings, m_descriptor_buffers, m_descriptor_images)) return;
+#endif
+
+	for (auto* prepared: prepared_bindings) {
+		const auto& program = *prepared->runtime->program;
+		auto& descriptors = *prepared;
+
 		m_image_occurrences.assign(descriptors.images.size(), 0);
 		for (const auto& binding: program.bindings.descriptors) {
 			vk::WriteDescriptorSet write {};
@@ -1057,6 +1532,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							m_descriptor_buffers.push_back(view);
 						}
 						break;
+					case BindingKind::LodStats: {
+						const auto* buffer = m_context.GetBufferCache().GetLodStatsBuffer();
+						m_descriptor_buffers.emplace_back(buffer->Handle(), 0, buffer->Size());
+						break;
+					}
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
 						auto&       cache      = m_context.GetBufferCache();

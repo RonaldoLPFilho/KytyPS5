@@ -228,9 +228,14 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Every use moves: take the list whole instead of erasing its entries one by one from the front.
+	const auto old_uses = std::exchange(uses, {});
+	auto*      new_inst = replacement.TryInstruction();
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		use.user->args[use.operand] = replacement;
+		if (new_inst != nullptr) {
+			use.user->AddUse(new_inst, use.operand);
+		}
 	}
 	Invalidate();
 	if (preserve) {
@@ -255,9 +260,7 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found != used->uses.end());
+	EXIT_IF(ValidationEnabled() && std::ranges::find(used->uses, Use {this, operand}) != used->uses.end());
 	used->uses.push_back({this, operand});
 }
 
@@ -266,6 +269,13 @@ void Inst::RemoveUse(Inst* used, size_t operand) {
 	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
 	EXIT_IF(found == used->uses.end());
 	used->uses.erase(found);
+}
+
+void Inst::DropLinks() {
+	args.clear();
+	phi_blocks.clear();
+	uses.clear();
+	opcode = ValueOpcode::Void;
 }
 
 void Inst::ClearArgs() {

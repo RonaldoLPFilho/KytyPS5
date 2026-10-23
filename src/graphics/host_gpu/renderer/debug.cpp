@@ -8,11 +8,14 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "live-census.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <iterator>
 #include <fmt/format.h>
 
 namespace Libs::Graphics {
@@ -35,7 +38,8 @@ static bool RenderTargetMaskHasBoundMrt(const CommandBuffer& buffer) {
 
 	uint32_t bound_targets = 0;
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			bound_targets++;
 		}
 	}
@@ -47,7 +51,8 @@ uint32_t render_target_first_bound_slot(const CommandBuffer& buffer) {
 	const auto& hw   = buffer.GetRegisters();
 	const auto  mask = hw.GetRenderTargetMask();
 	for (uint32_t i = 0; i < 8; i++) {
-		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0) {
+		if (render_target_mask_slot(mask, i) != 0 && hw.GetRenderTarget(i).base.addr != 0 &&
+		    hw.GetRenderTarget(i).info.format != Prospero::ChannelLayout::kInvalid) {
 			return i;
 		}
 	}
@@ -665,6 +670,15 @@ static void AaCheck(const HW::AaSampleControl& c, const HW::AaConfig& cf) {
 }
 
 void LogDrawPhase(const char* draw_name, const char* phase) {
+	if (LiveCensus::g_draw_phases) {
+		// Local diagnostic (live census, draw phases): the phase this marker starts.
+		static constexpr const char* phases[] = {"ResolveRenderColorTarget", "ResolveRenderDepthTarget",
+		                                         "GetGraphicsPrograms",      "PrepareBindings",
+		                                         "PrepareVertexBuffers",     "CreatePipeline",
+		                                         "BeginRendering",           "DrawComplete"};
+		for (uint32_t i = 0; i < std::size(phases); ++i)
+			if (std::strcmp(phase, phases[i]) == 0) LiveCensus::MarkDrawPhase(i + 1);
+	}
 	if (graphics_debug_dump_enabled()) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 1024) {

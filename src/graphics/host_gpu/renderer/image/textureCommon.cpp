@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "slow-log.h"
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -291,6 +292,10 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
                               std::vector<GpuTileInfo>& out_tile_infos) {
+	SlowLog::Scope slow([&](double ms) {
+		std::printf("SLOW TextureBuildGpuTileInfos %.1f ms tiled_size=0x%llx regions=%zu levels=%u tiles=%zu\n", ms,
+		            static_cast<unsigned long long>(tiled_size), regions.size(), levels, out_tile_infos.size());
+	}, SlowLog::HitchThreshold());
 	const auto& description    = layout.surface.description;
 	const bool  volume_texture = description.dimension == TileSurfaceDimension::Dim3D;
 	const auto  depth          = volume_texture ? description.depth : description.layers;

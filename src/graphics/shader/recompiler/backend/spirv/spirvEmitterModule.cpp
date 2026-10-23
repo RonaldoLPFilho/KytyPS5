@@ -125,6 +125,10 @@ uint32_t TypePhysicalU32Pointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPhysicalStorageBuffer, TypeU32(state));
 }
 
+uint32_t TypePhysicalU64Pointer(EmitterState& state) {
+	return TypePointer(state, StorageClassPhysicalStorageBuffer, TypeScalarU64(state));
+}
+
 uint32_t TypePushConstantElementPointer(EmitterState& state) {
 	return TypePointer(state, StorageClassPushConstant, TypeU32(state));
 }
@@ -243,6 +247,11 @@ void DefineDescriptorVariables(EmitterState& state) {
 		const auto pointer_type = TypePointer(state, StorageClassUniformConstant, array_type);
 		state.sampler_variable =
 		    state.builder.DefineGlobalVariable(pointer_type, StorageClassUniformConstant);
+	}
+	if (DescriptorBinding(state, IR::DescriptorBindingKind::LodStats) != nullptr) {
+		state.lod_stats_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
+		                                                        StorageClassStorageBuffer);
+		state.builder.RequireCapability(CapabilityImageQuery);
 	}
 	if (DescriptorBinding(state, IR::DescriptorBindingKind::Gds) != nullptr) {
 		state.gds_variable = state.builder.DefineGlobalVariable(TypeStorageBufferPointer(state),
@@ -384,21 +393,26 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	if (state.lod_stats_subgroup) {
+		state.lod_helper_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.lod_helper_variable);
+	}
+
+	const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components, const char* name) {
+		if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) { return input.kind == kind; })) {
+			state.inputs.push_back({kind, 0, components, 0, name});
+		}
+	};
 	if (state.lane_count == 2) {
-		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
-		                             const char* name) {
-			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
-				    return input.kind == kind;
-			    })) {
-				state.inputs.push_back({kind, 0, components, 0, name});
-			}
-		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
+	} else if (state.program.lane_local && state.requirements.subgroup_local_invocation_id) {
+		// (A lane-local wave64 program's GCN lane: BufferByteAddress.)
+		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 	}
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
@@ -474,6 +488,7 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 	switch (kind) {
 		case IR::StageInputKind::VertexIndex: return BuiltInVertexIndex;
 		case IR::StageInputKind::InstanceIndex: return BuiltInInstanceIndex;
+		case IR::StageInputKind::BaseInstance: return BuiltInBaseInstance;
 		case IR::StageInputKind::FragCoord: return BuiltInFragCoord;
 		case IR::StageInputKind::FrontFacing: return BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return BuiltInLayer;
@@ -489,6 +504,12 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 }
 
 void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.lod_helper_variable != 0) {
+		state.builder.AddName(state.lod_helper_variable, "gl_HelperInvocation");
+		state.builder.AddAnnotation({OpDecorate, state.lod_helper_variable,
+		                             DecorationBuiltIn, BuiltInHelperInvocation});
+	}
+
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddName(state.subgroup_local_invocation_id_variable,
 		                      "gl_SubgroupInvocationID");
@@ -614,6 +635,9 @@ void AddDescriptorAnnotationsAndNames(EmitterState& state) {
 	if (state.sampler_variable != 0) {
 		Decorate(state.sampler_variable, "samplers", IR::DescriptorBindingKind::Samplers);
 	}
+	if (state.lod_stats_variable != 0) {
+		Decorate(state.lod_stats_variable, "lod_stats", IR::DescriptorBindingKind::LodStats);
+	}
 	if (state.gds_variable != 0) {
 		Decorate(state.gds_variable, "gds", IR::DescriptorBindingKind::Gds);
 	}
@@ -685,8 +709,16 @@ void DefineModule(EmitterState& state) {
 	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
 		state.builder.RequireCapability(CapabilitySampleRateShading);
 	}
+	if (InputVariableForKind(state, IR::StageInputKind::BaseInstance) != 0) {
+		state.builder.RequireCapability(CapabilityDrawParameters);
+	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
+	}
+	if (state.lod_stats_subgroup) {
+		state.builder.RequireCapability(CapabilityGroupNonUniform);
+		state.builder.RequireCapability(CapabilityGroupNonUniformVote);
+		state.builder.RequireCapability(CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.lane_count == 2 || state.requirements.subgroup_ballot ||
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
@@ -761,6 +793,10 @@ void DefineModule(EmitterState& state) {
 			state.builder.AddName(state.scratch_variable[half], "scratch_dwords");
 		}
 	}
+	if (state.lod_helper_variable != 0) {
+		state.builder.DefineGlobalVariable(state.lod_helper_variable,
+		    TypePointer(state, StorageClassInput, TypeBool(state)), StorageClassInput);
+	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
 	AddDescriptorAnnotationsAndNames(state);
@@ -776,6 +812,7 @@ void DefineModule(EmitterState& state) {
 		switch (input.kind) {
 			case IR::StageInputKind::VertexIndex:
 			case IR::StageInputKind::InstanceIndex:
+			case IR::StageInputKind::BaseInstance:
 			case IR::StageInputKind::Layer:
 			case IR::StageInputKind::SampleId:
 				ptr_type = TypePointer(state, StorageClassInput, TypeI32(state));

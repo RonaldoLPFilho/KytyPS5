@@ -6,3 +6,11 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+/game-path.txt
+/no-precompile-prompt.txt
+/launcher-settings.json
+
+# Runtime data (saves, dev logs)
+_DevLog/
+_SaveData/
+__pycache__/

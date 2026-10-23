@@ -572,23 +572,6 @@ bool IsValidTarget(uint32_t target, const std::set<uint32_t>& instruction_pcs, u
 	return target == end_pc || (target >= first_pc && instruction_pcs.contains(target));
 }
 
-std::vector<uint32_t> AllBlockIds(uint32_t count) {
-	std::vector<uint32_t> ids;
-	ids.reserve(count);
-	for (uint32_t i = 0; i < count; i++) {
-		ids.push_back(i);
-	}
-	return ids;
-}
-
-std::vector<uint32_t> IntersectSorted(const std::vector<uint32_t>& a,
-                                      const std::vector<uint32_t>& b) {
-	std::vector<uint32_t> ret;
-	ret.reserve(std::min(a.size(), b.size()));
-	std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(ret));
-	return ret;
-}
-
 void SortUnique(std::vector<uint32_t>& values) {
 	std::sort(values.begin(), values.end());
 	values.erase(std::unique(values.begin(), values.end()), values.end());
@@ -596,6 +579,10 @@ void SortUnique(std::vector<uint32_t>& values) {
 
 bool Contains(const std::vector<uint32_t>& values, uint32_t value) {
 	return std::find(values.begin(), values.end(), value) != values.end();
+}
+
+bool ContainsSorted(const std::vector<uint32_t>& values, uint32_t value) {
+	return std::binary_search(values.begin(), values.end(), value);
 }
 
 bool ReplaceValue(std::vector<uint32_t>& values, uint32_t old_value, uint32_t new_value) {
@@ -699,8 +686,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.successors, id_map);
 		block.predecessors.clear();
-		block.dominators.clear();
-		block.post_dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -716,72 +701,131 @@ void PruneUnreachableBlocks(Graph& graph) {
 	graph.back_edges.clear();
 	graph.natural_loops.clear();
 	graph.components.clear();
+	graph.dominators      = {};
+	graph.post_dominators = {};
 	RebuildPredecessors(graph);
 }
 
-void ComputeDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
+// Cooper, Harvey, Kennedy: "A Simple, Fast Dominance Algorithm", over the blocks `roots` reach by
+// `next` edges (`prev`: the same edges reversed), the roots children of one virtual root.
+DominatorTree BuildDominatorTree(const Graph& graph, const std::vector<uint32_t>& roots,
+                                 std::vector<uint32_t> BasicBlock::*next,
+                                 std::vector<uint32_t> BasicBlock::*prev) {
+	constexpr uint32_t None  = UINT32_MAX;
+	const auto         count = static_cast<uint32_t>(graph.blocks.size());
+	const auto         root  = count; // the virtual root
 
-	for (auto& block: graph.blocks) {
-		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
-	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			if (block.id == graph.entry_block) {
-				continue;
-			}
-			std::vector<uint32_t> next;
-			if (block.predecessors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.predecessors.front()].dominators;
-				for (uint32_t i = 1; i < block.predecessors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.predecessors[i]].dominators);
+	// Reverse postorder; number[] is the position in it (the virtual root first).
+	std::vector<uint32_t>                      postorder;
+	std::vector<bool>                          seen(count, false);
+	std::vector<std::pair<uint32_t, uint32_t>> stack; // block, next edge
+	postorder.reserve(count);
+	for (const auto start: roots) {
+		if (start >= count || seen[start]) continue;
+		seen[start] = true;
+		stack.emplace_back(start, 0u);
+		while (!stack.empty()) {
+			const auto [block, edge] = stack.back();
+			const auto& edges        = graph.blocks[block].*next;
+			if (edge < edges.size()) {
+				stack.back().second++;
+				if (const auto to = edges[edge]; to < count && !seen[to]) {
+					seen[to] = true;
+					stack.emplace_back(to, 0u);
 				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.dominators) {
-				block.dominators = std::move(next);
-				changed          = true;
+			} else {
+				postorder.push_back(block);
+				stack.pop_back();
 			}
 		}
 	}
+	std::vector<uint32_t> number(count + 1u, None);
+	number[root] = 0;
+	for (uint32_t i = 0; i < postorder.size(); i++) {
+		number[postorder[postorder.size() - 1u - i]] = i + 1u;
+	}
+	std::vector<bool> is_root(count, false);
+	for (const auto start: roots) {
+		if (start < count) is_root[start] = true;
+	}
+
+	std::vector<uint32_t> idom(count + 1u, None);
+	idom[root]           = root;
+	const auto intersect = [&](uint32_t a, uint32_t b) {
+		while (a != b) {
+			while (number[a] > number[b]) a = idom[a];
+			while (number[b] > number[a]) b = idom[b];
+		}
+		return a;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto i = postorder.size(); i-- > 0;) {
+			const auto block    = postorder[i];
+			uint32_t   dominator = is_root[block] ? root : None;
+			for (const auto from: graph.blocks[block].*prev) {
+				if (from < count && idom[from] != None) {
+					dominator = dominator == None ? from : intersect(from, dominator);
+				}
+			}
+			if (idom[block] != dominator) {
+				idom[block] = dominator;
+				changed     = true;
+			}
+		}
+	}
+
+	DominatorTree tree;
+	tree.analysed = count;
+	tree.kind.assign(count, DominatorTree::All);
+	tree.parent.assign(count, None);
+	tree.depth.assign(count, 0u);
+	tree.enter.assign(count, 0u);
+	tree.leave.assign(count, 0u);
+	// Parents precede their children in reverse postorder.
+	std::vector<std::vector<uint32_t>> children(count + 1u);
+	for (auto i = postorder.size(); i-- > 0;) {
+		const auto block  = postorder[i];
+		const auto parent = idom[block];
+		tree.kind[block]   = DominatorTree::Tree;
+		tree.parent[block] = parent == root ? None : parent;
+		tree.depth[block]  = parent == root ? 1u : tree.depth[parent] + 1u;
+		children[parent].push_back(block);
+	}
+	uint32_t                                   preorder = 0;
+	std::vector<std::pair<uint32_t, uint32_t>> walk = {{root, 0u}};
+	while (!walk.empty()) {
+		const auto [block, child] = walk.back();
+		if (child < children[block].size()) {
+			walk.back().second++;
+			const auto next_block  = children[block][child];
+			tree.enter[next_block] = preorder++;
+			walk.emplace_back(next_block, 0u);
+		} else {
+			if (block != root) tree.leave[block] = preorder - 1u;
+			walk.pop_back();
+		}
+	}
+	return tree;
+}
+
+void ComputeDominators(Graph& graph) {
+	std::vector<uint32_t> roots;
+	if (graph.entry_block < graph.blocks.size()) roots.push_back(graph.entry_block);
+	for (const auto& block: graph.blocks) {
+		if (block.predecessors.empty()) roots.push_back(block.id);
+	}
+	graph.dominators =
+	    BuildDominatorTree(graph, roots, &BasicBlock::successors, &BasicBlock::predecessors);
 }
 
 void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
+	std::vector<uint32_t> roots;
+	for (const auto& block: graph.blocks) {
+		if (block.successors.empty()) roots.push_back(block.id);
 	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
-			}
-		}
-	}
+	graph.post_dominators =
+	    BuildDominatorTree(graph, roots, &BasicBlock::predecessors, &BasicBlock::successors);
 }
 
 void ComputeBackEdges(Graph& graph) {
@@ -799,10 +843,12 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
                                       bool* natural) {
 	std::vector<uint32_t> body;
 	std::vector<uint32_t> stack;
+	std::vector<bool>     in_body(graph.blocks.size(), false);
 	body.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
 	AddUnique(body, header);
 	AddUnique(body, latch);
+	for (const auto member: body) in_body[member] = true;
 	if (latch != header) {
 		stack.push_back(latch);
 	}
@@ -821,7 +867,8 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 			if (!graph.Dominates(header, pred) && natural != nullptr) {
 				*natural = false;
 			}
-			if (!Contains(body, pred)) {
+			if (!in_body[pred]) {
+				in_body[pred] = true;
 				body.push_back(pred);
 				if (pred != header) {
 					stack.push_back(pred);
@@ -852,7 +899,7 @@ void ComputeNaturalLoops(Graph& graph) {
 				continue;
 			}
 			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
+				if (!ContainsSorted(loop.body_blocks, succ)) {
 					AddUnique(loop.exit_blocks, succ);
 				}
 			}
@@ -923,7 +970,7 @@ void TarjanVisit(TarjanState& state, uint32_t block_id) {
 		}
 		if (member_block != nullptr) {
 			for (auto pred: member_block->predecessors) {
-				if (!Contains(component.blocks, pred)) {
+				if (!ContainsSorted(component.blocks, pred)) {
 					AddUnique(component.entry_blocks, member);
 				}
 			}
@@ -983,13 +1030,13 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
-		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
 		block.terminator.continue_block = RemapId(block.terminator.continue_block, id_map);
 	}
+	graph.dominators.Remap(id_map);
+	graph.post_dominators.Remap(id_map);
 
 	return id_map;
 }
@@ -1024,14 +1071,14 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
                                       uint32_t stop_block = UINT32_MAX) {
 	std::vector<uint32_t> blocks;
 	std::vector<uint32_t> stack = {header};
+	std::vector<bool>     added(graph.blocks.size(), false);
 	blocks.reserve(graph.blocks.size());
 	stack.reserve(graph.blocks.size());
 
 	while (!stack.empty()) {
 		const auto block_id = stack.back();
 		stack.pop_back();
-		if (block_id == stop_block || Contains(blocks, block_id) ||
-		    !graph.Dominates(header, block_id)) {
+		if (block_id == stop_block || !graph.Dominates(header, block_id) || added[block_id]) {
 			continue;
 		}
 
@@ -1040,7 +1087,8 @@ std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
 			continue;
 		}
 
-		AddUnique(blocks, block_id);
+		blocks.push_back(block_id);
+		added[block_id] = true;
 		for (auto succ: block->successors) {
 			if (succ != stop_block && graph.Dominates(header, succ)) {
 				stack.push_back(succ);
@@ -1096,7 +1144,7 @@ bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
 const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
 	const NaturalLoop* innermost = nullptr;
 	for (const auto& loop: graph.natural_loops) {
-		if (Contains(loop.body_blocks, block_id) &&
+		if (ContainsSorted(loop.body_blocks, block_id) &&
 		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
 			innermost = &loop;
 		}
@@ -1253,8 +1301,8 @@ bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& blo
 		};
 		return is_repeat_target(true_target) && is_repeat_target(false_target);
 	}
-	const bool true_in_body  = Contains(loop->body_blocks, true_target);
-	const bool false_in_body = Contains(loop->body_blocks, false_target);
+	const bool true_in_body  = ContainsSorted(loop->body_blocks, true_target);
+	const bool false_in_body = ContainsSorted(loop->body_blocks, false_target);
 	if (true_in_body != false_in_body) {
 		return true;
 	}
@@ -1317,8 +1365,8 @@ bool CanonicalizeNaturalLoops(Graph& graph) {
 			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
 			    is_loop_control_target(header->terminator.true_block) ||
 			    is_loop_control_target(header->terminator.false_block) ||
-			    !Contains(loop.body_blocks, header->terminator.true_block) ||
-			    !Contains(loop.body_blocks, header->terminator.false_block)) {
+			    !ContainsSorted(loop.body_blocks, header->terminator.true_block) ||
+			    !ContainsSorted(loop.body_blocks, header->terminator.false_block)) {
 				continue;
 			}
 
@@ -1368,7 +1416,7 @@ bool IsolateSemanticLoopHeaders(Graph& graph) {
 bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
                            const std::vector<uint32_t>& construct_blocks,
                            bool                         force_split = false) {
-	if (merge == UINT32_MAX || merge >= graph.blocks.size() || Contains(construct_blocks, merge)) {
+	if (merge == UINT32_MAX || merge >= graph.blocks.size() || ContainsSorted(construct_blocks, merge)) {
 		return false;
 	}
 
@@ -1380,7 +1428,7 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	std::vector<uint32_t> construct_predecessors;
 	bool                  has_external_predecessor = false;
 	for (auto pred: merge_block->predecessors) {
-		if (Contains(construct_blocks, pred)) {
+		if (ContainsSorted(construct_blocks, pred)) {
 			AddUnique(construct_predecessors, pred);
 		} else {
 			has_external_predecessor = true;
@@ -1435,11 +1483,12 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
                                       uint32_t merge) {
 	std::vector<uint32_t> region;
 	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
+	std::vector<bool>     added(graph.blocks.size(), false);
 	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
 	while (!pending.empty()) {
 		const auto block_id = pending.back();
 		pending.pop_back();
-		if (block_id == merge || Contains(region, block_id) ||
+		if (block_id == merge || (block_id < added.size() && added[block_id]) ||
 		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
 			continue;
 		}
@@ -1449,7 +1498,8 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 		}
 		// A return terminates its own block; a branch to a shared return still has to
 		// obey selection entry/exit rules, just like any other branch.
-		AddUnique(region, block_id);
+		region.push_back(block_id);
+		added[block_id] = true;
 		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
 	}
 	SortUnique(region);
@@ -1473,8 +1523,8 @@ bool SplitOneSelectionMerge(Graph& graph) {
 	std::sort(selection_headers.begin(), selection_headers.end(), [&](uint32_t lhs, uint32_t rhs) {
 		const auto* lhs_block = graph.FindBlock(lhs);
 		const auto* rhs_block = graph.FindBlock(rhs);
-		const auto  lhs_depth = lhs_block != nullptr ? lhs_block->dominators.size() : 0u;
-		const auto  rhs_depth = rhs_block != nullptr ? rhs_block->dominators.size() : 0u;
+		const auto  lhs_depth = lhs_block != nullptr ? graph.dominators.Depth(lhs) : 0u;
+		const auto  rhs_depth = rhs_block != nullptr ? graph.dominators.Depth(rhs) : 0u;
 		return lhs_depth != rhs_depth ? lhs_depth > rhs_depth : lhs < rhs;
 	});
 
@@ -1496,7 +1546,7 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			const auto* member_block = graph.FindBlock(member);
 			return member_block != nullptr &&
 			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
-				       return predecessor != block_id && !Contains(region, predecessor);
+				       return predecessor != block_id && !ContainsSorted(region, predecessor);
 			       });
 		});
 		if (external != region.end()) {
@@ -1584,37 +1634,88 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 	return const_cast<BasicBlock*>(static_cast<const Graph*>(this)->FindBlockByPc(pc));
 }
 
+bool DominatorTree::Dominates(uint32_t dominator, uint32_t block) const {
+	if (block >= kind.size() || dominator >= kind.size() || kind[block] == Unknown ||
+	    kind[dominator] == Unknown) {
+		return false;
+	}
+	if (kind[block] == All) return true;
+	return kind[dominator] == Tree && enter[dominator] <= enter[block] &&
+	       enter[block] <= leave[dominator];
+}
+
+uint32_t DominatorTree::Depth(uint32_t block) const {
+	if (block >= kind.size()) return 0;
+	return kind[block] == Tree ? depth[block] : kind[block] == All ? analysed : 0u;
+}
+
+// The member of both blocks' dominators the others all dominate.
+uint32_t DominatorTree::NearestCommon(uint32_t a, uint32_t b) const {
+	if (a >= kind.size() || b >= kind.size() || kind[a] == Unknown || kind[b] == Unknown) {
+		return UINT32_MAX;
+	}
+	if (kind[a] == All && kind[b] == All) {
+		return static_cast<uint32_t>(std::find(kind.begin(), kind.end(), All) - kind.begin());
+	}
+	if (kind[a] == All) return b;
+	if (kind[b] == All) return a;
+	while (depth[a] > depth[b]) a = parent[a];
+	while (depth[b] > depth[a]) b = parent[b];
+	while (a != b && a != UINT32_MAX) {
+		a = parent[a];
+		b = parent[b];
+	}
+	return a;
+}
+
+std::vector<uint32_t> DominatorTree::Dominators(uint32_t block) const {
+	std::vector<uint32_t> out;
+	if (block >= kind.size() || kind[block] == Unknown) return out;
+	if (kind[block] == All) {
+		for (uint32_t id = 0; id < kind.size(); id++) {
+			if (kind[id] != Unknown) out.push_back(id);
+		}
+		return out;
+	}
+	for (auto id = block; id != UINT32_MAX; id = parent[id]) out.push_back(id);
+	std::sort(out.begin(), out.end());
+	return out;
+}
+
+void DominatorTree::Remap(const std::vector<uint32_t>& id_map) {
+	DominatorTree out;
+	const auto    count = static_cast<uint32_t>(id_map.size());
+	out.analysed        = analysed;
+	out.kind.assign(count, Unknown);
+	out.parent.assign(count, UINT32_MAX);
+	out.depth.assign(count, 0u);
+	out.enter.assign(count, 0u);
+	out.leave.assign(count, 0u);
+	for (uint32_t old_id = 0; old_id < kind.size() && old_id < count; old_id++) {
+		const auto id = id_map[old_id];
+		if (id >= count) continue;
+		out.kind[id]   = kind[old_id];
+		out.parent[id] = parent[old_id] < count ? id_map[parent[old_id]] : parent[old_id];
+		out.depth[id]  = depth[old_id];
+		out.enter[id]  = enter[old_id];
+		out.leave[id]  = leave[old_id];
+	}
+	*this = std::move(out);
+}
+
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
-	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->dominators, dominator);
+	return FindBlock(block) != nullptr && dominators.Dominates(dominator, block);
 }
 
 bool Graph::PostDominates(uint32_t post_dominator, uint32_t block) const {
-	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->post_dominators, post_dominator);
+	return FindBlock(block) != nullptr && post_dominators.Dominates(post_dominator, block);
 }
 
 uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const {
-	const auto* a = FindBlock(block_a);
-	const auto* b = FindBlock(block_b);
-	if (a == nullptr || b == nullptr) {
+	if (FindBlock(block_a) == nullptr || FindBlock(block_b) == nullptr) {
 		return UINT32_MAX;
 	}
-
-	const auto common = IntersectSorted(a->post_dominators, b->post_dominators);
-	for (auto candidate: common) {
-		bool nearest = true;
-		for (auto other: common) {
-			if (other != candidate && !PostDominates(other, candidate)) {
-				nearest = false;
-				break;
-			}
-		}
-		if (nearest) {
-			return candidate;
-		}
-	}
-	return common.empty() ? UINT32_MAX : common.front();
+	return post_dominators.NearestCommon(block_a, block_b);
 }
 
 namespace {
@@ -2265,8 +2366,8 @@ std::string GraphToString(const Graph& graph) {
 		                    VectorToString(block.predecessors).c_str(),
 		                    VectorToString(block.successors).c_str());
 		text += fmt::format("  dominators=[{}] post_dominators=[{}]\n",
-		                    VectorToString(block.dominators).c_str(),
-		                    VectorToString(block.post_dominators).c_str());
+		                    VectorToString(graph.dominators.Dominators(block.id)).c_str(),
+		                    VectorToString(graph.post_dominators.Dominators(block.id)).c_str());
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "

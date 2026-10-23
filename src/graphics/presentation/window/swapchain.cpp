@@ -12,11 +12,28 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "loader/demonsSoulsWarp.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
+#include "frame-gen.h"
+#include "local-platform.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
+#include <string_view>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <thread>
+#include <optional>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -28,10 +45,13 @@
 namespace Libs::Graphics {
 
 struct Presenter::Frame {
-	VulkanImage image;
-	uint64_t    present_tick = 0;
-	bool        busy         = false;
-	bool        reusing_last = false;
+	VulkanImage            image;
+	FrameGen::FrameInputs  fg; // frame generation inputs (KYTY_FRAMEGEN)
+	uint64_t               present_tick = 0;
+	bool                   busy         = false;
+	bool                   reusing_last = false;
+	bool                   hdr          = false; // BT.2100 PQ pixels
+	bool                   blank        = false; // a cleared frame (no guest picture)
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -49,6 +69,7 @@ public:
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
+			FrameGen::DestroyInputs(m_window.graphic_ctx, frame->fg);
 		}
 	}
 	KYTY_CLASS_NO_COPY(FramePool);
@@ -283,7 +304,7 @@ public:
 	void                 Create();
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
-	[[nodiscard]] bool   PrepareSystemOverlay();
+	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
 	                                           bool draw_system_overlay);
 	uint64_t             Submit(CommandScheduler& scheduler);
@@ -293,13 +314,26 @@ public:
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
+	[[nodiscard]] bool IsHdrSupported() const noexcept { return m_hdr_supported.load(std::memory_order_relaxed); }
+	// The guest's frames are PQ (true) or SDR; true when the swapchain must be recreated for it.
+	[[nodiscard]] bool SetHdr(bool hdr) {
+		m_hdr_requested = hdr;
+		return m_hdr_active != (hdr && IsHdrSupported());
+	}
+	// Where RecordPresentCommands put the frame in the swapchain image.
+	[[nodiscard]] vk::Rect2D PresentRegion() const noexcept { return m_present_region; }
 
 private:
-	void Destroy();
+	void                 Destroy();
+	vk::SurfaceFormatKHR SelectFormat();
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
 	vk::Format                  m_format = vk::Format::eUndefined;
+	std::atomic_bool            m_hdr_supported {false};
+	bool                        m_hdr_requested = false;
+	bool                        m_hdr_active    = false;
 	vk::Extent2D                m_extent {};
 	std::vector<vk::Image>      m_images;
 	std::vector<vk::ImageView>  m_image_views;
@@ -308,6 +342,7 @@ private:
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
+	vk::Rect2D                  m_present_region {};
 };
 
 struct Presenter::Impl {
@@ -316,7 +351,88 @@ struct Presenter::Impl {
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
-		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		// One frame more than the swapchain's images: with frame generation the present worker holds
+		// the frame it presents and the next one waiting, while the GPU thread prepares a third.
+		frames.Initialize(swapchain.ImageCount() + 1u, swapchain.Format());
+	}
+	~Impl() { StopAsync(); }
+	KYTY_CLASS_NO_COPY(Impl);
+
+	// Presents the frame on the calling thread (the vblank thread, or the present worker).
+	void PresentNow(Frame& frame, bool reuse);
+
+	// KYTY_FRAMEGEN: DLSS-G's vkQueuePresentKHR shows the generated frame, paces, then shows the rendered one, and
+	// can take more than a 60 Hz vblank. On the vblank thread that held up the virtual vblank and the guest's flips
+	// (the game ran at 30 fps with frame generation on, 50-60 without). While frame generation is on, the vblank
+	// thread hands the frame to this worker and goes on; it waits only when a frame is already waiting.
+	// KYTY_FRAMEGEN_SYNC_PRESENT=1 presents on the vblank thread as before (for comparison).
+	[[nodiscard]] static bool AsyncPresentAllowed() {
+		static const bool allowed = std::getenv("KYTY_FRAMEGEN_SYNC_PRESENT") == nullptr;
+		return allowed;
+	}
+	void PostAsync(Frame& frame, bool reuse) {
+		const auto        begin = std::chrono::steady_clock::now();
+		std::unique_lock lock(async_mutex);
+		if (!async_thread.joinable()) {
+			async_thread = std::thread([this] { AsyncLoop(); });
+		}
+		async_cv.wait(lock, [this] { return async_pending == nullptr; });
+		const double blocked_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		async_post_count++;
+		async_post_blocked_ms_sum += blocked_ms;
+		async_post_blocked_ms_max = std::max(async_post_blocked_ms_max, blocked_ms);
+		async_pending       = &frame;
+		async_pending_reuse = reuse;
+		async_cv.notify_all();
+	}
+	// Until the worker has presented everything handed to it (before a present or a blank frame on the vblank thread:
+	// the swapchain and the present scheduler are used by one thread at a time).
+	void DrainAsync() {
+		std::unique_lock lock(async_mutex);
+		async_cv.wait(lock, [this] { return async_pending == nullptr && !async_busy; });
+	}
+	[[nodiscard]] bool AsyncIdle() {
+		std::lock_guard lock(async_mutex);
+		return async_pending == nullptr && !async_busy;
+	}
+	void AsyncLoop() {
+		LocalPlatform::SetThreadName("Kyty.Present");
+		std::unique_lock lock(async_mutex);
+		for (;;) {
+			async_cv.wait(lock, [this] { return async_pending != nullptr || async_stop; });
+			if (async_pending == nullptr) {
+				return; // stopping
+			}
+			auto*      frame = async_pending;
+			const bool reuse = async_pending_reuse;
+			async_pending    = nullptr;
+			async_busy       = true;
+			async_cv.notify_all();
+			lock.unlock();
+			if (async_stop) {
+				frames.Release(frame, reuse);
+			} else {
+				PresentNow(*frame, reuse);
+			}
+			lock.lock();
+			async_busy = false;
+			async_cv.notify_all();
+		}
+	}
+	void StopAsync() {
+		{
+			std::lock_guard lock(async_mutex);
+			async_stop = true;
+			async_cv.notify_all();
+		}
+		if (async_thread.joinable()) {
+			async_thread.join();
+		}
+		// A frame handed over after the worker's last look.
+		if (async_pending != nullptr) {
+			frames.Release(async_pending, async_pending_reuse);
+			async_pending = nullptr;
+		}
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -353,7 +469,189 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// KYTY_FPS_HUD: the frame rate panel, its numbers refreshed once a second (the game's presented
+	// frames times the frames DLSS-G shows for each).
+	SystemOverlayHud                      hud;
+	std::chrono::steady_clock::time_point hud_window {};
+	uint32_t                              hud_frames = 0;
+
+	// The present worker (PostAsync).
+	std::mutex              async_mutex;
+	std::condition_variable async_cv;
+	std::thread             async_thread;
+	Frame*                  async_pending       = nullptr;
+	bool                    async_pending_reuse = false;
+	bool                    async_busy          = false;
+	bool                    async_stop          = false;
+	uint32_t                async_post_count          = 0;   // under async_mutex
+	double                  async_post_blocked_ms_sum = 0.0; // under async_mutex
+	double                  async_post_blocked_ms_max = 0.0; // under async_mutex
+	// Frame generation presents (PresentNow): the GPU wait before it and the Streamline present call.
+	struct PresentTiming {
+		uint32_t presents = 0;
+		double   gpu_wait_sum = 0.0, gpu_wait_max = 0.0;
+		double   call_sum = 0.0, call_max = 0.0;
+		uint32_t over_vblank = 0; // gpu wait + call longer than a 60 Hz vblank
+	} present_timing;
+	void RecordPresentTiming(double gpu_wait_ms, double call_ms) {
+		auto& t = present_timing;
+		t.presents++;
+		t.gpu_wait_sum += gpu_wait_ms;
+		t.gpu_wait_max = std::max(t.gpu_wait_max, gpu_wait_ms);
+		t.call_sum += call_ms;
+		t.call_max = std::max(t.call_max, call_ms);
+		t.over_vblank += gpu_wait_ms + call_ms > 1000.0 / 60.0 ? 1u : 0u;
+		if (t.presents < 300) {
+			return;
+		}
+		uint32_t posts = 0;
+		double   blocked_sum = 0.0, blocked_max = 0.0;
+		{
+			std::lock_guard lock(async_mutex);
+			posts       = async_post_count;
+			blocked_sum = async_post_blocked_ms_sum;
+			blocked_max = async_post_blocked_ms_max;
+			async_post_count          = 0;
+			async_post_blocked_ms_sum = 0.0;
+			async_post_blocked_ms_max = 0.0;
+		}
+		std::printf("Frame generation present timing last %u presents: gpu_wait avg/max=%.2f/%.2f ms "
+		            "present_call avg/max=%.2f/%.2f ms over_60hz_vblank=%u async_posts=%u vblank_blocked avg/max=%.2f/%.2f ms\n",
+		            t.presents, t.gpu_wait_sum / t.presents, t.gpu_wait_max, t.call_sum / t.presents, t.call_max,
+		            t.over_vblank, posts, posts != 0 ? blocked_sum / posts : 0.0, blocked_max);
+		std::fflush(stdout);
+		t = {};
+	}
+
+	// The shader prefetch's progress line while it runs, and for a few seconds after.
+	std::chrono::steady_clock::time_point prefetch_finished {};
+	void UpdateStatus(std::chrono::steady_clock::time_point now) {
+		const auto progress = renderer.GetPipelineCache().GetPrefetchProgress();
+		hud.status.clear();
+		if (progress.total == 0) {
+			return;
+		}
+		std::array<char, 128> line {};
+		if (progress.done < progress.total) {
+			std::snprintf(line.data(), line.size(), "Preparing shaders %zu%%  (%zu / %zu)", progress.done * 100 / progress.total,
+			              progress.done, progress.total);
+		} else {
+			if (prefetch_finished == std::chrono::steady_clock::time_point {}) {
+				prefetch_finished = now;
+			}
+			if (now - prefetch_finished >= std::chrono::seconds(3)) {
+				return;
+			}
+			std::snprintf(line.data(), line.size(), "All shaders ready (%zu)", progress.total);
+		}
+		hud.status          = line.data();
+		hud.status_fraction = static_cast<float>(progress.done) / static_cast<float>(progress.total);
+	}
+
+	[[nodiscard]] SystemOverlayHud* UpdateHud(bool reuse) {
+		const bool enabled = FrameGen::FpsHudEnabled();
+		const auto now = std::chrono::steady_clock::now();
+		UpdateStatus(now);
+		hud.notice = Loader::DemonsSoulsWarp::HudText();
+		if (!enabled) {
+			return hud.status.empty() && hud.notice.empty() ? nullptr : PlaceHud();
+		}
+		if (hud_window == std::chrono::steady_clock::time_point {}) {
+			hud_window = now;
+		}
+		hud_frames += reuse ? 0u : 1u;
+		const double seconds = std::chrono::duration<double>(now - hud_window).count();
+		if (seconds >= 1.0) {
+			const double   game  = hud_frames / seconds;
+			const uint32_t shown = FrameGen::Enabled() ? FrameGen::PresentedFrames() : 1u;
+			std::array<char, 32>  title {};
+			std::array<char, 128> detail {};
+			std::snprintf(title.data(), title.size(), "%.0f FPS", game * shown);
+			if (shown > 1) {
+				std::snprintf(detail.data(), detail.size(), "DLSS Frame Generation %ux  |  game %.0f fps",
+				              shown, game);
+			} else {
+				std::snprintf(detail.data(), detail.size(), "game %.0f fps", game);
+			}
+			hud.title  = title.data();
+			hud.detail = detail.data();
+			hud_window = now;
+			hud_frames = 0;
+		}
+		if (hud.title.empty() && hud.status.empty() && hud.notice.empty()) {
+			return nullptr;
+		}
+		return PlaceHud();
+	}
+	SystemOverlayHud* PlaceHud() {
+		hud.region = swapchain.PresentRegion();
+		if (hud.region.extent.width == 0 || hud.region.extent.height == 0) {
+			hud.region = vk::Rect2D {{0, 0}, swapchain.Extent()};
+		}
+		return &hud;
+	}
+#if defined(_WIN32)
+	// Presents faster than the display refreshes only pile up in the compositor, and on Windows
+	// a present blocked there holds the driver's device lock (see Swapchain::Present).
+	std::chrono::steady_clock::time_point last_present {};
+	std::chrono::nanoseconds              min_present_interval {-1}; // -1: not queried yet
+	// A frame PresentDue turned away that no newer present replaced: the vblank thread shows it once the display can
+	// take it (Presenter::PresentSkippedIfDue).
+	bool skipped_unshown = false;
+
+	// `commit`: the present goes ahead now (the next one is timed from it).
+	[[nodiscard]] bool PresentDue(bool commit = true) {
+		if (min_present_interval.count() < 0) {
+			SDL_DisplayMode mode {};
+			const int       display = window.window != nullptr ? SDL_GetWindowDisplayIndex(window.window) : -1;
+			const int       refresh =
+			    display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 ? mode.refresh_rate : 0;
+			min_present_interval = std::chrono::nanoseconds(refresh > 0 ? 1000000000LL / refresh : 0);
+			LOGF("Presents limited to the display refresh: %d Hz\n", refresh);
+		}
+		const auto now = std::chrono::steady_clock::now();
+		// A quarter of the interval as slack: a 60 Hz guest on a 60 Hz display flips at the same
+		// rate, and with jitter every third present came a little early (40 fps shown).
+		if (min_present_interval.count() > 0 && now - last_present < min_present_interval * 3 / 4) return false;
+		if (commit) last_present = now;
+		return true;
+	}
+#endif
 };
+
+// --hdr: an HDR10 (ST 2084 PQ) surface format the presentation blit can write. The swapchain uses it
+// while the guest's frames are PQ; SDR frames (and before the first PQ frame) keep an SDR swapchain.
+vk::SurfaceFormatKHR Swapchain::SelectFormat() {
+	const auto& formats    = m_window.surface_capabilities.formats;
+	auto&       graphics   = m_window.graphic_ctx;
+	const auto  hdr_format = std::find_if(formats.begin(), formats.end(), [&](const vk::SurfaceFormatKHR& candidate) {
+		return candidate.colorSpace == vk::ColorSpaceKHR::eHdr10St2084EXT && IsHdrSwapchainFormat(candidate.format) &&
+		       static_cast<bool>(graphics.GetFormatProperties(candidate.format).optimalTilingFeatures &
+		                         vk::FormatFeatureFlagBits::eBlitDst);
+	});
+	const bool supported = Config::HdrEnabled() && hdr_format != formats.end();
+	if (Config::HdrEnabled() && supported != m_hdr_supported.load(std::memory_order_relaxed)) {
+		std::printf("HDR10 output: %s\n", supported ? "available" : "the display offers no HDR10 surface (SDR output)");
+		std::fflush(stdout);
+	}
+	m_hdr_supported.store(supported, std::memory_order_relaxed);
+	m_hdr_active = m_hdr_requested && supported;
+	if (m_hdr_active) {
+		return *hdr_format;
+	}
+	if (formats.size() == 1 && formats.front().format == vk::Format::eUndefined) {
+		return {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
+	}
+	for (const auto& candidate: formats) {
+		if (candidate.colorSpace != vk::ColorSpaceKHR::eSrgbNonlinear) {
+			continue;
+		}
+		if (candidate.format == vk::Format::eB8G8R8A8Unorm || candidate.format == vk::Format::eR8G8B8A8Unorm) {
+			return candidate;
+		}
+	}
+	EXIT("no supported UNORM swapchain format\n");
+}
 
 void Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
@@ -388,18 +686,7 @@ void Swapchain::Create() {
 	        ? vk::CompositeAlphaFlagBitsKHR::eOpaque
 	        : vk::CompositeAlphaFlagBitsKHR::eInherit;
 
-	vk::SurfaceFormatKHR format {vk::Format::eR8G8B8A8Unorm, vk::ColorSpaceKHR::eSrgbNonlinear};
-	if (surface.formats.size() != 1 || surface.formats.front().format != vk::Format::eUndefined) {
-		const auto it = std::find_if(surface.formats.begin(), surface.formats.end(),
-		                             [](const vk::SurfaceFormatKHR& candidate) {
-			                             return candidate.format == vk::Format::eB8G8R8A8Unorm ||
-			                                    candidate.format == vk::Format::eR8G8B8A8Unorm;
-		                             });
-		if (it == surface.formats.end()) {
-			EXIT("no supported UNORM swapchain format\n");
-		}
-		format = *it;
-	}
+	const auto format             = SelectFormat();
 	m_format                      = format.format;
 	const auto swapchain_features = graphics.GetFormatProperties(m_format).optimalTilingFeatures;
 	if (!static_cast<bool>(swapchain_features & vk::FormatFeatureFlagBits::eBlitDst)) {
@@ -439,6 +726,10 @@ void Swapchain::Create() {
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
+	if (Config::HdrEnabled()) {
+		std::printf("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
+		std::fflush(stdout);
+	}
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -494,6 +785,10 @@ void Swapchain::Destroy() {
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+	}
+	if (graphics.present_queue != nullptr) {
+		Common::LockGuard queue_lock(graphics.present_queue_mutex);
+		RequireVulkanSuccess(graphics.present_queue.waitIdle(), "wait for present queue");
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -570,11 +865,11 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	return Status::Success;
 }
 
-bool Swapchain::PrepareSystemOverlay() {
+bool Swapchain::PrepareSystemOverlay(SystemOverlayHud* hud) {
 	if (m_system_overlay == nullptr) {
 		m_system_overlay = std::make_unique<SystemOverlay>(m_window.graphic_ctx);
 	}
-	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount(), hud);
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
@@ -604,6 +899,37 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
+	// KYTY_PRESENT_ASPECT=fit: keep the frame's aspect ratio (black bars) instead of stretching
+	// it over the window; a 3840x2160 frame on a 5120x2160 screen is then copied 1:1.
+	static const bool aspect_fit = [] {
+		const char* value = std::getenv("KYTY_PRESENT_ASPECT");
+		return value != nullptr && std::string_view(value) == "fit";
+	}();
+	int dst_x = 0, dst_y = 0;
+	int dst_w = static_cast<int>(m_extent.width), dst_h = static_cast<int>(m_extent.height);
+	if (aspect_fit && source.extent.width != 0 && source.extent.height != 0) {
+		const double scale = std::min(static_cast<double>(m_extent.width) / source.extent.width,
+		                              static_cast<double>(m_extent.height) / source.extent.height);
+		dst_w = std::max(1, static_cast<int>(std::lround(source.extent.width * scale)));
+		dst_h = std::max(1, static_cast<int>(std::lround(source.extent.height * scale)));
+		dst_x = (static_cast<int>(m_extent.width) - dst_w) / 2;
+		dst_y = (static_cast<int>(m_extent.height) - dst_h) / 2;
+		if (dst_w != static_cast<int>(m_extent.width) || dst_h != static_cast<int>(m_extent.height)) {
+			const vk::ClearColorValue black {std::array<float, 4> {0.0f, 0.0f, 0.0f, 1.0f}};
+			vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, &black, 1,
+			                           &to_transfer.subresourceRange);
+			// (An image barrier: <windows.h> defines MemoryBarrier as a macro.)
+			auto cleared          = to_transfer;
+			cleared.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			cleared.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			cleared.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+			cleared.newLayout     = vk::ImageLayout::eTransferDstOptimal;
+			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+			                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &cleared);
+		}
+	}
+
+	m_present_region = vk::Rect2D {{dst_x, dst_y}, {static_cast<uint32_t>(dst_w), static_cast<uint32_t>(dst_h)}};
 	vk::ImageBlit region {};
 	region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	region.srcSubresource.mipLevel       = 0;
@@ -616,8 +942,10 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.dstSubresource.mipLevel       = 0;
 	region.dstSubresource.baseArrayLayer = 0;
 	region.dstSubresource.layerCount     = 1;
-	region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
-	region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
+	region.dstOffsets[0].x               = dst_x;
+	region.dstOffsets[0].y               = dst_y;
+	region.dstOffsets[1].x               = dst_x + dst_w;
+	region.dstOffsets[1].y               = dst_y + dst_h;
 	region.dstOffsets[1].z               = 1;
 	vk_command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
 	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1, &region,
@@ -678,9 +1006,13 @@ Swapchain::Status Swapchain::Present() {
 	present.waitSemaphoreCount = 1;
 
 	vk::Result result;
-	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+	if (auto& graphics = m_window.graphic_ctx; graphics.present_queue != nullptr) {
+		// Its own queue: a present blocked in the kernel does not hold up other submissions.
+		Common::LockGuard lock(graphics.present_queue_mutex);
+		result = graphics.present_queue.presentKHR(&present);
+	} else {
+		Common::LockGuard lock(graphics.queue_mutex);
+		result = graphics.queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -703,11 +1035,13 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto*             frame = m_impl->frames.Acquire();
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	frame->hdr              = hdr;
+	frame->blank            = false;
+	RenderLockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
@@ -722,6 +1056,11 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	frame->fg.valid = false;
+	if (FrameGen::CaptureRequested()) {
+		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
+		                        buffer, frame->fg);
+	}
 	return *frame;
 }
 
@@ -730,7 +1069,13 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire();
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	// Into the GPU thread's command buffer (its flip) under the renderer's lock; the present thread's blank frame
+	// (no producer) touches only the presenter's own scheduler and frame, as Present does.
+	std::optional<RenderLockGuard> render_lock;
+	if (producer != nullptr) render_lock.emplace(m_impl->renderer.GetMutex());
+	frame->fg.valid = false;
+	frame->hdr      = false;
+	frame->blank    = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -738,6 +1083,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		m_impl->DrainAsync(); // the present worker records on the same scheduler
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -749,8 +1095,32 @@ Presenter::Frame* Presenter::PrepareLastFrame() {
 	return m_impl->frames.AcquireLast();
 }
 
+bool Presenter::PresentSkippedIfDue() {
+#if defined(_WIN32)
+	// A game above the display's rate had every frame that came within a refresh of the one before turned away, and
+	// the refresh after it showed nothing new when the next frame was late (a 69 fps game on a 60 Hz display: 52
+	// frames a second shown). Each refresh shows the latest frame now. (Frame generation paces its own frames.)
+	// (The present worker owns the presenting state while it runs: frame generation was just switched off.)
+	if (FrameGen::Enabled() || !m_impl->AsyncIdle()) return false;
+	if (!m_impl->skipped_unshown || !m_impl->PresentDue(false)) return false;
+	auto* frame = PrepareLastFrame();
+	if (frame == nullptr) {
+		m_impl->skipped_unshown = false; // (the GPU thread took it for a newer frame)
+		return false;
+	}
+	Present(*frame, true);
+	return true;
+#else
+	return false;
+#endif
+}
+
 bool Presenter::IsGuestPaused() const noexcept {
 	return m_impl->window.loop.paused.load(std::memory_order_acquire);
+}
+
+bool Presenter::IsHdrSupported() const noexcept {
+	return m_impl->swapchain.IsHdrSupported();
 }
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
@@ -763,40 +1133,120 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+bool Presenter::FlipRateApplies(const Frame& frame) noexcept {
+	return !FrameGen::Enabled() || frame.fg.valid;
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	if (FrameGen::Enabled() && Impl::AsyncPresentAllowed()) {
+		m_impl->PostAsync(frame, reuse);
+		return;
+	}
+	m_impl->DrainAsync();
+	m_impl->PresentNow(frame, reuse);
+}
+
+void Presenter::Impl::PresentNow(Frame& frame, bool reuse) {
+	KYTY_PROFILER_FUNCTION();
+#if defined(_WIN32)
+	if (!PresentDue()) {
+		// A frame the display could not show anyway (menus and movies run far above it); it
+		// stays the latest frame for an idle refresh, and the next vblank that finds the display
+		// ready and no newer frame shows it (PresentSkippedIfDue).
+		skipped_unshown = true;
+		frames.Release(&frame, true);
+		return;
+	}
+#endif
+#if defined(KYTY_LOCAL_VULKAN_RECORDING) && defined(_WIN32)
+	// The frame's rendering may still sit in the recording worker's queue (KYTY_DEFERRED_SUBMIT).
+	// On Windows, presenting before it reaches the driver blocks vkQueuePresentKHR in the
+	// kernel while it holds the queue lock that submission needs: a deadlock. Wait (no locks
+	// held) until it has been submitted; this does not wait for the GPU.
+	LocalVulkanRecording::WaitDeferredSubmits();
+#endif
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto*      overlay_hud    = UpdateHud(reuse);
+	// The guest's own frames choose the color space (PQ or SDR); black and blank flips keep the current one.
+	if (!frame.blank && swapchain.SetHdr(frame.hdr)) {
+		RecoverSwapchain(Swapchain::Status::Recreate);
+	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
+			RecoverSwapchain(status);
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command          = m_impl->present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
+			// The present thread records and submits on its own scheduler (present_scheduler: its own pool, timeline
+			// and command buffers; the queue has its own lock), from the presenter's frame image into the swapchain's:
+			// nothing the GPU thread uses. Under the renderer's lock, its GPU thread waited for the whole recording
+			// and submission once a frame (~60 us, ~110 us with the wake-up). Frame generation shares the renderer's.
+			std::optional<RenderLockGuard> render_lock;
+			if (FrameGen::Enabled()) render_lock.emplace(renderer.GetMutex());
+			auto&      command             = present_scheduler.BeginCommand();
+			const bool draw_system_overlay =
+			    (overlay_visual.active || overlay_hud != nullptr) && swapchain.PrepareSystemOverlay(overlay_hud);
+			if (overlay_hud != nullptr && draw_system_overlay && FrameGen::Enabled()) {
+				// The panel's motion vectors are zeroed (a margin around it).
+				const auto& region = overlay_hud->region;
+				const auto& drawn  = overlay_hud->drawn;
+				const float w = static_cast<float>(region.extent.width), h = static_cast<float>(region.extent.height);
+				const float margin = 8.0f;
+				FrameGen::SetStaticRect(
+				    (static_cast<float>(drawn.offset.x - region.offset.x) - margin) / w,
+				    (static_cast<float>(drawn.offset.y - region.offset.y) - margin) / h,
+				    (static_cast<float>(drawn.offset.x - region.offset.x) + static_cast<float>(drawn.extent.width) + margin) / w,
+				    (static_cast<float>(drawn.offset.y - region.offset.y) + static_cast<float>(drawn.extent.height) + margin) / h);
+			}
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
-			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+			frame.present_tick = swapchain.Submit(present_scheduler);
+		}
+		const auto wait_begin = std::chrono::steady_clock::now();
+#if defined(_WIN32)
+		// The Windows driver waits in vkQueuePresentKHR, inside the kernel, for the semaphore's
+		// GPU work while it holds a device-wide lock: every queue submission waits behind it,
+		// including those the GPU work may still depend on (a deadlock). Wait for the GPU here,
+		// holding nothing; the present on its own queue then finds the semaphore signaled.
+		present_scheduler.Wait(frame.present_tick);
+#endif
+		const auto call_begin = std::chrono::steady_clock::now();
+		// KYTY_FRAMEGEN: Streamline takes the present (vkQueuePresentKHR is its hook) and adds
+		// the generated frames; an idle refresh of the last frame carries no new inputs.
+		const bool streamline_present = FrameGen::PresentIntegrationReady();
+		if (streamline_present) {
+			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
+			                        {frame.image.extent.width, frame.image.extent.height}, swapchain.Extent(),
+			                        swapchain.PresentRegion(), swapchain.Format(), swapchain.ImageCount(),
+			                        frame.reusing_last);
 		}
 		status = swapchain.Present();
+		if (streamline_present) {
+			FrameGen::AfterPresent();
+		}
+		if (FrameGen::Enabled()) {
+			const auto call_end = std::chrono::steady_clock::now();
+			RecordPresentTiming(std::chrono::duration<double, std::milli>(call_begin - wait_begin).count(),
+			                    std::chrono::duration<double, std::milli>(call_end - call_begin).count());
+		}
 		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
+			RecoverSwapchain(status);
 			continue;
 		}
 
-		m_impl->presented_overlay_revision.store(overlay_visual.revision,
-		                                         std::memory_order_release);
-		m_impl->window.UpdateTitle();
-		m_impl->frames.Release(&frame, true);
+		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+#if defined(_WIN32)
+		skipped_unshown = false;
+#endif
+		window.UpdateTitle();
+		frames.Release(&frame, true);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
-	m_impl->frames.Release(&frame, reuse);
+	frames.Release(&frame, reuse);
 }
 
 void Presenter::Discard(Frame& frame) {

@@ -189,6 +189,8 @@ struct AudioOut2PortStateEntry {
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
 	const void*            pcm_data      = nullptr;
+	float                  gain          = 1.0f; // a mono (object) port's gain attribute
+	uint32_t               ambisonics    = 0;    // an object port's attribute 8: 0x40 | ACN when it carries one
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -221,6 +223,9 @@ static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511;
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
+static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
+static constexpr uint32_t AUDIO_OUT2_AMBISONICS_CHANNEL           = 0x40;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_OUTPUT_RECORDING   = 2;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_DEFAULT  = 1;
 static constexpr uint32_t AUDIO_OUT2_MASTERING_STATES_ID_V2       = 2;
@@ -352,15 +357,80 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 	return false;
 }
 
+// The object ports (mono float) are for the system's 3D audio to render. Demon's Souls puts its whole
+// game mix there as ambisonics: two fifth-order scenes, one channel per port (attribute 8 = 0x40 | ACN,
+// SN3D, its beds silent). Decoded here for stereo from the first order (W, Y left positive, X front
+// positive) by two virtual microphones facing about 74 degrees left and right: a sound straight ahead
+// plays at full level on both sides, as a binaural render plays it, one behind at -3 dB (the level of
+// a surround downmix), and one at the side with the power it has ahead. Cardioids facing 90 degrees
+// (W and Y alone) played what is ahead, where people talk, 3 dB below what is at the sides. An object
+// that is no ambisonics channel plays in the centre. Each port's gain applies, and the result goes to
+// the front left and right of the context's first float main port. Adding the 36 channels up instead
+// cancelled most directions.
+static const void* audioout2_mix_objects_locked(AudioOut2ContextHandle ctx, const AudioOut2PortStateEntry& target) {
+	constexpr float HALF_POWER = 0.70710677f;
+	// Ahead W + X = 1, behind W - X = 1/sqrt(2), at the side (W + Y)^2 + (W - Y)^2 = 2.
+	constexpr float W_GAIN = 0.85355339f;
+	constexpr float X_GAIN = 0.14644661f;
+	constexpr float Y_GAIN = 0.52100538f;
+	thread_local std::vector<float> mix;
+	const auto channels = audioout2_data_format_channels(target.data_format);
+	const auto frames   = target.samples_num;
+	bool       mixed    = false;
+	for (const auto& object: g_audioout2_ports) {
+		if (!object.used || object.context != ctx || !audioout2_port_type_is_object(object.port_type) ||
+		    object.pcm_data == nullptr || object.audio_format != AudioInternal::Format::FloatMono ||
+		    object.samples_num != frames) {
+			continue;
+		}
+		float left = HALF_POWER, right = HALF_POWER;
+		if ((object.ambisonics & AUDIO_OUT2_AMBISONICS_CHANNEL) != 0) {
+			const auto acn = object.ambisonics & ~AUDIO_OUT2_AMBISONICS_CHANNEL;
+			if (acn == 0) {
+				left = right = W_GAIN;
+			} else if (acn == 1) {
+				left  = Y_GAIN;
+				right = -Y_GAIN;
+			} else if (acn == 3) {
+				left = right = X_GAIN;
+			} else {
+				continue;
+			}
+		}
+		if (!mixed) {
+			const auto* bed = static_cast<const float*>(target.pcm_data);
+			mix.assign(bed, bed + static_cast<size_t>(frames) * channels);
+			mixed = true;
+		}
+		const auto* in = static_cast<const float*>(object.pcm_data);
+		left *= object.gain;
+		right *= object.gain;
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			mix[static_cast<size_t>(frame) * channels] += in[frame] * left;
+			mix[static_cast<size_t>(frame) * channels + 1] += in[frame] * right;
+		}
+	}
+	return mixed ? mix.data() : target.pcm_data;
+}
+
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 
 	g_audioout2_port_mutex.Lock();
+	bool objects_mixed = false;
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    state.pcm_data != nullptr && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data});
+			const void* data = state.pcm_data;
+			if (!objects_mixed && (state.port_type & 0xffu) == 0 &&
+			    (state.audio_format == AudioInternal::Format::FloatStereo ||
+			     state.audio_format == AudioInternal::Format::Float8Ch ||
+			     state.audio_format == AudioInternal::Format::Float8ChStd)) {
+				data          = audioout2_mix_objects_locked(ctx, state);
+				objects_mixed = true;
+			}
+			params.push_back(AudioInternal::OutputParam {state.audio_handle, data});
 		}
 	}
 	g_audioout2_port_mutex.Unlock();
@@ -664,8 +734,12 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
 
-	const void* pcm_data = nullptr;
-	bool        has_pcm  = false;
+	const void* pcm_data       = nullptr;
+	bool        has_pcm        = false;
+	float       gain           = 1.0f;
+	bool        has_gain       = false;
+	uint32_t    ambisonics     = 0;
+	bool        has_ambisonics = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
 		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
@@ -674,12 +748,25 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			pcm_data = pcm.data;
 			has_pcm  = true;
 		}
+		// A mono port's gain (a float per channel).
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(float)) {
+			std::memcpy(&gain, attributes[i].value, sizeof(float));
+			has_gain = true;
+		}
+		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS && attributes[i].value != nullptr &&
+		    attributes[i].value_size == sizeof(uint32_t)) {
+			std::memcpy(&ambisonics, attributes[i].value, sizeof(uint32_t));
+			has_ambisonics = true;
+		}
 	}
 
-	if (has_pcm) {
+	if (has_pcm || has_gain || has_ambisonics) {
 		g_audioout2_port_mutex.Lock();
 		if (auto* state = audioout2_find_port_locked(port); state != nullptr) {
-			state->pcm_data = pcm_data;
+			if (has_pcm) state->pcm_data = pcm_data;
+			if (has_gain) state->gain = gain;
+			if (has_ambisonics) state->ambisonics = ambisonics;
 		}
 		g_audioout2_port_mutex.Unlock();
 	}

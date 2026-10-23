@@ -10,8 +10,12 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cinttypes>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -137,6 +141,7 @@ struct DecodedFunction {
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
+	size_t                                      swept_instructions {}; // see SweepUndecodedCode
 };
 
 struct InstructionRewrite {
@@ -489,13 +494,255 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 	return resolved_targets;
 }
 
+// Instruction starts of a linear decode of [function_start, function_end) that agrees with every
+// instruction the control-flow walk has decoded (empty when it does not: data in the range).
+std::set<uintptr_t> LinearBoundaries(const DecodedFunction& function, uintptr_t function_start,
+                                     uintptr_t function_end) {
+	std::set<uintptr_t> starts;
+	for (uintptr_t address = function_start; address < function_end;) {
+		starts.insert(address);
+		if (const auto known = function.instructions.find(address);
+		    known != function.instructions.end()) {
+			address += known->second.instruction.length;
+			continue;
+		}
+		const auto decoded    = DecodeCodeInstruction(address, function_end);
+		const auto next_known = function.instructions.lower_bound(address);
+		if (decoded.instruction.length == 0 ||
+		    (next_known != function.instructions.end() &&
+		     next_known->first < address + decoded.instruction.length)) {
+			return {};
+		}
+		address += decoded.instruction.length;
+	}
+	return starts;
+}
+
+// clang's table jump without a bounds check the bounded resolver recognizes (an `and` mask, or the
+// table set up far from the branch among scheduled vector code):
+//   lea B, [rip + T] ... movsxd R, dword ptr [B + 4*I] ... add R, S (S holds T) ... jmp R
+// all in one straight run of code. The table is read until an entry leaves the function or does
+// not hit an instruction start of the linear decode; reading on into a neighbouring table can
+// only add real targets (more conservative), a short read cannot happen.
+std::optional<std::vector<uintptr_t>>
+ResolveScannedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
+                        uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
+                        uintptr_t segment_end, const std::set<uintptr_t>& boundaries) {
+	const auto branch = function.instructions.find(branch_address);
+	if (branch == function.instructions.end() ||
+	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
+	    branch->second.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+		return std::nullopt;
+	}
+	using Cursor = decltype(function.instructions.begin());
+	size_t steps = 0; // bounds the search below
+	// The instructions that may have defined `reg` when control reaches `at` (before it runs):
+	// every predecessor is followed, the fall-through one and direct branches to `at` (tail-merged
+	// dispatch shares its last instructions); false when some path leaves what we can follow.
+	std::function<bool(Cursor, ZydisRegister, int, std::vector<Cursor>&)> defs_at;
+	const auto defs_after = [&](Cursor last, ZydisRegister reg, int depth,
+	                            std::vector<Cursor>& defs) -> bool {
+		if (WritesRegister(last->second, reg)) {
+			defs.push_back(last);
+			return true;
+		}
+		if (last->second.instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+			return false;
+		}
+		return defs_at(last, reg, depth, defs);
+	};
+	defs_at = [&](Cursor at, ZydisRegister reg, int depth, std::vector<Cursor>& defs) -> bool {
+		if (++steps > 8192 || depth > 6 || at == function.instructions.begin()) {
+			return false;
+		}
+		const auto previous      = std::prev(at);
+		const bool falls_through = previous->first + previous->second.instruction.length == at->first &&
+		                           !IsControlFlowTerminator(previous->second.instruction);
+		if (function.branch_targets.contains(at->first)) {
+			bool any = false;
+			for (auto it = function.instructions.begin(); it != function.instructions.end(); ++it) {
+				const auto& d = it->second;
+				if ((d.instruction.meta.category == ZYDIS_CATEGORY_COND_BR ||
+				     d.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) &&
+				    GetRelativeTarget(d) == at->first) {
+					if (!defs_at(it, reg, depth + 1, defs)) return false; // a branch writes no register
+					any = true;
+				}
+			}
+			if (!falls_through) {
+				return any;
+			}
+		} else if (!falls_through) {
+			return false;
+		}
+		return defs_after(previous, reg, depth, defs);
+	};
+	// Table addresses `reg` may hold when control reaches `at`: lea reg, [rip + T] or a mov copy.
+	std::function<bool(Cursor, ZydisRegister, int, std::set<uintptr_t>&)> tables_at =
+	    [&](Cursor at, ZydisRegister reg, int depth, std::set<uintptr_t>& tables) -> bool {
+		std::vector<Cursor> defs;
+		if (depth > 3 || !defs_at(at, reg, 0, defs)) return false;
+		for (const auto def: defs) {
+			const auto& d = def->second;
+			if (d.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+			    d.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			    d.operands[1].mem.base == ZYDIS_REGISTER_RIP) {
+				ZyanU64 absolute {};
+				if (!ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&d.instruction, &d.operands[1], d.address,
+				                                           &absolute))) {
+					return false;
+				}
+				tables.insert(static_cast<uintptr_t>(absolute));
+			} else if (d.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+			           d.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+				if (!tables_at(def, d.operands[1].reg.value, depth + 1, tables)) return false;
+			} else {
+				return false;
+			}
+		}
+		return !tables.empty();
+	};
+
+	// jmp R, where every definition of R is `add R, S` over `movsxd R, [B + 4*I]`, and B and S
+	// hold the same table addresses.
+	const ZydisRegister target_reg = branch->second.operands[0].reg.value;
+	std::vector<Cursor> adds;
+	if (!defs_at(branch, target_reg, 0, adds)) {
+		return std::nullopt;
+	}
+	std::set<uintptr_t> load_tables, add_tables;
+	for (const auto add: adds) {
+		const auto& a = add->second;
+		if (a.instruction.mnemonic != ZYDIS_MNEMONIC_ADD ||
+		    a.operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    a.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+		    !tables_at(add, a.operands[1].reg.value, 0, add_tables)) {
+			return std::nullopt;
+		}
+		std::vector<Cursor> loads;
+		if (!defs_at(add, target_reg, 0, loads)) {
+			return std::nullopt;
+		}
+		for (const auto load: loads) {
+			const auto& l = load->second;
+			if (l.instruction.mnemonic != ZYDIS_MNEMONIC_MOVSXD ||
+			    l.operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY ||
+			    l.operands[1].mem.index == ZYDIS_REGISTER_NONE ||
+			    l.operands[1].mem.scale != sizeof(s32) || l.operands[1].mem.disp.value != 0 ||
+			    !tables_at(load, l.operands[1].mem.base, 0, load_tables)) {
+				return std::nullopt;
+			}
+		}
+	}
+	if (load_tables.empty() || load_tables != add_tables) {
+		return std::nullopt;
+	}
+	const auto* tables = &load_tables;
+
+	constexpr size_t       MaxEntries = 2048;
+	std::vector<uintptr_t> targets;
+	for (const uintptr_t table: *tables) {
+		if (table < segment_start || table >= segment_end ||
+		    (table >= function_start && table < function_end)) {
+			return std::nullopt;
+		}
+		size_t entries = 0;
+		for (size_t index = 0; index < MaxEntries; ++index) {
+			const uintptr_t entry_address = table + index * sizeof(s32);
+			if (entry_address + sizeof(s32) > segment_end) break;
+			s32 offset;
+			std::memcpy(&offset, reinterpret_cast<const void*>(entry_address), sizeof(offset));
+			const uintptr_t target = table + static_cast<intptr_t>(offset);
+			if (target < function_start || target >= function_end || !boundaries.contains(target)) {
+				break;
+			}
+			targets.push_back(target);
+			++entries;
+			if (index + 1 == MaxEntries) return std::nullopt; // no end found: not a table
+		}
+		if (entries < 2) {
+			return std::nullopt;
+		}
+	}
+	std::ranges::sort(targets);
+	targets.erase(std::ranges::unique(targets).begin(), targets.end());
+	return targets;
+}
+
+// Code that only an unresolved indirect branch reaches (a jump table the resolver does not
+// recognize) is never decoded by the control-flow walk, so its memory instructions stayed
+// unprotected: a guest fault there overwrote live red-zone data (a null pointer read back from
+// [rsp-0x68] at eboot+0x1c5e2ce). Decode the rest of the range linearly and keep it only if it
+// agrees with every instruction the walk found and no RIP-relative operand points into the
+// range outside an instruction start (inline data). Swept instructions are recorded as branch
+// targets, so relocation never spans across one of them.
+void SweepUndecodedCode(DecodedFunction& function, uintptr_t function_start,
+                        uintptr_t function_end) {
+	std::vector<DecodedCodeInstruction> swept;
+	for (uintptr_t address = function_start; address < function_end;) {
+		if (const auto known = function.instructions.find(address);
+		    known != function.instructions.end()) {
+			address += known->second.instruction.length;
+			continue;
+		}
+		auto       decoded    = DecodeCodeInstruction(address, function_end);
+		const auto next_known = function.instructions.lower_bound(address);
+		if (decoded.instruction.length == 0 ||
+		    (next_known != function.instructions.end() &&
+		     next_known->first < address + decoded.instruction.length)) {
+			return;
+		}
+		address += decoded.instruction.length;
+		swept.push_back(std::move(decoded));
+	}
+	std::set<uintptr_t> starts;
+	for (const auto& [address, _]: function.instructions) starts.insert(address);
+	for (const auto& decoded: swept) starts.insert(decoded.address);
+	const auto points_inside = [&](const DecodedCodeInstruction& decoded) {
+		for (u8 index = 0; index < decoded.instruction.operand_count_visible; ++index) {
+			const auto& operand = decoded.operands[index];
+			if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY || operand.mem.base != ZYDIS_REGISTER_RIP) {
+				continue;
+			}
+			ZyanU64 target {};
+			if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&decoded.instruction, &operand,
+			                                          decoded.address, &target)) &&
+			    target >= function_start && target < function_end && !starts.contains(target)) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (const auto& [_, decoded]: function.instructions) {
+		if (points_inside(decoded)) return;
+	}
+	for (const auto& decoded: swept) {
+		if (points_inside(decoded)) return;
+	}
+	for (auto& decoded: swept) {
+		function.uses_red_zone |= decoded.has_red_zone_operand;
+		function.requires_conservative_red_zone_tracking |=
+		    decoded.has_unmodeled_red_zone_operand ||
+		    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
+		const uintptr_t target = GetRelativeTarget(decoded);
+		if (target >= function_start && target < function_end) {
+			function.branch_targets.insert(target);
+		}
+		function.branch_targets.insert(decoded.address);
+		function.instructions.emplace(decoded.address, std::move(decoded));
+	}
+	function.swept_instructions = swept.size();
+}
+
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
-	DecodedFunction               function;
-	std::vector<uintptr_t>        blocks {function_start};
-	std::unordered_set<uintptr_t> visited;
-	std::set<uintptr_t>           indirect_branches;
-	std::set<uintptr_t>           resolved_indirect_branches;
+                               uintptr_t segment_start, uintptr_t segment_end,
+                               uintptr_t module_start, uintptr_t module_end) {
+	DecodedFunction                    function;
+	std::vector<uintptr_t>             blocks {function_start};
+	std::unordered_set<uintptr_t>      visited;
+	std::set<uintptr_t>                indirect_branches;
+	std::set<uintptr_t>                resolved_indirect_branches;
+	std::optional<std::set<uintptr_t>> boundaries; // linear-decode starts, built when first needed
 
 	while (true) {
 		while (!blocks.empty()) {
@@ -545,8 +792,19 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 			if (resolved_indirect_branches.contains(branch_address)) {
 				continue;
 			}
-			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
+			                                       function_end, segment_start, segment_end);
+			if (!targets) {
+				if (!boundaries) {
+					boundaries = LinearBoundaries(function, function_start, function_end);
+				}
+				if (!boundaries->empty()) {
+					// Tables live in read-only data, another segment of the module.
+					targets = ResolveScannedJumpTable(function, branch_address, function_start,
+					                                  function_end, module_start, module_end,
+					                                  *boundaries);
+				}
+			}
 			if (!targets) {
 				continue;
 			}
@@ -564,6 +822,29 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	if (function.has_indirect_branch) {
+		SweepUndecodedCode(function, function_start, function_end);
+		// KYTY_REDZONE_DUMP_INDIRECT: print each unresolved indirect branch with the code before it
+		// (to teach ResolveBoundedJumpTable its pattern). Diagnostic.
+		static const bool dump = std::getenv("KYTY_REDZONE_DUMP_INDIRECT") != nullptr;
+		if (dump && function.uses_red_zone) {
+			for (const uintptr_t branch: indirect_branches) {
+				if (resolved_indirect_branches.contains(branch)) continue;
+				std::printf("RED_ZONE_INDIRECT function=%" PRIx64 " branch=%" PRIx64 "\n",
+				            static_cast<u64>(function_start), static_cast<u64>(branch));
+				auto it = function.instructions.find(branch);
+				for (int back = 0; back < 14 && it != function.instructions.begin(); ++back) --it;
+				for (int n = 0; n < 16 && it != function.instructions.end(); ++n, ++it) {
+					std::printf("RED_ZONE_INDIRECT   %" PRIx64 ":", static_cast<u64>(it->first));
+					for (u8 i = 0; i < it->second.instruction.length; ++i) {
+						std::printf(" %02x", reinterpret_cast<const u8*>(it->first)[i]);
+					}
+					std::printf("\n");
+				}
+			}
+			std::fflush(stdout);
+		}
+	}
 	return function;
 }
 
@@ -741,6 +1022,48 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 }
 } // namespace
 
+// KYTY_REDZONE_PROBE=<module offset>[,...] (hex): print how the patcher sees the function holding
+// each address (range, red-zone use, per-instruction liveness and planned rewrites). Diagnostic.
+static std::vector<u64> RedZoneProbes() {
+	std::vector<u64> probes;
+	const char*      value = std::getenv("KYTY_REDZONE_PROBE");
+	for (const char* p = value; p != nullptr && *p != '\0';) {
+		char*     end    = nullptr;
+		const u64 offset = std::strtoull(p, &end, 16);
+		if (end == p) {
+			break;
+		}
+		probes.push_back(offset);
+		p = *end == ',' ? end + 1 : end;
+	}
+	return probes;
+}
+
+static void PrintRedZoneProbe(const PatchModule& module, u64 probe, uintptr_t function_start,
+                              uintptr_t function_end, const DecodedFunction& function,
+                              const std::map<uintptr_t, InstructionRewrite>& rewrites) {
+	const auto base = reinterpret_cast<uintptr_t>(module.start);
+	std::printf("RED_ZONE_PROBE +0x%" PRIx64 ": function +0x%" PRIx64 "..+0x%" PRIx64
+	            " instructions=%zu swept=%zu uses_red_zone=%d indirect_branch=%d conservative=%d"
+	            " rewrites=%zu\n",
+	            probe, static_cast<u64>(function_start - base), static_cast<u64>(function_end - base),
+	            function.instructions.size(), function.swept_instructions, function.uses_red_zone,
+	            function.has_indirect_branch,
+	            function.requires_conservative_red_zone_tracking, rewrites.size());
+	const uintptr_t address = base + probe;
+	for (auto it = function.instructions.lower_bound(address > 0x80 ? address - 0x80 : 0);
+	     it != function.instructions.end() && it->first <= address + 0x20; ++it) {
+		const auto& d = it->second;
+		std::printf("RED_ZONE_PROBE   +0x%" PRIx64 " len=%u mem=%d sp=%d rz_operand=%d rz_live=%zu"
+		            " rz_use=%zu rewrite=%d%s\n",
+		            static_cast<u64>(it->first - base), d.instruction.length, d.accesses_memory,
+		            d.uses_stack_pointer, d.has_red_zone_operand, d.red_zone_live.count(),
+		            d.red_zone_use.count(), rewrites.contains(it->first) ? 1 : 0,
+		            it->first == address ? "  <== probe" : "");
+	}
+	std::fflush(stdout);
+}
+
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
 	RedZonePatchResult result {};
@@ -748,6 +1071,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 	if (module == nullptr || function_starts.empty()) {
 		return result;
 	}
+	static const auto probes = RedZoneProbes();
 
 	const uintptr_t        segment_end = segment_addr + segment_size;
 	std::vector<uintptr_t> starts;
@@ -771,9 +1095,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end,
+		                               reinterpret_cast<uintptr_t>(module->start),
+		                               reinterpret_cast<uintptr_t>(module->end));
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
+		result.swept_instruction_count += function.swept_instructions;
 
 		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 
@@ -781,6 +1108,16 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			++result.red_zone_function_count;
 			result.indirect_red_zone_function_count += function.has_indirect_branch;
 			for (const auto& [address, decoded]: function.instructions) {
+				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL &&
+				    !decoded.accesses_memory && decoded.red_zone_live.any() &&
+				    GetRelativeTarget(decoded) != 0 && !rewrite_sites.contains(address)) {
+					// A direct call while red-zone data is live: compilers never emit one, the
+					// loader's TLS patch does (`mov reg, fs:[0]` becomes a call). Its return
+					// address would land on the red zone; call from below it instead.
+					++result.live_call_count;
+					rewrite_sites[address].protect_red_zone = true;
+					continue;
+				}
 				if (!decoded.accesses_memory || !decoded.red_zone_live.any() ||
 				    rewrite_sites.contains(address)) {
 					continue;
@@ -810,6 +1147,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 					continue;
 				}
 				rewrite_sites[address].protect_red_zone = true;
+			}
+		}
+		for (const u64 probe: probes) {
+			const uintptr_t address = reinterpret_cast<uintptr_t>(module->start) + probe;
+			if (address >= function_start && address < function_end) {
+				PrintRedZoneProbe(*module, probe, function_start, function_end, function, rewrite_sites);
 			}
 		}
 		if (rewrite_sites.empty()) {
@@ -991,6 +1334,20 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			const auto& rewrite = rewrite_sites.at(site);
 			if (rewrite.protect_red_zone) {
 				++result.unrelocatable_memory_instruction_count;
+				LOGF("Windows guest red-zone: unprotected memory instruction at +0x%" PRIx64
+				     " in function +0x%" PRIx64 "\n",
+				     static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),
+				     static_cast<u64>(function_start - reinterpret_cast<uintptr_t>(module->start)));
+				static const bool dump = std::getenv("KYTY_REDZONE_DUMP_INDIRECT") != nullptr;
+				if (dump) {
+					std::printf("RED_ZONE_UNPROTECTED function=+0x%" PRIx64 " site=+0x%" PRIx64
+					            " len=%u indirect=%d\n",
+					            static_cast<u64>(function_start -
+					                             reinterpret_cast<uintptr_t>(module->start)),
+					            static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),
+					            function.instructions.at(site).instruction.length,
+					            function.has_indirect_branch ? 1 : 0);
+				}
 			}
 		};
 		const auto overlaps_patched_span = [&patched_spans](uintptr_t start, uintptr_t end) {
@@ -1227,6 +1584,22 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			}
 			record_rewrites(site_span);
 			patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
+		}
+		for (const u64 probe: probes) {
+			const uintptr_t address = reinterpret_cast<uintptr_t>(module->start) + probe;
+			if (address < function_start || address >= function_end) {
+				continue;
+			}
+			const auto base = reinterpret_cast<uintptr_t>(module->start);
+			for (const auto& [site, rewrite]: rewrite_sites) {
+				std::printf("RED_ZONE_PROBE +0x%" PRIx64 " rewrite +0x%" PRIx64 " len=%u live=%zu %s\n",
+				            probe, static_cast<u64>(site - base),
+				            function.instructions.at(site).instruction.length,
+				            function.instructions.at(site).red_zone_live.count(),
+				            module->patched.contains(reinterpret_cast<u8*>(site)) ? "patched"
+				                                                                  : "NOT PATCHED");
+			}
+			std::fflush(stdout);
 		}
 	}
 	return result;

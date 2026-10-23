@@ -128,6 +128,8 @@ private:
 	static bool            FormatIsStd(Format format);
 	static uint32_t        BytesPerSample(Format format);
 	static uint32_t        OutputChannels(const PortOut& port);
+	static bool            DownmixesToStereo(const PortOut& port);
+	static uint32_t        PreparedChannels(const PortOut& port);
 	static SDL_AudioFormat SdlFormat(Format format);
 	static bool            OpenSdlDevice(PortOut* port);
 	static void            CloseSdlDevice(PortOut* port);
@@ -272,6 +274,18 @@ void Audio::CloseSdlDevice(PortOut* port) {
 	port->audio_spec   = {};
 }
 
+// A 7.1 (or 7.1.4) port on a stereo device is downmixed here: the front pair at full level, the
+// centre, surrounds and heights at -3 dB, the LFE left out (the usual downmix). SDL's own matrix keeps
+// even all eight channels at full scale unclipped, so it plays the front pair at 0.21 (-13.5 dB).
+bool Audio::DownmixesToStereo(const PortOut& port) {
+	return port.channels_num >= 8 && port.audio_spec.channels == 2;
+}
+
+// The channels the port's prepared buffer has (what SDL converts from).
+uint32_t Audio::PreparedChannels(const PortOut& port) {
+	return DownmixesToStereo(port) ? 2u : OutputChannels(port);
+}
+
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
                                        std::vector<uint8_t>* buffer) {
 	EXIT_IF(data == nullptr);
@@ -282,6 +296,38 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto output_channels  = OutputChannels(port);
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
+
+	if (DownmixesToStereo(port)) {
+		// Both 8-channel orders have the left surrounds at 4 and 6 and the right ones at 5 and 7; the
+		// 12-channel one has its left heights at 8 and 10.
+		const bool is_float = FormatIsFloat(port.format);
+		const auto sample   = [&](uint32_t frame, uint32_t ch) {
+			const auto  index = static_cast<size_t>(frame) * channels + ch;
+			const float value = is_float ? static_cast<const float*>(data)[index]
+			                             : static_cast<float>(static_cast<const int16_t*>(data)[index]) / 32768.0f;
+			return value * static_cast<float>(port.volume[ch]) / 32768.0f;
+		};
+		constexpr float SIDE = 0.70710677f;
+		buffer->resize(static_cast<size_t>(frames) * 2 * bytes_per_sample);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			float left  = sample(frame, 0) + SIDE * (sample(frame, 2) + sample(frame, 4) + sample(frame, 6));
+			float right = sample(frame, 1) + SIDE * (sample(frame, 2) + sample(frame, 5) + sample(frame, 7));
+			if (channels == 12) {
+				left += SIDE * (sample(frame, 8) + sample(frame, 10));
+				right += SIDE * (sample(frame, 9) + sample(frame, 11));
+			}
+			if (is_float) {
+				reinterpret_cast<float*>(buffer->data())[frame * 2]     = left;
+				reinterpret_cast<float*>(buffer->data())[frame * 2 + 1] = right;
+			} else {
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2] =
+				    static_cast<int16_t>(std::clamp(left * 32768.0f, -32768.0f, 32767.0f));
+				reinterpret_cast<int16_t*>(buffer->data())[frame * 2 + 1] =
+				    static_cast<int16_t>(std::clamp(right * 32768.0f, -32768.0f, 32767.0f));
+			}
+		}
+		return buffer->data();
+	}
 
 	bool volume_changed = false;
 	for (uint32_t ch = 0; ch < channels; ch++) {
@@ -353,7 +399,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
-	const auto           output_channels = OutputChannels(*port);
+	const auto           output_channels = PreparedChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 

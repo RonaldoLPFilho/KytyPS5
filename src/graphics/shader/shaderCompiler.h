@@ -36,6 +36,15 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& input_info);
+// The same into a caller's params (one per draw or dispatch: its user-data vector is reused).
+void PrepareProgramInto(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        ShaderComputeInputInfo& input_info, ShaderParams& params);
+void PrepareProgramInto(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                        const HW::UserConfig& user_config, ShaderVertexInputInfo& input_info,
+                        ShaderParams& params);
+void PrepareProgramInto(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+                        std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+                        ShaderPixelInputInfo& input_info, ShaderParams& params);
 
 } // namespace Libs::Graphics
 

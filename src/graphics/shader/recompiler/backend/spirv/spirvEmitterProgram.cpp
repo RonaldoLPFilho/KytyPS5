@@ -659,8 +659,13 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
-			for (const auto& [inst, id]: dispatch.spills[0]) {
-				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
+			// In program order: the ids, hence the module, must not depend on where the IR lives.
+			for (const auto* block: program.blocks) {
+				for (const auto& inst: *block) {
+					if (dispatch.spills[0].contains(&inst)) {
+						dispatch.spills[1].emplace(&inst, state.builder.AllocateId());
+					}
+				}
 			}
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
@@ -685,7 +690,7 @@ void EmitProgram(EmitterState& state) {
 	EmitLabel(state, state.entry_label);
 	if (state.requirements.function_lds) {
 		state.builder.AddFunction(
-		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsDwordCount(state)),
+		    {OpVariable, TypeU32ArrayPointer(state, StorageClassFunction, LdsStorageDwordCount(state)),
 		     state.lds_variable, StorageClassFunction});
 	}
 	if (state.requirements.function_scratch) {
@@ -731,6 +736,7 @@ void EmitProgram(EmitterState& state) {
 		    {OpStore, state.pixel_valid_mask_variable, ConstantU32(state, 1)});
 	}
 	EmitMemoryOffsets(state);
+	EmitTableMode(ctx);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
 	} else if (state.program.dispatcher_fallback) {

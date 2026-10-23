@@ -4,15 +4,90 @@
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "device-fault.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h"
+#endif
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <numeric>
+#include <thread>
+#include <vector>
 #include <vk_mem_alloc.h>
+
+extern "C" {
+// KYTY_BUFFER_RECLAIM: 1: a retired buffer's memory is freed on a worker thread. Freeing a
+// dedicated allocation is a kernel call (~0.1 ms on Windows) the render thread paid for every
+// such buffer the cache retired while the game streams. VMA synchronizes internally, and a buffer
+// is destroyed only after the GPU is done with it.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_buffer_reclaim_mode {0};
+}
 
 namespace Libs::Graphics {
 
 namespace {
+
+class BufferReclaimer {
+public:
+	~BufferReclaimer() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stop = true;
+		}
+		m_wake.notify_one();
+		if (m_thread.joinable()) m_thread.join();
+	}
+	void Push(VmaAllocator allocator, VkBuffer buffer, VmaAllocation allocation) {
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_thread.joinable()) m_thread = std::thread([this] { Run(); });
+			m_pending.push_back({allocator, buffer, allocation});
+		}
+		m_wake.notify_one();
+	}
+	// Returns once every pushed buffer is destroyed (before the allocator goes away).
+	void Flush() {
+		std::unique_lock lock(m_mutex);
+		m_idle.wait(lock, [this] { return m_pending.empty() && !m_busy; });
+	}
+
+private:
+	struct Item {
+		VmaAllocator  allocator;
+		VkBuffer      buffer;
+		VmaAllocation allocation;
+	};
+	void Run() {
+		std::vector<Item> batch;
+		std::unique_lock  lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_stop || !m_pending.empty(); });
+			if (m_pending.empty() && m_stop) return;
+			batch.swap(m_pending);
+			m_busy = true;
+			lock.unlock();
+			for (const auto& item: batch) vmaDestroyBuffer(item.allocator, item.buffer, item.allocation);
+			batch.clear();
+			lock.lock();
+			m_busy = false;
+			m_idle.notify_all();
+		}
+	}
+	std::mutex              m_mutex;
+	std::condition_variable m_wake, m_idle;
+	std::vector<Item>       m_pending;
+	bool                    m_busy = false, m_stop = false;
+	std::thread             m_thread;
+};
+
+BufferReclaimer& Reclaimer() {
+	static BufferReclaimer reclaimer;
+	return reclaimer;
+}
 
 constexpr size_t WATCHES_INITIAL_RESERVE = 0x4000;
 constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
@@ -25,7 +100,8 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 			       VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
 		case MemoryUsage::Download:
 			return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
-		case MemoryUsage::DeviceLocal: return {};
+		case MemoryUsage::DeviceLocal:
+		case MemoryUsage::SparseDeviceLocal: return {};
 	}
 	return {};
 }
@@ -33,6 +109,7 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 [[nodiscard]] VmaMemoryUsage AllocationUsage(MemoryUsage usage) {
 	switch (usage) {
 		case MemoryUsage::DeviceLocal:
+		case MemoryUsage::SparseDeviceLocal:
 		case MemoryUsage::Stream: return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
 		case MemoryUsage::Upload:
 		case MemoryUsage::Download: return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
@@ -58,7 +135,20 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 	return true;
 }
 
+// Pages of video memory bound to a sparse buffer as it is used, from chunks of SparseChunkPages pages.
+constexpr uint32_t SparseChunkPages = 32;
+
 } // namespace
+
+struct Buffer::Sparse {
+	uint64_t                    page_size   = 0;
+	uint32_t                    memory_type = 0;
+	std::vector<uint8_t>        resident; // per page
+	std::vector<VkDeviceMemory> chunks;
+	uint32_t                    free_in_chunk = 0; // pages of the last chunk not bound yet
+	VkSemaphore                 timeline      = VK_NULL_HANDLE;
+	uint64_t                    value         = 0;
+};
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
@@ -66,31 +156,91 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
       m_size(size) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
+	EXIT_IF(usage == MemoryUsage::SparseDeviceLocal && !graphics.sparse_residency_buffers);
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+	// KYTY_READBACK_QUEUE: the transfer queue reads guest buffers and writes download buffers.
+	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
+		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.pQueueFamilyIndices   = families;
+	}
 
-	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
-	const VmaAllocationCreateFlags bda_flag =
-	    with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+	// A buffer with device addresses is placed in VMA's blocks as any other (the allocator is made with buffer device
+	// addresses; VMA itself gives a big one its own memory). Each its own allocation, as before, cost a kernel call:
+	// ~100 us a buffer (2.4 us placed), 8400 buffers while a save loads and 100-400 in a frame where the game streams
+	// a new area.
+	const bool              with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+	// On a GPU short of video memory a GPU buffer asks for video memory whatever VMA's budget says, and goes elsewhere
+	// only when the driver has none: NVIDIA counts what its system memory type holds, the textures put there
+	// (GraphicContext::CreateImage), under the video memory heap's usage, so the budget sent buffers to system memory
+	// while there was room (Shrine of Storms with 8 GB: 2 buffers, 140 MB).
+	const bool ignore_budget = usage == MemoryUsage::DeviceLocal && graphics.small_video_memory;
 	VmaAllocationCreateInfo allocation_info {};
-	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	allocation_info.flags = (ignore_budget ? VmaAllocationCreateFlags {} : VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+	                        AllocationFlags(usage);
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+	if (usage == MemoryUsage::SparseDeviceLocal) {
+		const auto native_device = static_cast<VkDevice>(graphics.device);
+		buffer_info.flags        = vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		VkBuffer   sparse_buffer = VK_NULL_HANDLE;
+		const auto raw           = static_cast<VkBufferCreateInfo>(buffer_info);
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateBuffer(native_device, &raw, nullptr, &sparse_buffer) != VK_SUCCESS);
+		m_buffer = sparse_buffer;
+		VkMemoryRequirements requirements {};
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetBufferMemoryRequirements(native_device, sparse_buffer, &requirements);
+		m_sparse            = std::make_unique<Sparse>();
+		m_sparse->page_size = requirements.alignment;
+		EXIT_IF(m_sparse->page_size == 0);
+		m_sparse->resident.resize((size + m_sparse->page_size - 1) / m_sparse->page_size);
+		const auto& memory     = graphics.physical_device_memory_properties;
+		uint32_t    type_index = UINT32_MAX;
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type_index == UINT32_MAX; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 && properties == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+				type_index = i;
+		}
+		for (uint32_t i = 0; i < memory.memoryTypeCount && type_index == UINT32_MAX; ++i) {
+			const auto properties = static_cast<VkMemoryPropertyFlags>(memory.memoryTypes[i].propertyFlags);
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0)
+				type_index = i;
+		}
+		EXIT_NOT_IMPLEMENTED(type_index == UINT32_MAX);
+		m_sparse->memory_type = type_index;
+		VkSemaphoreTypeCreateInfo timeline {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+		timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+		VkSemaphoreCreateInfo semaphore {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+		semaphore.pNext = &timeline;
+		EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateSemaphore(native_device, &semaphore, nullptr, &m_sparse->timeline) != VK_SUCCESS);
+		if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+		}
+		return;
+	}
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
-	const auto        result        = static_cast<vk::Result>(vmaCreateBuffer(
-	    graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info), &allocation_info,
-	    &native_buffer, &m_allocation, &allocation_result));
-	if (result != vk::Result::eSuccess) {
-		graphics.LogMemoryBudget();
+	const auto        create        = [&] {
+		return vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                       &allocation_info, &native_buffer, &m_allocation, &allocation_result) == VK_SUCCESS;
+	};
+	// Over the video memory budget VMA places it in system memory; when even that fails, without
+	// the images kept for reuse and over budget.
+	if (!create()) {
+		graphics.TrimImagePool();
+		allocation_info.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+		if (!create()) graphics.ReportMemoryFallback("a buffer could not be created", size);
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(native_buffer == VK_NULL_HANDLE);
 
 	m_buffer = native_buffer;
 	if (with_bda) {
@@ -98,11 +248,15 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		address_info.buffer = m_buffer;
 		m_device_address    = graphics.device.getBufferAddress(address_info);
 		EXIT_IF(m_device_address == 0);
+		DeviceFault::NoteCreated(m_device_address, size, cpu_address);
 	}
 
 	VkMemoryPropertyFlags properties = 0;
 	vmaGetAllocationMemoryProperties(graphics.allocator, m_allocation, &properties);
 	m_coherent = (properties & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+	if (usage == MemoryUsage::DeviceLocal && (properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) {
+		graphics.ReportMemoryFallback("a GPU buffer is in system memory", size);
+	}
 	if (allocation_result.pMappedData != nullptr) {
 		m_mapped = {static_cast<uint8_t*>(allocation_result.pMappedData),
 		            static_cast<size_t>(size)};
@@ -110,9 +264,25 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
-		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+	DeviceFault::NoteDestroyed(m_device_address);
+	if (m_sparse) {
+		const auto native_device = static_cast<VkDevice>(m_graphics->device);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyBuffer(native_device, static_cast<VkBuffer>(m_buffer), nullptr);
+		for (const auto chunk: m_sparse->chunks) VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(native_device, chunk, nullptr);
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroySemaphore(native_device, m_sparse->timeline, nullptr);
+		return;
 	}
+	if (m_buffer != nullptr) {
+		if (kyty_local_buffer_reclaim_mode.load(std::memory_order_relaxed) != 0) {
+			Reclaimer().Push(m_graphics->allocator, m_buffer, m_allocation);
+		} else {
+			vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
+		}
+	}
+}
+
+void FlushBufferReclaimer() {
+	Reclaimer().Flush();
 }
 
 vk::DeviceAddress Buffer::BufferDeviceAddress() const noexcept {
@@ -140,7 +310,7 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	EXIT_IF(m_mapped.empty() || offset > Size() || size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
@@ -178,6 +348,7 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	    destination_offset < source_offset + size) {
 		EXIT("Buffer: overlapping self-copy\n");
 	}
+	written_serial = Scheduler().CommandSerial();
 	command.EndRendering();
 	const vk::BufferMemoryBarrier before[] = {
 	    source.Barrier(source_offset, size, source_before, vk::AccessFlagBits::eTransferRead),
@@ -205,11 +376,29 @@ void Buffer::CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t sou
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 2, after, 0, nullptr);
 }
 
+void Buffer::CopyInRun(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
+                       uint64_t destination_offset, uint64_t size) {
+	if (size == 0 || source_offset > source.Size() || size > source.Size() - source_offset ||
+	    destination_offset > Size() || size > Size() - destination_offset) {
+		EXIT("Buffer: invalid copy range\n");
+	}
+	if (source.Handle() == Handle() && source_offset < destination_offset + size &&
+	    destination_offset < source_offset + size) {
+		EXIT("Buffer: overlapping self-copy\n");
+	}
+	written_serial = Scheduler().CommandSerial();
+	command.EndRendering();
+	const vk::BufferCopy copy {source_offset, destination_offset, size};
+	command.CopyRunHandle(source.Handle(), source_offset, Handle(), destination_offset, size)
+	    .copyBuffer(source.Handle(), Handle(), 1, &copy);
+}
+
 void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	if (((offset | size) & 3u) != 0) {
 		EXIT("Buffer: fill range must be dword aligned\n");
 	}
 	auto& command = Scheduler().Current();
+	written_serial = Scheduler().CommandSerial();
 	command.EndRendering();
 	const auto before =
 	    Barrier(offset, size, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
@@ -226,9 +415,67 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 }
 
+void Buffer::MakeResident(uint64_t offset, uint64_t size) {
+	if (!m_sparse || size == 0 || offset >= m_size) return;
+	auto&          sparse = *m_sparse;
+	const uint64_t first  = offset / sparse.page_size;
+	const uint64_t last   = std::min((offset + size - 1) / sparse.page_size, uint64_t {sparse.resident.size() - 1});
+	std::vector<VkSparseMemoryBind> binds;
+	for (uint64_t page = first; page <= last; ++page) {
+		if (sparse.resident[page] != 0) continue;
+		if (sparse.free_in_chunk == 0) {
+			VkMemoryAllocateInfo allocate {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+			allocate.allocationSize  = sparse.page_size * SparseChunkPages;
+			allocate.memoryTypeIndex = sparse.memory_type;
+			VkDeviceMemory chunk     = VK_NULL_HANDLE;
+			EXIT_NOT_IMPLEMENTED(VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(static_cast<VkDevice>(m_graphics->device), &allocate, nullptr, &chunk) !=
+			                     VK_SUCCESS);
+			sparse.chunks.push_back(chunk);
+			sparse.free_in_chunk = SparseChunkPages;
+		}
+		const uint64_t slot = SparseChunkPages - sparse.free_in_chunk--;
+		binds.push_back({page * sparse.page_size, sparse.page_size, sparse.chunks.back(), slot * sparse.page_size, 0});
+		sparse.resident[page] = 1;
+	}
+	if (binds.empty()) return;
+	VkSparseBufferMemoryBindInfo buffer_bind {static_cast<VkBuffer>(m_buffer), static_cast<uint32_t>(binds.size()),
+	                                          binds.data()};
+	const uint64_t                signal = ++sparse.value;
+	VkTimelineSemaphoreSubmitInfo timeline {VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	timeline.signalSemaphoreValueCount = 1;
+	timeline.pSignalSemaphoreValues    = &signal;
+	VkBindSparseInfo info {VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+	info.pNext                = &timeline;
+	info.bufferBindCount      = 1;
+	info.pBufferBinds         = &buffer_bind;
+	info.signalSemaphoreCount = 1;
+	info.pSignalSemaphores    = &sparse.timeline;
+	VkResult result           = VK_SUCCESS;
+	{
+		// (The queue the recording worker submits on, and not through the recording layer: its direct call first drains
+		// the stream, whose submissions wait for this lock.)
+		Common::LockGuard lock(m_graphics->queue_mutex);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		const auto& dispatch = LocalVulkanRecording::DirectDispatch();
+#else
+		const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
+#endif
+		result = dispatch.vkQueueBindSparse(static_cast<VkQueue>(m_graphics->queue), 1, &info, VK_NULL_HANDLE);
+	}
+	if (result == VK_ERROR_DEVICE_LOST) DeviceFault::Report();
+	EXIT_NOT_IMPLEMENTED(result != VK_SUCCESS);
+	// The submission of what is recorded next (the zeroing below, the caller's writes) waits for the binding on the GPU:
+	// binding operations keep no order with command buffers but through semaphores. (A wait here, on the CPU, behind
+	// everything queued before it: 1-1 loading 14 -> 141 s.) Earlier submissions see the pages bound or not, zero
+	// either way (strict residency).
+	Scheduler().WaitBeforeNextSubmit(vk::Semaphore(sparse.timeline), signal);
+	// New memory, zeroed: an entry nobody wrote is a page no buffer holds.
+	for (const auto& bind: binds) Fill(bind.resourceOffset, std::min(bind.size, m_size - bind.resourceOffset) & ~uint64_t {3}, 0);
+}
+
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-                           uint64_t size)
-    : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
+                           uint64_t size, vk::BufferUsageFlags flags)
+    : Buffer(graphics, scheduler, usage, 0, flags, size),
       m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
@@ -310,6 +557,12 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
+}
+
+void StreamBuffer::ResolvePendingTicks(uint64_t pending, uint64_t tick) noexcept {
+	for (auto* watches: {&m_current_watches, &m_previous_watches})
+		for (auto& watch: *watches)
+			if (watch.tick == pending) watch.tick = tick;
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

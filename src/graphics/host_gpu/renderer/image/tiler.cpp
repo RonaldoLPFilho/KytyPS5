@@ -20,15 +20,24 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
 
+// Freed scratch buffers kept for reuse: at most this much.
+static constexpr uint64_t ScratchPoolBudget = 512ull << 20u;
+
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
     : m_graphics(graphics), m_scheduler(scheduler), m_stream_buffer(stream_buffer) {
+	// Kept scratch is video memory too: a smaller GPU keeps less (8 GB: ~200 MiB).
+	m_scratch_pool_budget = std::min(ScratchPoolBudget, m_graphics.GetTotalMemoryBudget() / 32);
 	static_assert(FamilyCount == 9);
 	static_assert(sizeof(Push) == 52);
 	std::array<vk::DescriptorSetLayoutBinding, 3> bindings {};
@@ -59,6 +68,10 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 TileManager::~TileManager() {
+	if (m_timing_pool != nullptr) m_graphics.device.destroyQueryPool(m_timing_pool, nullptr);
+	for (const auto& pooled: m_scratch_pool) {
+		vmaDestroyBuffer(m_graphics.allocator, pooled.buffer, pooled.allocation);
+	}
 	for (auto pipeline: m_pipelines) {
 		if (pipeline != nullptr) {
 			m_graphics.device.destroyPipeline(pipeline, nullptr);
@@ -87,10 +100,31 @@ TileManager::~TileManager() {
 	}
 }
 
+// Scratch capacities are powers of two from 64 KiB, so buffers of similar requests are reused; past 64 MiB, multiples of
+// 64 MiB (a power of two made a 1.5 GB texture's scratch 2 GiB: on an 8 GB GPU neither video nor system memory had it,
+// and the emulator exited, 10-13).
+static uint64_t ScratchCapacity(uint64_t size) {
+	constexpr uint64_t Large = uint64_t {64} << 20u;
+	if (size > Large) return (size + Large - 1) / Large * Large;
+	return std::max<uint64_t>(uint64_t {1} << 16u, std::bit_ceil(size));
+}
+
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
+	const auto capacity = ScratchCapacity(size);
+	{
+		std::scoped_lock lock(m_scratch_mutex);
+		const auto it = std::ranges::find(m_scratch_pool, capacity, &PooledScratch::capacity);
+		if (it != m_scratch_pool.end()) {
+			const Scratch reused {it->buffer, it->allocation, size};
+			m_scratch_pool_bytes -= it->capacity;
+			*it = m_scratch_pool.back();
+			m_scratch_pool.pop_back();
+			return reused;
+		}
+	}
 	vk::BufferCreateInfo create {};
-	create.size  = size;
+	create.size  = capacity;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
 
@@ -99,16 +133,43 @@ TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	VkBuffer      buffer = VK_NULL_HANDLE;
 	VmaAllocation memory = nullptr;
 	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
-	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
-	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
-	                     "allocate TileManager scratch buffer");
+	auto          result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	// Out of video memory (a GPU with less of it, or a texture of over a GiB: 10-11 a 1.6 GiB one asked for 2 GiB and the
+	// emulator exited): without the pooled buffers, then in system memory (the GPU reads it slower; the game goes on).
+	if (result != VK_SUCCESS) {
+		std::vector<PooledScratch> pooled;
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			pooled.swap(m_scratch_pool);
+			m_scratch_pool_bytes = 0;
+		}
+		for (const auto& item: pooled) vmaDestroyBuffer(m_graphics.allocator, item.buffer, item.allocation);
+		result = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+	}
+	if (result != VK_SUCCESS) {
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		result         = vmaCreateBuffer(m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr);
+		if (result == VK_SUCCESS) m_graphics.ReportMemoryFallback("a tiling scratch buffer is in system memory", capacity);
+	}
+	RequireVulkanSuccess(static_cast<vk::Result>(result), "allocate TileManager scratch buffer");
 	return {buffer, memory, size};
 }
 
+// Once the GPU is done with the current work the buffer goes back to the pool (or, past its
+// budget, is freed).
 void TileManager::DeferDestroy(Scratch scratch) {
-	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
+	m_scheduler.DeferOperation([this, scratch] {
+		const auto capacity = ScratchCapacity(scratch.size);
+		{
+			std::scoped_lock lock(m_scratch_mutex);
+			if (m_scratch_pool_bytes + capacity <= m_scratch_pool_budget) {
+				m_scratch_pool.push_back({scratch.buffer, scratch.allocation, capacity});
+				m_scratch_pool_bytes += capacity;
+				return;
+			}
+		}
+		vmaDestroyBuffer(m_graphics.allocator, scratch.buffer, scratch.allocation);
+	});
 }
 
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
@@ -363,20 +424,93 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 	                        &barriers[1], 0, nullptr);
 }
 
+static constexpr uint32_t TimingSlots = 4096; // (pairs of timestamps)
+
+uint32_t TileManager::TimingBegin(vk::CommandBuffer command) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TILER_TIMING");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!enabled) return UINT32_MAX;
+	if (m_timing_pool == nullptr) {
+		vk::QueryPoolCreateInfo info {};
+		info.queryType  = vk::QueryType::eTimestamp;
+		info.queryCount = TimingSlots * 2;
+		if (m_graphics.device.createQueryPool(&info, nullptr, &m_timing_pool) != vk::Result::eSuccess) return UINT32_MAX;
+	}
+	const uint32_t slot = (m_timing_next++ % TimingSlots) * 2;
+	command.resetQueryPool(m_timing_pool, slot, 2);
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timing_pool, slot);
+	return slot;
+}
+
+void TileManager::TimingEnd(vk::CommandBuffer command, uint32_t slot, uint64_t bytes, bool host_source) {
+	if (slot == UINT32_MAX) return;
+	command.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, m_timing_pool, slot + 1);
+	struct Totals {
+		std::atomic<uint64_t> ns[2] {}, bytes[2] {}, count[2] {};
+		std::atomic<int64_t>  printed {0};
+	};
+	static Totals totals;
+	const double  period = m_graphics.GetPhysicalDeviceProperties().limits.timestampPeriod;
+	m_scheduler.DeferOperation([this, slot, bytes, host_source, period] {
+		std::array<uint64_t, 2> stamps {};
+		if (m_graphics.device.getQueryPoolResults(m_timing_pool, slot, 2, sizeof(stamps), stamps.data(), sizeof(uint64_t),
+		                                          vk::QueryResultFlagBits::e64) != vk::Result::eSuccess ||
+		    stamps[1] < stamps[0])
+			return;
+		const auto ns = static_cast<uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * period);
+		totals.ns[host_source].fetch_add(ns, std::memory_order_relaxed);
+		totals.bytes[host_source].fetch_add(bytes, std::memory_order_relaxed);
+		totals.count[host_source].fetch_add(1, std::memory_order_relaxed);
+		const auto now  = std::chrono::duration_cast<std::chrono::seconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch())
+		                     .count();
+		auto       last = totals.printed.load(std::memory_order_relaxed);
+		if (now - last < 5 || !totals.printed.compare_exchange_strong(last, now)) return;
+		for (int host = 1; host >= 0; --host) {
+			const auto b = totals.bytes[host].exchange(0), n = totals.ns[host].exchange(0),
+			           c = totals.count[host].exchange(0);
+			if (c == 0) continue;
+			std::printf("TILER detiles from %s memory: %llu, %.1f MiB in %.1f ms GPU (%.2f GB/s)\n",
+			            host != 0 ? "system" : "video", static_cast<unsigned long long>(c),
+			            static_cast<double>(b) / (1024.0 * 1024.0), static_cast<double>(n) / 1e6,
+			            n != 0 ? static_cast<double>(b) / static_cast<double>(n) : 0.0);
+		}
+	});
+}
+
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos) {
+                                        std::span<const GpuTileInfo> infos, bool host_source,
+                                        bool reuse_scratch) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
-	auto scratch = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
-	DeferDestroy(scratch);
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
-	return {scratch.buffer, 0, linear_capacity};
+	const uint64_t size = (linear_capacity + 3u) & ~uint64_t {3};
+	vk::Buffer     output {};
+	// (After Prepare, whose parameter ring may submit the tick: a buffer is reused only in the tick it is kept through.
+	// Record's first barrier waits for every earlier command, the reused buffer's readers.)
+	if (reuse_scratch && m_reused_scratch.buffer != vk::Buffer {} && m_reused_tick == m_scheduler.CurrentTick() &&
+	    m_reused_scratch.size >= size) {
+		output = m_reused_scratch.buffer;
+	} else {
+		auto scratch = AllocateScratch(size);
+		DeferDestroy(scratch);
+		output = scratch.buffer;
+		if (reuse_scratch) {
+			m_reused_scratch = {scratch.buffer, 0, ScratchCapacity(size)};
+			m_reused_tick    = m_scheduler.CurrentTick();
+		}
+	}
+	m_scheduler.EndRendering();
+	const auto timing = TimingBegin(m_scheduler.Current().Handle());
+	Record(tiled, tiled_offset, tiled_capacity, output, 0, size, dispatches, true);
+	TimingEnd(m_scheduler.Current().Handle(), timing, tiled_capacity, host_source);
+	return {output, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
