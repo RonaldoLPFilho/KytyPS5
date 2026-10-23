@@ -41,6 +41,56 @@
 namespace Libs::Graphics {
 
 
+// desport: DES_STATS probe for a materialization cache. Per shader entry, remembers the inputs
+// (user data, shader base, indirect address, workgroup counts) of the last 64 calls and their
+// results; counts how often the same inputs come back (srt_probe_key_seen) and give the same
+// resources and specialization (srt_probe_hit, the upper bound of an input-keyed cache).
+struct DesportSrtProbe {
+	struct Seen {
+		std::vector<uint32_t>                        key;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+	};
+	std::vector<Seen> recent;
+	size_t            next = 0;
+
+	void Record(const ShaderRecompiler::IR::SrtRuntime&            runtime,
+	            const ShaderRecompiler::IR::ResourceSnapshot&       resources,
+	            const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
+		std::vector<uint32_t> key(runtime.user_data.begin(), runtime.user_data.end());
+		for (const uint64_t v: {runtime.shader_base, runtime.indirect_args_address}) {
+			key.push_back(static_cast<uint32_t>(v));
+			key.push_back(static_cast<uint32_t>(v >> 32u));
+		}
+		key.insert(key.end(), runtime.workgroup_counts.begin(), runtime.workgroup_counts.end());
+		Desport::Stats::Add("srt_probe_calls", 0);
+		for (auto& seen: recent) {
+			if (seen.key != key) continue;
+			Desport::Stats::Add("srt_probe_key_seen", 0);
+			const auto& a = seen.resources;
+			const bool  same = a.buffers == resources.buffers && a.images == resources.images &&
+			                  a.samplers == resources.samplers && a.flattened_srt == resources.flattened_srt &&
+			                  a.user_data == resources.user_data &&
+			                  a.specialization_reads == resources.specialization_reads &&
+			                  a.uniform_fill == resources.uniform_fill;
+			if (same && seen.specialization == specialization) {
+				Desport::Stats::Add("srt_probe_hit", 0);
+			} else {
+				seen.resources      = resources;
+				seen.specialization = specialization;
+			}
+			return;
+		}
+		Seen entry {std::move(key), resources, specialization};
+		if (recent.size() < 64) {
+			recent.push_back(std::move(entry));
+		} else {
+			recent[next] = std::move(entry);
+			next         = (next + 1) % recent.size();
+		}
+	}
+};
+
 // desport: which SrtWalker path MaterializeResources takes (mirrors its capture_reads condition):
 // the compiled walker only runs when no read capture replaces read_memory.
 static const char* DesportSrtPath(const ShaderRecompiler::IR::ResourcePlan& plan,
@@ -272,6 +322,7 @@ struct PipelineCache::ProgramCache {
 			Desport::Stats::Scope desport_stat(DesportSrtPath(resource_plan, runtime)); // desport: DES_STATS per-draw SRT cost
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
+			if (Desport::Stats::Enabled()) desport_probe.Record(runtime, resources, specialization); // desport
 			for (auto& candidate: permutations) {
 				const auto& layout = candidate.program.bindings;
 				if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -293,6 +344,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 		bool                                       skip_dispatch = false;
+		DesportSrtProbe                            desport_probe; // desport: DES_STATS cache probe
 	};
 
 	struct ProgramKeyHash {
