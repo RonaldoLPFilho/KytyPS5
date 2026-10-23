@@ -45,7 +45,7 @@ void Milestone(std::string_view name, std::string_view detail) {
 			return;
 		}
 	}
-	Log::WriteToConsoleAndLog(
+	Log::Write(
 	    detail.empty() ? fmt::format("DES_MILESTONE {} t={}\n", name, ElapsedMs())
 	                   : fmt::format("DES_MILESTONE {} t={} {}\n", name, ElapsedMs(), detail));
 }
@@ -67,7 +67,7 @@ void FlipMilestone(bool from_gpu) {
 		window_start_flips.store(n);
 	} else if (now - start >= 5000 && window_start_ms.compare_exchange_strong(start, now)) {
 		const auto frames = n - window_start_flips.exchange(n);
-		Log::WriteToConsoleAndLog(
+		Log::Write(
 		    fmt::format("DES_FPS t={} fps={:.1f}\n", now, 1000.0 * static_cast<double>(frames) /
 		                                                     static_cast<double>(now - start)));
 	}
@@ -153,7 +153,7 @@ void Add(const char* name, uint64_t ns, uint64_t bytes, uint64_t vaddr) {
 		state.totals.clear();
 		state.regions.clear();
 	}
-	Log::WriteToConsoleAndLog(out);
+	Log::Write(out);
 }
 
 Scope::Scope(const char* name, uint64_t bytes, uint64_t vaddr)
@@ -303,7 +303,7 @@ void StartSampler() {
 			}
 		}
 	}).detach();
-	Log::WriteToConsoleAndLog(
+	Log::Write(
 	    fmt::format("DES_TRACE: counting PLT calls -> {}\n", g_output.string()));
 }
 
