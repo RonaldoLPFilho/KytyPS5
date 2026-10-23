@@ -303,7 +303,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
-	Desport::Stats::Scope desport_stat("readback", size, vaddr); // desport: DES_STATS readback cost
+	Desport::Stats::Scope desport_stat(is_write ? "readback_cpu_write" : "readback_cpu_read", size, vaddr); // desport: DES_STATS readback cost
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

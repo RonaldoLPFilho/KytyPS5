@@ -40,6 +40,21 @@
 
 namespace Libs::Graphics {
 
+
+// desport: which SrtWalker path MaterializeResources takes (mirrors its capture_reads condition):
+// the compiled walker only runs when no read capture replaces read_memory.
+static const char* DesportSrtPath(const ShaderRecompiler::IR::ResourcePlan& plan,
+                                  const ShaderRecompiler::IR::SrtRuntime&   runtime) {
+	if (!Desport::Stats::Enabled()) return "srt_materialize";
+	const bool workgroup = runtime.indirect_args_address != 0u &&
+	    std::ranges::any_of(plan.descriptor_sources, [](const auto& source) {
+		    return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
+	    });
+	const bool capture = plan.capture_specialization_reads || !plan.source_reads.empty() || workgroup;
+	if (!plan.srt_code) return "srt_materialize_nocode";
+	return capture ? "srt_materialize_capture" : "srt_materialize_jit";
+}
+
 namespace {
 
 constexpr auto DriverCacheSaveInterval = std::chrono::minutes {5};
@@ -254,7 +269,7 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
-			Desport::Stats::Scope desport_stat("srt_materialize"); // desport: DES_STATS per-draw SRT cost
+			Desport::Stats::Scope desport_stat(DesportSrtPath(resource_plan, runtime)); // desport: DES_STATS per-draw SRT cost
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
