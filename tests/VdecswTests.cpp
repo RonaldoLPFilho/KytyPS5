@@ -59,12 +59,22 @@ struct GuardedMemory {
 	uint8_t* data;
 	size_t size;
 	explicit GuardedMemory(size_t bytes): size(bytes) {
+#ifdef _WIN32
+		// desport: the MSVC STL has no std::aligned_alloc; use _aligned_malloc on Windows
+		allocation = static_cast<uint8_t*>(_aligned_malloc((bytes + 767u) & ~size_t{255}, 256));
+#else
 		allocation = static_cast<uint8_t*>(std::aligned_alloc(256, (bytes + 767u) & ~size_t{255}));
+#endif
 		CHECK(allocation != nullptr);
 		data = allocation + 256;
 		std::memset(allocation, 0xa7, bytes + 512);
 	}
+#ifdef _WIN32
+	// desport: memory from _aligned_malloc must be released with _aligned_free
+	~GuardedMemory() { Check(); _aligned_free(allocation); }
+#else
 	~GuardedMemory() { Check(); std::free(allocation); }
+#endif
 	void Check() const {
 		for (size_t i = 0; i < 256; ++i)
 			CHECK(allocation[i] == 0xa7 && data[size + i] == 0xa7);
