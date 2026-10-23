@@ -315,8 +315,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		// desport: fault-around. A host fault reports one byte, so a CPU walking a GPU-written
+		// buffer used to drain the GPU once per 4 KiB page. Download every GPU-modified page in an
+		// aligned window around the access (within this buffer) with the same wait instead.
+		// DES_FAULT_AROUND=0 restores the per-page behaviour.
+		uint64_t download_vaddr = vaddr;
+		uint64_t download_end   = vaddr + size;
+		if (const auto window = Desport::FaultAroundBytes(); window != 0 && size < window) {
+			download_vaddr = std::max(buffer.CpuAddress(), Common::AlignDown(vaddr, window));
+			download_end   = std::min(buffer.CpuAddress() + buffer.Size(), Common::AlignUp(vaddr + size, window));
+		}
+		if (DownloadBufferMemory<false>(buffer, download_vaddr, download_end - download_vaddr)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_end - download_vaddr);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

@@ -115,6 +115,14 @@ void LogEngineCounters(uint64_t now_ms, uint64_t frames) {
 
 } // namespace Stats
 
+uint64_t FaultAroundBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("DES_FAULT_AROUND");
+		return value != nullptr && value[0] == '0' ? uint64_t {0} : uint64_t {1} << 20u;
+	}();
+	return bytes;
+}
+
 namespace Stats {
 
 namespace {

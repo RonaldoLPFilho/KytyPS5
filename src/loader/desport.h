@@ -19,6 +19,10 @@ void FlipMilestone(bool from_gpu);
 // The first guest file opened under /app0 that is not part of the executable or sce_sys.
 void FileOpenMilestone(const char* guest_path);
 
+// Bytes of the aligned window a CPU fault on GPU-written memory downloads at once
+// (BufferCache::ReadMemory): 1 MiB, or 0 (one page per fault, upstream behaviour) with DES_FAULT_AROUND=0.
+uint64_t FaultAroundBytes();
+
 namespace Stats {
 
 // DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as
