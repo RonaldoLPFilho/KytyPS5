@@ -16,6 +16,7 @@
 #include "libs/network.h"
 #include "loader/demonsSoulsWarp.h"
 #include "loader/gameArgs.h"
+#include "loader/desport.h" // desport: first data file milestone
 
 #include <algorithm>
 #include <atomic>
@@ -388,6 +389,9 @@ void Shutdown() {
 void Mount(const std::filesystem::path& folder, const std::string& point) {
 
 	g_mount_points->Mount(folder, point);
+	if (point.starts_with("/savedata")) {
+		Desport::Milestone("first_savedata_mount", "point=" + point); // desport
+	}
 }
 
 void Umount(const std::string& folder_or_point) {
@@ -414,6 +418,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	     "\t flags = %08" PRIx32 "\n"
 	     "\t mode = %04" PRIx16 "\n",
 	     path, flags_u, mode);
+	Desport::FileOpenMilestone(path); // desport
 
 	bool append    = (flags_u & 0x0008u) != 0;
 	bool fsync     = (flags_u & 0x0080u) != 0;

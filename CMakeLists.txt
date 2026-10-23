@@ -372,6 +372,15 @@ list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/local/jit-arena.h"
 	"${KYTY_SOURCE_DIR}/local/jit-arena.cpp"
 )
+# desport: game-specific HLE overrides live in the desport repository (game/hooks).
+set(DESPORT_GAME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../game" CACHE PATH "desport game layer")
+file(GLOB desport_game_hooks CONFIGURE_DEPENDS "${DESPORT_GAME_DIR}/hooks/*.cpp")
+if (desport_game_hooks)
+	message(STATUS "desport: game hooks from ${DESPORT_GAME_DIR}/hooks")
+	list(APPEND kyty_emulator_src ${desport_game_hooks})
+else()
+	list(APPEND kyty_emulator_src "${KYTY_SOURCE_DIR}/desport/gameHooksDefault.cpp")
+endif()
 list(REMOVE_DUPLICATES kyty_emulator_src)
 
 if (KYTY_CLANG_CL)

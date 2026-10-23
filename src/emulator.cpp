@@ -21,6 +21,7 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
+#include "loader/desport.h" // desport: milestones
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
 #include "loader/timer.h"
@@ -197,6 +198,12 @@ void Run(const RunOptions& options) {
 	ClearDebugTextureFolder();
 
 	PrintSystemInfo();
+	{
+		// desport: process_started milestone with the title id.
+		std::string desport_title;
+		Loader::SystemContentParamSfoGetString("TITLE_ID", &desport_title);
+		Desport::Milestone("process_started", fmt::format("title={}", desport_title));
+	}
 
 	int ok = atexit(KytyClose);
 	EXIT_NOT_IMPLEMENTED(ok != 0);
@@ -206,6 +213,9 @@ void Run(const RunOptions& options) {
 	EXIT_NOT_IMPLEMENTED(ok != 0);
 
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/app0");
+	// desport: games write their own logs to /hostapp/logs; keep them out of the read-only dump.
+	// MountPoints::ResolvePath takes the first match, so this must come before /hostapp.
+	MountOrCreateDir("_HostAppLogs", "/hostapp/logs");
 	Libs::LibKernel::FileSystem::Mount(options.app0_dir, "/hostapp");
 
 	MountSandboxDirs();

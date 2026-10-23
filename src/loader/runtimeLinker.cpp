@@ -22,6 +22,7 @@
 #include "loader/demonsSoulsRenderSize.h"
 #include "loader/demonsSoulsSceneGuard.h"
 #include "loader/demonsSoulsTouchGuard.h"
+#include "loader/desport.h" // desport: milestones, call tracing, game hooks
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -1624,6 +1625,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
+	Desport::Milestone("modules_loaded", fmt::format("programs={}", m_programs.size())); // desport
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1636,6 +1638,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
+		Desport::Milestone("game_entry"); // desport: the game's own entry point is about to run
 		RunEntry(entry, params, ProgramExitHandler,
 		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
 	}
@@ -1688,6 +1691,11 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 	}
 
 	if (ids.size() == 3) {
+		// desport: game-specific overrides (game/hooks) win over the HLE and native modules.
+		if (Desport::FindGameHook(ids.at(0), type, out_info)) {
+			return;
+		}
+
 		const LibraryId* l = FindLibrary(*program, ids.at(1));
 		const ModuleId*  m = FindModule(*program, ids.at(2));
 
