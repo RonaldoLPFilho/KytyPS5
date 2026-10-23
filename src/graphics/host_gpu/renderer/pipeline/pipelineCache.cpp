@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "loader/desport.h" // desport: DES_STATS
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"

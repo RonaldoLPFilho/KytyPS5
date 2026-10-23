@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "loader/desport.h" // desport: DES_STATS
 #include "slow-log.h"
 
 #include "native-buffer-residency.h"
@@ -1633,6 +1634,7 @@ void BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	Desport::Stats::Scope desport_stat("readback", size, vaddr); // desport: DES_STATS readback cost
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",

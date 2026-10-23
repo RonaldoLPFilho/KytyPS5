@@ -2,11 +2,13 @@
 // desport: Demon's Souls port layer (milestones, call tracing, game-specific HLE overrides).
 #include "loader/desport.h"
 
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -55,7 +57,156 @@ void FlipMilestone(bool from_gpu) {
 	if (n == 1 || n == 60 || n == 600 || n == 3600) {
 		Milestone(fmt::format("flip_{}", n), from_gpu ? "source=gpu" : "source=cpu");
 	}
+	// Frame rate every 5 s (DES_FPS lines, read by tools/log_triage.py); the thread that wins the
+	// exchange of the window start logs it.
+	static std::atomic_uint64_t window_start_ms {0};
+	static std::atomic_uint64_t window_start_flips {0};
+	const auto                  now   = ElapsedMs();
+	auto                        start = window_start_ms.load(std::memory_order_relaxed);
+	if (start == 0) {
+		window_start_ms.compare_exchange_strong(start, now);
+		window_start_flips.store(n);
+	} else if (now - start >= 5000 && window_start_ms.compare_exchange_strong(start, now)) {
+		const auto frames = n - window_start_flips.exchange(n);
+		Log::WriteToConsoleAndLog(
+		    fmt::format("DES_FPS t={} fps={:.1f}\n", now, 1000.0 * static_cast<double>(frames) /
+		                                                     static_cast<double>(now - start)));
+		Stats::LogEngineCounters(now, frames);
+	}
 }
+
+namespace Stats {
+
+void LogEngineCounters(uint64_t now_ms, uint64_t frames) {
+	using Common::DebugCounters::Counter;
+	if (!Enabled()) {
+		return;
+	}
+	if (!Common::DebugCounters::Enabled()) {
+		// The upstream counters feed --perf-overlay; DES_STATS turns them on for the log too.
+		Common::DebugCounters::SetEnabled(true);
+		return;
+	}
+	static constexpr std::pair<Counter, const char*> Logged[] = {
+	    {Counter::Draws, "draws"},
+	    {Counter::Dispatches, "dispatches"},
+	    {Counter::QueueSubmits, "queue_submits"},
+	    {Counter::GpuWaits, "gpu_waits"},
+	    {Counter::GpuWaitNs, "gpu_wait_ns"},
+	    {Counter::GpuFaults, "gpu_faults"},
+	    {Counter::BufferDownloadBytes, "buffer_download_bytes"},
+	    {Counter::BufferUploadBytes, "buffer_upload_bytes"},
+	    {Counter::TextureDownloadBytes, "texture_download_bytes"},
+	    {Counter::TextureUploadBytes, "texture_upload_bytes"},
+	    {Counter::ColorMetadataReadbacks, "color_metadata_readbacks"},
+	    {Counter::ColorMetadataReadbackNs, "color_metadata_readback_ns"},
+	    {Counter::ShadersCompiled, "shaders_compiled"},
+	    {Counter::PipelinesCreated, "pipelines_created"},
+	};
+	static uint64_t previous[std::size(Logged)] {};
+	std::string     line = fmt::format("DES_COUNTERS t={} frames={}", now_ms, frames);
+	for (size_t i = 0; i < std::size(Logged); i++) {
+		const auto value = Common::DebugCounters::Get(Logged[i].first);
+		line += fmt::format(" {}={}", Logged[i].second, value - previous[i]);
+		previous[i] = value;
+	}
+	Log::WriteToConsoleAndLog(line + "\n");
+}
+
+} // namespace Stats
+
+namespace Stats {
+
+namespace {
+
+struct Totals {
+	uint64_t calls = 0;
+	uint64_t ns    = 0;
+	uint64_t bytes = 0;
+};
+
+struct State {
+	std::mutex                                       mutex;
+	std::unordered_map<std::string, Totals>          totals;
+	std::unordered_map<std::string, std::unordered_map<uint64_t, Totals>> regions;
+	uint64_t                                         window_start_ms = 0;
+};
+
+State& GetState() {
+	static State state;
+	return state;
+}
+
+int64_t NowNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
+} // namespace
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("DES_STATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void Add(const char* name, uint64_t ns, uint64_t bytes, uint64_t vaddr) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&            state = GetState();
+	std::string      out;
+	{
+		std::scoped_lock lock(state.mutex);
+		auto&            t = state.totals[name];
+		t.calls++;
+		t.ns += ns;
+		t.bytes += bytes;
+		if (vaddr != 0) {
+			auto& r = state.regions[name][vaddr >> 16u];
+			r.calls++;
+			r.ns += ns;
+		}
+		const auto now = ElapsedMs();
+		if (state.window_start_ms == 0) {
+			state.window_start_ms = now;
+		}
+		if (now - state.window_start_ms < 5000) {
+			return;
+		}
+		state.window_start_ms = now;
+		for (const auto& [n, v]: state.totals) {
+			out += fmt::format("DES_STAT t={} name={} calls={} ms={:.1f} bytes={}\n", now, n, v.calls,
+			                   static_cast<double>(v.ns) / 1e6, v.bytes);
+		}
+		for (auto& [n, regions]: state.regions) {
+			std::vector<std::pair<uint64_t, Totals>> top(regions.begin(), regions.end());
+			std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
+			top.resize(std::min<size_t>(top.size(), 8));
+			for (const auto& [region, v]: top) {
+				out += fmt::format("DES_STAT_ADDR t={} name={} region=0x{:x} calls={} ms={:.1f}\n", now, n,
+				                   region << 16u, v.calls, static_cast<double>(v.ns) / 1e6);
+			}
+		}
+		state.totals.clear();
+		state.regions.clear();
+	}
+	Log::WriteToConsoleAndLog(out);
+}
+
+Scope::Scope(const char* name, uint64_t bytes, uint64_t vaddr)
+    : m_name(name), m_bytes(bytes), m_vaddr(vaddr), m_start_ns(Enabled() ? NowNs() : 0) {}
+
+Scope::~Scope() {
+	if (m_start_ns != 0) {
+		Add(m_name, static_cast<uint64_t>(NowNs() - m_start_ns), m_bytes, m_vaddr);
+	}
+}
+
+} // namespace Stats
 
 void FileOpenMilestone(const char* guest_path) {
 	static std::atomic_bool done {false};

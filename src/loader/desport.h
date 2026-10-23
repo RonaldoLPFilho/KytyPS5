@@ -19,6 +19,33 @@ void FlipMilestone(bool from_gpu);
 // The first guest file opened under /app0 that is not part of the executable or sce_sys.
 void FileOpenMilestone(const char* guest_path);
 
+namespace Stats {
+
+// DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as
+// "DES_STAT t=<ms> name=<n> calls=<c> ms=<total> bytes=<b>" plus, for names recorded with an
+// address, "DES_STAT_ADDR t=<ms> name=<n> region=0x<64 KiB region> calls=<c> ms=<total>" (top 8).
+bool Enabled();
+void Add(const char* name, uint64_t ns, uint64_t bytes = 0, uint64_t vaddr = 0);
+// Logs the upstream Common::DebugCounters deltas as one DES_COUNTERS line (called with DES_FPS).
+void LogEngineCounters(uint64_t now_ms, uint64_t frames);
+
+// Times a scope when stats are enabled.
+class Scope {
+public:
+	explicit Scope(const char* name, uint64_t bytes = 0, uint64_t vaddr = 0);
+	~Scope();
+	Scope(const Scope&)            = delete;
+	Scope& operator=(const Scope&) = delete;
+
+private:
+	const char* m_name;
+	uint64_t    m_bytes;
+	uint64_t    m_vaddr;
+	int64_t     m_start_ns;
+};
+
+} // namespace Stats
+
 namespace Trace {
 
 // DES_TRACE=1 counts every PLT call through a per-slot thunk and writes DES_TRACE_FILE
