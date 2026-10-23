@@ -23,6 +23,7 @@
 #include "libs/errno.h"
 #include "libs/hmd2.h"
 #include "libs/libs.h"
+#include "loader/desport.h" // desport: flip milestones
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -553,6 +554,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
 		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
+	Desport::FlipMilestone(source == FlipRequestSource::GpuEop); // desport: CPU and GPU flips
 	return OK;
 }
 

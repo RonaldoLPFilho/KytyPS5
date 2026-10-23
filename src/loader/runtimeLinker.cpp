@@ -17,6 +17,7 @@
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "loader/desport.h" // desport: milestones, call tracing, game hooks
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/guestInstructionPatcher.h"
@@ -889,6 +890,11 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 		}
 	}
 
+	// desport: DES_TRACE=1 routes each PLT function slot through a counting thunk.
+	if (jmprela_table && ri.type == SymbolType::Func && Desport::Trace::Enabled()) {
+		value = Desport::Trace::Wrap(ri.vaddr, value, ri.name, ri.dbg_name, program->file_name);
+	}
+
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
@@ -1135,8 +1141,9 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 			if (symbol.GetBind() != STB_GLOBAL && symbol.GetBind() != STB_WEAK) {
 				return;
 			}
-			const auto value =
-			    *reinterpret_cast<const uint64_t*>(importer->base_vaddr + r->r_offset);
+			// desport: look through DES_TRACE thunks to the module the slot really targets.
+			const auto value = Desport::Trace::Unwrap(
+			    *reinterpret_cast<const uint64_t*>(importer->base_vaddr + r->r_offset));
 			const auto address = value - (type == R_X86_64_64 ? r->r_addend : 0);
 			if (address < program->base_vaddr ||
 			    address >= program->base_vaddr + program->mapped_size) {
@@ -1274,6 +1281,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
+	Desport::Milestone("modules_loaded", fmt::format("programs={}", m_programs.size())); // desport
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
@@ -1291,6 +1299,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 		LOGF("stack_addr = %" PRIx64 "\n", reinterpret_cast<uint64_t>(params));
 
+		Desport::Milestone("game_entry"); // desport: the game's own entry point is about to run
 		RunEntry(entry, params, ProgramExitHandler,
 		         reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(params) - 0x1000u));
 	}
@@ -1339,6 +1348,11 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 	}
 
 	if (ids.size() == 3) {
+		// desport: game-specific overrides (game/hooks) win over the HLE and native modules.
+		if (Desport::FindGameHook(ids.at(0), type, out_info)) {
+			return;
+		}
+
 		const LibraryId* l = FindLibrary(*program, ids.at(1));
 		const ModuleId*  m = FindModule(*program, ids.at(2));
 
