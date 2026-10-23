@@ -2,7 +2,6 @@
 // desport: Demon's Souls port layer (milestones, call tracing, game-specific HLE overrides).
 #include "loader/desport.h"
 
-#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
@@ -71,49 +70,9 @@ void FlipMilestone(bool from_gpu) {
 		Log::WriteToConsoleAndLog(
 		    fmt::format("DES_FPS t={} fps={:.1f}\n", now, 1000.0 * static_cast<double>(frames) /
 		                                                     static_cast<double>(now - start)));
-		Stats::LogEngineCounters(now, frames);
 	}
 }
 
-namespace Stats {
-
-void LogEngineCounters(uint64_t now_ms, uint64_t frames) {
-	using Common::DebugCounters::Counter;
-	if (!Enabled()) {
-		return;
-	}
-	if (!Common::DebugCounters::Enabled()) {
-		// The upstream counters feed --perf-overlay; DES_STATS turns them on for the log too.
-		Common::DebugCounters::SetEnabled(true);
-		return;
-	}
-	static constexpr std::pair<Counter, const char*> Logged[] = {
-	    {Counter::Draws, "draws"},
-	    {Counter::Dispatches, "dispatches"},
-	    {Counter::QueueSubmits, "queue_submits"},
-	    {Counter::GpuWaits, "gpu_waits"},
-	    {Counter::GpuWaitNs, "gpu_wait_ns"},
-	    {Counter::GpuFaults, "gpu_faults"},
-	    {Counter::BufferDownloadBytes, "buffer_download_bytes"},
-	    {Counter::BufferUploadBytes, "buffer_upload_bytes"},
-	    {Counter::TextureDownloadBytes, "texture_download_bytes"},
-	    {Counter::TextureUploadBytes, "texture_upload_bytes"},
-	    {Counter::ColorMetadataReadbacks, "color_metadata_readbacks"},
-	    {Counter::ColorMetadataReadbackNs, "color_metadata_readback_ns"},
-	    {Counter::ShadersCompiled, "shaders_compiled"},
-	    {Counter::PipelinesCreated, "pipelines_created"},
-	};
-	static uint64_t previous[std::size(Logged)] {};
-	std::string     line = fmt::format("DES_COUNTERS t={} frames={}", now_ms, frames);
-	for (size_t i = 0; i < std::size(Logged); i++) {
-		const auto value = Common::DebugCounters::Get(Logged[i].first);
-		line += fmt::format(" {}={}", Logged[i].second, value - previous[i]);
-		previous[i] = value;
-	}
-	Log::WriteToConsoleAndLog(line + "\n");
-}
-
-} // namespace Stats
 
 namespace Stats {
 

@@ -26,8 +26,6 @@ namespace Stats {
 // address, "DES_STAT_ADDR t=<ms> name=<n> region=0x<64 KiB region> calls=<c> ms=<total>" (top 8).
 bool Enabled();
 void Add(const char* name, uint64_t ns, uint64_t bytes = 0, uint64_t vaddr = 0);
-// Logs the upstream Common::DebugCounters deltas as one DES_COUNTERS line (called with DES_FPS).
-void LogEngineCounters(uint64_t now_ms, uint64_t frames);
 
 // Times a scope when stats are enabled.
 class Scope {
