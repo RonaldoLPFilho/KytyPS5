@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "loader/desport.h" // desport: DES_STATS
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -253,6 +254,7 @@ struct PipelineCache::ProgramCache {
 		template <bool HasCalls>
 		Permutation* FindPermutation(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                             uint32_t push_data_cursor) {
+			Desport::Stats::Scope desport_stat("srt_materialize"); // desport: DES_STATS per-draw SRT cost
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    resource_plan, runtime, resources, specialization));
 			for (auto& candidate: permutations) {
