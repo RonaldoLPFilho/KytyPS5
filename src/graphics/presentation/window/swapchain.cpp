@@ -295,13 +295,14 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 
 class Swapchain final {
 public:
-	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
+	enum class Status : uint8_t { Success, Recreate, SurfaceLost, Timeout }; // desport: S-001 Timeout
 
 	explicit Swapchain(WindowContext& window): m_window(window) {}
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
-	void                 Create();
+	[[nodiscard]] bool   Create(); // desport: S-001 false: no swapchain (0x0 surface)
+	[[nodiscard]] bool   Valid() const noexcept { return m_handle != nullptr; } // desport: S-001
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay(SystemOverlayHud* hud = nullptr);
@@ -350,7 +351,7 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
-		swapchain.Create();
+		EXIT_IF(!swapchain.Create()); // desport: S-001
 		// One frame more than the swapchain's images: with frame generation the present worker holds
 		// the frame it presents and the next one waiting, while the GPU thread prepares a third.
 		frames.Initialize(swapchain.ImageCount() + 1u, swapchain.Format());
@@ -439,7 +440,7 @@ struct Presenter::Impl {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
-		frames.SetFormat(swapchain.Format());
+		if (swapchain.Valid()) frames.SetFormat(swapchain.Format()); // desport: S-001 (no swapchain while 0x0)
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -653,7 +654,7 @@ vk::SurfaceFormatKHR Swapchain::SelectFormat() {
 	EXIT("no supported UNORM swapchain format\n");
 }
 
-void Swapchain::Create() {
+bool Swapchain::Create() { // desport: S-001
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
@@ -672,6 +673,13 @@ void Swapchain::Create() {
 		m_extent.height =
 		    std::clamp(graphics.screen_height, surface.capabilities.minImageExtent.height,
 		               surface.capabilities.maxImageExtent.height);
+	}
+	// desport: S-001 never create a 0x0 swapchain (minimized window): leave it without one; the present path
+	// skips presenting and tries again when the window is back.
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		m_extent = {};
+		LOGF("Swapchain: surface extent is 0x0, no swapchain for now\n");
+		return false;
 	}
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
 	if (surface.capabilities.maxImageCount != 0) {
@@ -769,6 +777,7 @@ void Swapchain::Create() {
 	}
 	m_image_index = static_cast<uint32_t>(-1);
 	m_frame_index = 0;
+	return true; // desport: S-001
 }
 
 Swapchain::~Swapchain() {
@@ -836,17 +845,42 @@ void Swapchain::Recreate(bool surface_lost) {
 #endif
 	}
 	m_window.RefreshSurfaceCapabilities();
-	Create();
+	(void)Create(); // desport: S-001 (false: 0x0 surface, Valid() says so)
 }
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index     = static_cast<uint32_t>(-1);
+	// desport: S-001 a finite timeout (KYTY_ACQUIRE_TIMEOUT_MS, default 100, 0 = wait forever as before): a driver
+	// that does not hand out images (minimized, covered window) costs the frame, not the whole emulation.
+	static const uint64_t acquire_timeout_ns = [] {
+		uint64_t ms = 100;
+		if (const char* value = std::getenv("KYTY_ACQUIRE_TIMEOUT_MS"); value != nullptr && *value != '\0') {
+			ms = std::strtoull(value, nullptr, 10);
+		}
+		return ms == 0 ? std::numeric_limits<uint64_t>::max() : ms * 1000000ull;
+	}();
+	static std::atomic_bool timing_out {false}; // desport: S-001 (log once per transition)
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
+	    m_handle, acquire_timeout_ns, m_image_acquired[m_frame_index], nullptr, // desport: S-001
 	    &m_image_index);
+	if (result == vk::Result::eSuccess || result == vk::Result::eSuboptimalKHR) {
+		if (timing_out.exchange(false)) { // desport: S-001
+			LOGF("DES_WINDOW acquire_recovered\n");
+			std::printf("DES_WINDOW acquire_recovered\n");
+			std::fflush(stdout);
+		}
+	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
+		case vk::Result::eTimeout: // desport: S-001
+		case vk::Result::eNotReady:
+			if (!timing_out.exchange(true)) {
+				LOGF("DES_WINDOW acquire_timeout (%llu ms)\n", static_cast<unsigned long long>(acquire_timeout_ns / 1000000ull));
+				std::printf("DES_WINDOW acquire_timeout (%llu ms)\n", static_cast<unsigned long long>(acquire_timeout_ns / 1000000ull));
+				std::fflush(stdout);
+			}
+			return Status::Timeout;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
@@ -1140,6 +1174,11 @@ bool Presenter::FlipRateApplies(const Frame& frame) noexcept {
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	// desport: S-001 minimized window: retire the flip without presenting (and without waiting for the FG worker)
+	if (m_impl->window.minimized.load(std::memory_order_acquire)) {
+		m_impl->frames.Release(&frame, true);
+		return;
+	}
 	if (FrameGen::Enabled() && Impl::AsyncPresentAllowed()) {
 		m_impl->PostAsync(frame, reuse);
 		return;
@@ -1150,6 +1189,21 @@ void Presenter::Present(Frame& frame, bool reuse) {
 
 void Presenter::Impl::PresentNow(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
+	// desport: S-001 minimized window (also for a frame the FG worker already holds): nothing to show and the driver may
+	// block acquire/present; the frame goes back to the pool and the flip retires as usual (no FrameGen::BeforePresent).
+	if (window.minimized.load(std::memory_order_acquire)) {
+		frames.Release(&frame, true);
+		return;
+	}
+	// desport: S-001 window back: refresh the surface capabilities and recreate the swapchain before the first acquire;
+	// also when the last recreate found a 0x0 surface and left no swapchain.
+	if (window.surface_dirty.exchange(false, std::memory_order_acq_rel) || !swapchain.Valid()) {
+		RecoverSwapchain(Swapchain::Status::Recreate);
+		if (!swapchain.Valid()) {
+			frames.Release(&frame, true);
+			return;
+		}
+	}
 #if defined(_WIN32)
 	if (!PresentDue()) {
 		// A frame the display could not show anyway (menus and movies run far above it); it
@@ -1175,7 +1229,12 @@ void Presenter::Impl::PresentNow(Frame& frame, bool reuse) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		if (!swapchain.Valid()) break; // desport: S-001 recreate found a 0x0 surface
 		auto status = swapchain.AcquireNextImage();
+		if (status == Swapchain::Status::Timeout) { // desport: S-001 drop the frame, do not block the vblank thread
+			frames.Release(&frame, true);
+			return;
+		}
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

@@ -18,6 +18,7 @@
 #include "SDL_touch.h"
 #include "SDL_video.h"
 #include "SDL_vulkan.h"
+#include <cstdio> // desport: S-001
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -417,6 +418,20 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
+// desport: S-001 minimized/restored transition: the present path skips presenting while minimized (a minimized
+// window has a 0x0 surface and the driver can block acquire/present), and refreshes the swapchain on restore.
+static void MarkMinimized(WindowContext& context, bool minimized, const char* why) {
+	if (context.minimized.exchange(minimized, std::memory_order_acq_rel) == minimized) {
+		return;
+	}
+	if (!minimized) {
+		context.surface_dirty.store(true, std::memory_order_release);
+	}
+	LOGF("DES_WINDOW %s (%s)\n", minimized ? "minimized" : "restored", why);
+	std::printf("DES_WINDOW %s (%s)\n", minimized ? "minimized" : "restored", why);
+	std::fflush(stdout);
+}
+
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 	EXIT_IF(new_width == 0 || new_height == 0);
 	Common::LockGuard lock(mutex);
@@ -449,6 +464,12 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			     window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
+			// desport: S-001 a 0x0 size is a minimized window: no Resize (it would EXIT), only the flag
+			if (window_event.data1 <= 0 || window_event.data2 <= 0) {
+				MarkMinimized(*this, true, "size 0x0");
+				break;
+			}
+			MarkMinimized(*this, false, "size"); // desport: S-001 a real size again
 			Resize(window_event.data1, window_event.data2);
 
 			break;
@@ -458,18 +479,27 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			     window_event.windowID, window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
+			// desport: S-001 a 0x0 size is a minimized window: no Resize (it would EXIT), only the flag
+			if (window_event.data1 <= 0 || window_event.data2 <= 0) {
+				MarkMinimized(*this, true, "size 0x0");
+				break;
+			}
+			MarkMinimized(*this, false, "size"); // desport: S-001 a real size again
 			Resize(window_event.data1, window_event.data2);
 
 			break;
 
 		case SDL_WINDOWEVENT_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			MarkMinimized(*this, true, "event"); // desport: S-001
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			MarkMinimized(*this, false, "maximized"); // desport: S-001
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			MarkMinimized(*this, false, "event"); // desport: S-001
 			break;
 		case SDL_WINDOWEVENT_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
