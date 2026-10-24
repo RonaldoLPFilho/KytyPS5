@@ -87,13 +87,21 @@ int MovieFlipFloor() {
 	return std::max(0, static_cast<int>((Config::GetVblankFrequency() + 30u) / 60u) - 1);
 }
 
+bool MoviePlaying() { // desport: KYTY_FPS_LIMIT
+	return g_movie_files.load(std::memory_order_relaxed) > 0;
+}
+
 void MovieFileOpened(const char* guest_path) {
 	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
 		return;
 	}
-	if (g_movie_files.fetch_add(1) == 0 && Config::GetVblankFrequency() >= 100) {
+	const int before = g_movie_files.fetch_add(1);
+	if (before == 0 && Config::GetVblankFrequency() >= 100) {
 		Emit(fmt::format("DES_VBLANK movie_pacing on t={} file={} vblank={}Hz flip_floor={}\n", ElapsedMs(), guest_path,
 		                 Config::GetVblankFrequency(), MovieFlipFloor()));
+	}
+	if (before == 0 && Fps::Requested()) { // desport: KYTY_FPS_LIMIT: flips back on vblank ticks while the movie plays
+		Emit(fmt::format("DES_FPS_LIMIT movie_hold on t={} file={}\n", ElapsedMs(), guest_path));
 	}
 }
 
@@ -104,9 +112,14 @@ void MovieFileClosed(const char* guest_path) {
 	const int before = g_movie_files.fetch_sub(1);
 	if (before <= 0) {
 		g_movie_files.store(0); // a close we did not count
-	} else if (before == 1 && Config::GetVblankFrequency() >= 100) {
-		Emit(fmt::format("DES_VBLANK movie_pacing off t={} file={} vblank={}Hz\n", ElapsedMs(), guest_path,
-		                 Config::GetVblankFrequency()));
+	} else if (before == 1) {
+		if (Config::GetVblankFrequency() >= 100) {
+			Emit(fmt::format("DES_VBLANK movie_pacing off t={} file={} vblank={}Hz\n", ElapsedMs(), guest_path,
+			                 Config::GetVblankFrequency()));
+		}
+		if (Fps::Requested()) { // desport: KYTY_FPS_LIMIT
+			Emit(fmt::format("DES_FPS_LIMIT movie_hold off t={} file={}\n", ElapsedMs(), guest_path));
+		}
 	}
 }
 

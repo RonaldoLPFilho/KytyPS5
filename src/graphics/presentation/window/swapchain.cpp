@@ -1165,6 +1165,18 @@ bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
 }
 
+// desport: KYTY_FPS_LIMIT=display (the same query as PresentDue's).
+uint32_t Presenter::DisplayRefreshRate() const noexcept {
+	if (m_impl->window.window == nullptr) {
+		return 0;
+	}
+	SDL_DisplayMode mode {};
+	const int       display = SDL_GetWindowDisplayIndex(m_impl->window.window);
+	return display >= 0 && SDL_GetCurrentDisplayMode(display, &mode) == 0 && mode.refresh_rate > 0
+	           ? static_cast<uint32_t>(mode.refresh_rate)
+	           : 0u;
+}
+
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
