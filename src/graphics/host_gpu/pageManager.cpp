@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "slow-log.h"
+#include "common/assert.h" // desport: crash record
 
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
@@ -67,6 +68,7 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	Common::ReportCrash(reason != nullptr ? reason : "PageManager fail-fast: invalid page state"); // desport: crash record
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif
@@ -81,6 +83,7 @@ constexpr uint32_t READ_WRITE_PROTECTION = PAGE_READWRITE;
 	va_end(args);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
+	Common::ReportCrash("PageManager fatal (see stderr)"); // desport: crash record
 	std::_Exit(322);
 }
 

@@ -47,6 +47,14 @@ std::set<std::string> g_milestones;
 
 } // namespace
 
+void EmitLine(const std::string& text) { // desport: crash record
+	Emit(text);
+}
+
+uint64_t ElapsedMilliseconds() { // desport: crash record
+	return ElapsedMs();
+}
+
 void Milestone(std::string_view name, std::string_view detail) {
 	{
 		std::scoped_lock lock(g_milestone_mutex);

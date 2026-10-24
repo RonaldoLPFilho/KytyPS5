@@ -19,6 +19,22 @@ void FlipMilestone(bool from_gpu);
 // The first guest file opened under /app0 that is not part of the executable or sce_sys.
 void FileOpenMilestone(const char* guest_path);
 
+// desport: the same line the milestones go out with (log and stdout, flushed) and the process's age in ms.
+void     EmitLine(const std::string& text);
+uint64_t ElapsedMilliseconds();
+
+// desport: crash record (desportCrash.cpp): a minidump in DES_CRASH_DIR (default: the working directory) and a
+// "DES_CRASH t=<ms> kind=<exception|exit|device_lost> code=0x.. pc=0x.. module=.. thread=<tid> name=.. dump=.. message=.."
+// line, once per process.
+namespace Crash {
+
+// Hooks Common::ReportCrash (EXIT/EXIT_IF/NOT_IMPLEMENTED), the unhandled-exception filter, abort and std::terminate.
+void Install();
+// The faulting context of a host exception the engine is about to end with EXIT (kept per thread for the dump).
+void NoteException(const void* native_context, uint32_t code, uint64_t pc);
+
+} // namespace Crash
+
 namespace Stats {
 
 // DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as

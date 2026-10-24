@@ -192,6 +192,7 @@ void Run(const RunOptions& options) {
 	}
 
 	const auto         param_json = options.app0_dir / "sce_sys" / "param.json";
+	Desport::Crash::Install(); // desport: crash record
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 

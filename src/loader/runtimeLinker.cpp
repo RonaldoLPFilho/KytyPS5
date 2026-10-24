@@ -996,6 +996,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 #endif
 		std::fflush(stdout);
 	}
+	Desport::Crash::NoteException(info->native_context, info->native_code, info->exception_address); // desport: crash record
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64 " (%s)"
 	     " access=%u address=0x%016" PRIx64 " (%s) code=%s\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
