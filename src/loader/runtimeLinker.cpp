@@ -1623,6 +1623,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	for (auto* program : m_programs) DemonsSoulsCopy::Install(program);
 	DemonsSoulsGpuPages::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsRenderSize::Install(m_programs.empty() ? nullptr : m_programs.front());
+	Desport::InstallUltrawide(m_programs.empty() ? nullptr : m_programs.front()); // desport: KYTY_ULTRAWIDE
 	DemonsSoulsSceneGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	DemonsSoulsTouchGuard::Install(m_programs.empty() ? nullptr : m_programs.front());
 	StartAllModules();
