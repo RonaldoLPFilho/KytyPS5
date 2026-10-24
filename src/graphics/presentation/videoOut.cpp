@@ -24,6 +24,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/desport.h" // desport: flip milestones
+#include "frame-gen.h"      // desport: KYTY_FPS_LIMIT with frame generation (FrameGen::Enabled, PresentedFrames)
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -857,6 +858,10 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
+		// desport: KYTY_FPS_LIMIT with frame generation: "display" limits flips to display rate / frames shown per flip
+		if (Desport::Fps::Requested()) {
+			Desport::Fps::SetFrameGeneration(Graphics::FrameGen::Enabled() ? Graphics::FrameGen::PresentedFrames() : 1u);
+		}
 		// desport: KYTY_FPS_LIMIT=display: the display's rate, once the window is there
 		if (Desport::Fps::NeedsDisplayRate()) {
 			Desport::Fps::SetDisplayRate(m_presenter.DisplayRefreshRate());

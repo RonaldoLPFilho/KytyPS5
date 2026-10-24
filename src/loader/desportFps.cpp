@@ -24,6 +24,14 @@
 //   ms) and gameDeltaTimeCorrectionTolorance=0.1 (quantum 1.7 ms); KYTY_FPS_GAME_CONVARS replaces
 //   or ("0") removes them. Physics keeps its fixed 60 Hz step (physicsUseFixedTimestep=1,
 //   physicsBaseFixedTimestepOnRefreshRate=1, physicsMaxUpdateStepsPerFrame=1).
+//
+// desport: with frame generation (DLSS-G, FrameGen::Enabled()) the limit counts flips, i.e. rendered frames; DLSS-G adds
+// its generated frames at the present. "display" then limits flips to display rate / FrameGen::PresentedFrames() (the
+// frames DLSS-G shows per flip, as it last reported them, about once a second; it follows F2 and a minimized window),
+// so the presented rate is the display's. <n> stays a limit on flips: the presented rate is about n x the frames shown
+// per flip (a launcher that wants "n presented" passes n / (1 + generated)). Each change logs
+// "DES_FPS_LIMIT fg t=<ms> mode=<..> fg=<frames per flip> effective=<flip limit> presented=<..>".
+// The Reflex frame limiter (slReflexSetOptions frameLimitUs) is not used: these flips are paced here already.
 #include "loader/desport.h"
 
 #include <algorithm>
@@ -89,6 +97,10 @@ std::atomic<uint64_t> g_next_due_ns {0}; // the vblank thread writes it (OnFlip)
 std::atomic<uint64_t> g_between_vblanks {0};
 std::atomic<uint64_t> g_on_vblank {0};
 std::atomic<uint64_t> g_last_stats_ns {0};
+// desport: frame generation (SetFrameGeneration): frames DLSS-G shows per flip (1: none) and, for "display", the
+// display's rate once known. Written by the vblank thread only.
+std::atomic<uint32_t> g_fg_frames {1};
+std::atomic<uint32_t> g_display_hz {0};
 
 void StartPacing(uint64_t period_ns) {
 	g_period_ns.store(period_ns, std::memory_order_relaxed);
@@ -99,6 +111,17 @@ std::string ToLower(std::string text) {
 	for (auto& c: text)
 		c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 	return text;
+}
+
+// desport: "display" with frame generation: flips (rendered frames) at display rate / frames shown per flip, so the
+// presented rate is the display's. The period of that flip rate, kept within kMinFps..kMaxFps.
+uint64_t DisplayPeriodNs(uint32_t hz, uint32_t fg_frames) {
+	const uint64_t period  = 1'000'000'000ull * std::max<uint32_t>(fg_frames, 1) / std::max<uint32_t>(hz, 1);
+	return std::clamp<uint64_t>(period, 1'000'000'000ull / kMaxFps, 1'000'000'000ull / kMinFps);
+}
+
+double PeriodFps(uint64_t period_ns) {
+	return period_ns == 0 ? 0.0 : 1e9 / static_cast<double>(period_ns);
 }
 
 } // namespace
@@ -154,10 +177,45 @@ void SetDisplayRate(uint32_t hz) {
 	if (!NeedsDisplayRate() || hz == 0) {
 		return;
 	}
-	const auto fps = std::clamp<uint32_t>(hz, kMinFps, kMaxFps);
-	StartPacing(1'000'000'000ull / fps);
-	EmitLine(fmt::format("DES_FPS_LIMIT display t={} display={}Hz limit={}fps\n",
-	                     ElapsedMilliseconds(), hz, fps));
+	// desport: with frame generation the flip limit is the display's rate / frames shown per flip (SetFrameGeneration).
+	const auto fg     = g_fg_frames.load(std::memory_order_relaxed);
+	const auto period = DisplayPeriodNs(hz, fg);
+	g_display_hz.store(hz, std::memory_order_relaxed);
+	StartPacing(period);
+	EmitLine(fmt::format("DES_FPS_LIMIT display t={} display={}Hz limit={:.1f}fps fg={} effective={:.1f}fps\n",
+	                     ElapsedMilliseconds(), hz, PeriodFps(period), fg, PeriodFps(period)));
+}
+
+void SetFrameGeneration(uint32_t presented_frames) {
+	const auto& s  = Get();
+	const auto  fg = std::clamp<uint32_t>(presented_frames, 1, 8);
+	if (!Requested() || g_fg_frames.exchange(fg, std::memory_order_relaxed) == fg) {
+		return;
+	}
+	// desport: effective = the flip (rendered frame) limit now; presented = what the display gets with DLSS-G.
+	switch (s.mode) {
+		case Mode::Display: {
+			const auto hz = g_display_hz.load(std::memory_order_relaxed);
+			if (hz == 0) {
+				return; // (SetDisplayRate applies it once the display's rate is known)
+			}
+			const auto period = DisplayPeriodNs(hz, fg);
+			g_period_ns.store(period, std::memory_order_relaxed);
+			EmitLine(fmt::format("DES_FPS_LIMIT fg t={} mode=display display={}Hz fg={} effective={:.1f}fps "
+			                     "presented={:.1f}fps\n",
+			                     ElapsedMilliseconds(), hz, fg, PeriodFps(period), PeriodFps(period) * fg));
+			return;
+		}
+		case Mode::Fixed:
+			EmitLine(fmt::format("DES_FPS_LIMIT fg t={} mode=fixed limit={}fps fg={} effective={}fps presented={}fps\n",
+			                     ElapsedMilliseconds(), s.fps, fg, s.fps, s.fps * fg));
+			return;
+		case Mode::Unlimited:
+			EmitLine(fmt::format("DES_FPS_LIMIT fg t={} mode=unlimited fg={} effective=unlimited\n", ElapsedMilliseconds(),
+			                     fg));
+			return;
+		default: return;
+	}
 }
 
 void LogBoot(uint32_t vblank_hz) {
@@ -181,7 +239,9 @@ void LogBoot(uint32_t vblank_hz) {
 	std::replace(convars.begin(), convars.end(), '\n', ' ');
 	if (!convars.empty() && convars.back() == ' ') convars.pop_back();
 	EmitLine(fmt::format(
-	    "DES_FPS_LIMIT mode={} limit={} vblank={}Hz movies=vblank game_convars=\"{}\"\n",
+	    // desport: fg=display_divided: with frame generation "display" limits flips to display rate / frames shown per
+	    // flip; <n> always limits flips (rendered frames)
+	    "DES_FPS_LIMIT mode={} limit={} vblank={}Hz movies=vblank fg=display_divided game_convars=\"{}\"\n",
 	    s.mode == Mode::Unlimited ? "unlimited"
 	    : s.mode == Mode::Fixed   ? "fixed"
 	                              : "display",

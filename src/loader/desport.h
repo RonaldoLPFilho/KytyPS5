@@ -77,7 +77,9 @@ float UltrawideMovieScale(uint32_t target_width, uint32_t target_height);
 //   unset    the engine as before: a flip only on a vblank tick (the ceiling is --vblank-frequency).
 //   0        no limit: a finished frame is flipped at once, between vblank ticks.
 //   <n>      at most n flips a second (20..1000), between vblank ticks.
-//   display  at most the display's refresh rate (queried from the window's display).
+//   display  at most the display's refresh rate (queried from the window's display); with frame generation, the
+//            display's rate / the frames DLSS-G shows per flip (the presented rate is then the display's).
+// desport: with frame generation every limit counts flips (rendered frames); <n> is not divided (SetFrameGeneration).
 // The vblank keeps its rate (--vblank-frequency); movies (.bk2 open), the game's own sceVideoOutSetFlipRate(1|2) and
 // KYTY_FLIP_RATE keep flipping on vblank ticks. With a limit, the game's time step is freed from its 1/59.94 s floor
 // through console variables (KYTY_FPS_GAME_CONVARS, see GameConvarLines). Logs "DES_FPS_LIMIT ..." at boot.
@@ -97,6 +99,10 @@ void OnFlip(bool between_vblanks);
 // "display": the window's display refresh rate (Hz), 0 while unknown. Pacing starts once a rate is set.
 bool NeedsDisplayRate();
 void SetDisplayRate(uint32_t hz);
+// desport: vblank thread, every tick: the frames DLSS-G shows per flip (FrameGen::PresentedFrames() while frame
+// generation is enabled, else 1). "display" re-derives its flip limit from it; each change logs
+// "DES_FPS_LIMIT fg t=<ms> mode=<display|fixed|unlimited> ... fg=<n> effective=<fps> ...". No-op without a limit.
+void SetFrameGeneration(uint32_t presented_frames);
 // The boot line: "DES_FPS_LIMIT mode=<off|unlimited|fixed|display> ...".
 void LogBoot(uint32_t vblank_hz);
 // Every 30 s while pacing: "DES_FPS_LIMIT stats t=<ms> between_vblanks=<n> on_vblank=<n> movie_hold=<0|1>".
