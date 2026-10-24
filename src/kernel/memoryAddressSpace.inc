@@ -1746,8 +1746,14 @@ private:
 		} else {
 			const char* framegen      = std::getenv("KYTY_FRAMEGEN");
 			const char* runtime_toggle = std::getenv("KYTY_FRAMEGEN_RUNTIME_TOGGLE");
-			if ((framegen != nullptr && std::atoi(framegen) > 0) || runtime_toggle != nullptr) {
+			// desport: DLSS Super Resolution (KYTY_DLSS=quality|balanced|...) needs the same room: NGX's DLSS uses
+			// VK_NVX_binary_import, whose CUDA-side initialization reserves host address space below 1 TiB at vkCreateDevice
+			// (with the whole range taken by the guest, vkCreateDevice failed: ErrorInitializationFailed).
+			const char* dlss     = std::getenv("KYTY_DLSS");
+			const bool  dlss_on  = dlss != nullptr && *dlss != '\0' && std::strcmp(dlss, "off") != 0 && std::strcmp(dlss, "0") != 0;
+			if ((framegen != nullptr && std::atoi(framegen) > 0) || runtime_toggle != nullptr || dlss_on) {
 				ceiling = 0xE000000000ull;
+				if (dlss_on) std::printf("DLSS: guest address space stops at 0x%llx (room for NGX below 1 TiB)\n", static_cast<unsigned long long>(ceiling)); // desport
 			}
 		}
 		if (ceiling != 0) {
