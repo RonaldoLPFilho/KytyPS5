@@ -73,6 +73,11 @@ struct FrameInputs {
 	uint64_t      guest_frame = 0;
 	bool          motion_attachment = false; // the motion copy is a color attachment too
 	bool          valid       = false;
+	// desport: DLSS SR + DLSS-G (phase B): the guest frame's Streamline frame index (0: none; the present thread
+	// takes a new one) and whether the DLSS SR already set this frame's constants on viewport 0 (one
+	// slSetConstants per frame). Set by PrepareInputs whatever `valid` says.
+	uint32_t      token_index   = 0;     // desport
+	bool          constants_set = false; // desport
 };
 
 // Process start, before the window: loads Streamline when KYTY_FRAMEGEN is set (it then becomes
@@ -96,8 +101,11 @@ void BypassCommandHooks(vk::Device device);
 // Present thread, around vkQueuePresentKHR of the image showing `inputs` (null: a frame
 // without inputs, e.g. a menu). `backbuffer` is the swapchain extent, `region` the part the
 // game image covers.
+// desport: `token_index` / `constants_set`: the presented frame's FrameInputs fields (0 / false for a blank or a
+// reused frame): with DLSS SR and DLSS-G together the present uses the frame index the SR evaluated with.
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D color_extent, vk::Extent2D backbuffer,
-                   vk::Rect2D region, vk::Format format, uint32_t image_count, bool reusing_last);
+                   vk::Rect2D region, vk::Format format, uint32_t image_count, bool reusing_last,
+                   uint32_t token_index = 0, bool constants_set = false); // desport: phase B
 void AfterPresent();
 // Present thread: the frames DLSS-G showed per presented frame (1 without generation), as last
 // queried (about once a second), for the KYTY_FPS_HUD panel.
@@ -125,7 +133,12 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 // KYTY_DLSS_COLOR_SLOT / KYTY_DLSS_OUTPUT_SLOT / KYTY_DLSS_DEPTH_SLOT / KYTY_DLSS_MOTION_SLOT override the TAA
 // dispatch's image slots (default: depth 1, motion 3, color and output chosen from the shader's metadata);
 // KYTY_DLSS_JITTER_SIGN=<x><y> ('+' or '-', default "+-"); KYTY_DLSS_AUTOEXPOSURE=0|1 (default 1); KYTY_DLSS_HDR=0|1
-// (default: from the color format). With KYTY_FRAMEGEN (or its runtime toggle) the SR stays off (phase B).
+// (default: from the color format).
+// desport: phase B, KYTY_DLSS with KYTY_FRAMEGEN (or its runtime toggle): one Streamline frame index per guest frame,
+// taken by the SR on the renderer thread and carried in FrameInputs to the present thread; the SR evaluates on
+// viewport 0 (DLSS-G's) and sets the frame's constants there once; the present tags the copied depth/motion and
+// adds the Reflex/PCL markers and the generated frames as with DLSS-G alone; Reflex is always on. Without DLSS-G
+// (KYTY_DLSS alone, or DLSS-G unsupported) the SR keeps viewport 1 and its own frame indices (phase A).
 // desport: one image the TAA dispatch binds, as the renderer resolved it (renderCompute.cpp).
 struct SrSlot {
 	vk::Image           image  = nullptr;
@@ -149,6 +162,8 @@ struct SrSlot {
                               std::span<const SrSlot> slots);
 // desport: at the guest flip when the DLSS-G capture does not run (PrepareInputs): ends the frame's camera.
 void EndSrFrame();
+// desport: phase B: DLSS SR and DLSS-G both ready (the SR shares DLSS-G's viewport and frame indices).
+[[nodiscard]] bool SrWithFrameGeneration();
 
 } // namespace FrameGen
 } // namespace Libs::Graphics

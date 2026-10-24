@@ -20,10 +20,10 @@
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
-#   .un-windows.ps1 -Dlss performance     desport: DLSS Super Resolution in place of the game's TAA (off, quality,
+#   .\run-windows.ps1 -Dlss performance     desport: DLSS Super Resolution in place of the game's TAA (off, quality,
 #                                            balanced, performance, ultra_performance; dlaa not yet); the render
-#                                            height follows the mode unless -RenderHeight; not with -FrameGen
-#   .un-windows.ps1 -DlssPreset M         desport: DLSS preset (default: DLSS 4.5's M, L for ultra_performance;
+#                                            height follows the mode unless -RenderHeight; with -FrameGen too
+#   .\run-windows.ps1 -DlssPreset M         desport: DLSS preset (default: DLSS 4.5's M, L for ultra_performance;
 #                                            sdk: the SDK's own; J, K, L, M)
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known

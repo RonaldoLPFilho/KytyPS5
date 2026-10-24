@@ -1090,7 +1090,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
-	frame->fg.valid = false;
+	frame->fg.valid         = false;
+	frame->fg.token_index   = 0;     // desport: phase B (PrepareInputs sets it with DLSS SR + DLSS-G)
+	frame->fg.constants_set = false; // desport
 	if (FrameGen::CaptureRequested()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg);
@@ -1110,6 +1112,8 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	std::optional<RenderLockGuard> render_lock;
 	if (producer != nullptr) render_lock.emplace(m_impl->renderer.GetMutex());
 	frame->fg.valid = false;
+	frame->fg.token_index   = 0;     // desport: phase B, a blank frame takes a new Streamline frame index at present
+	frame->fg.constants_set = false; // desport
 	frame->hdr      = false;
 	frame->blank    = true;
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
@@ -1294,7 +1298,10 @@ void Presenter::Impl::PresentNow(Frame& frame, bool reuse) {
 			FrameGen::BeforePresent(frame.fg.valid && !frame.reusing_last ? &frame.fg : nullptr,
 			                        {frame.image.extent.width, frame.image.extent.height}, swapchain.Extent(),
 			                        swapchain.PresentRegion(), swapchain.Format(), swapchain.ImageCount(),
-			                        frame.reusing_last);
+			                        frame.reusing_last,
+			                        // desport: phase B, the frame index the DLSS SR used (a reused frame takes a new one)
+			                        frame.reusing_last ? 0u : frame.fg.token_index,
+			                        !frame.reusing_last && frame.fg.constants_set);
 		}
 		status = swapchain.Present();
 		if (streamline_present) {
