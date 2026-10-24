@@ -503,7 +503,8 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	if (const int floor = capped ? FlipRateFloor() : 0; floor > cfg.flip_rate) {
+	// desport: movie pacing: while a Bink movie plays, at least Desport::MovieFlipFloor() vblanks between flips
+	if (const int floor = std::max(capped ? FlipRateFloor() : 0, Desport::MovieFlipFloor()); floor > cfg.flip_rate) {
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;

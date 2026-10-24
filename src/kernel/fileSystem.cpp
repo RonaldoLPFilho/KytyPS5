@@ -561,6 +561,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->opened = true;
+	if (!file->directory) Desport::MovieFileOpened(path); // desport: movie pacing (open .bk2 = movie playing)
 	return descriptor;
 }
 
@@ -585,6 +586,7 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	EXIT_IF(!file->opened);
 
 	if (!file->directory && file->special == SpecialFile::None) {
+		Desport::MovieFileClosed(file->name.c_str()); // desport: movie pacing
 		file->f.Close();
 	}
 
