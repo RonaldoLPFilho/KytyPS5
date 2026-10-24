@@ -69,7 +69,7 @@ uint32_t         g_sr_mode     = 0;        // desport
 const char*      g_sr_mode_name = "off";   // desport
 bool             g_sr_ready    = false;    // desport: the feature is loaded and supported (OnDevice)
 std::atomic_bool g_sr_failed {false};      // desport: given up (the game's TAA runs from then on)
-bool             g_sr_upscale  = false;    // desport: KYTY_DLSS_UPSCALE=1 (SrUpscale)
+uint32_t         g_sr_upscale  = 0;        // desport: KYTY_DLSS_UPSCALE=1|2 (SrUpscaleMode), 0: off
 uint64_t         g_sr_frame    = 0;        // desport: Kyty.Gpu, guest frames (EndSrFrame / PrepareInputs)
 // desport: phase B (KYTY_DLSS with DLSS-G): Streamline frame indices come from one counter for every thread (the SR on
 // Kyty.Gpu, the present thread), so a guest frame's SR evaluate, constants, tags, markers and present share one index.
@@ -89,7 +89,7 @@ void LogDesDlss(const char* streamline) {
 	const bool combined = g_ready && g_sr_ready && g_sr_mode != 0;
 	// desport: upscale=<0|1> (KYTY_DLSS_UPSCALE); the sizes follow in "DES_DLSS upscale=1 render=WxH output=WxH" when
 	// the composite first samples the DLSS output.
-	const int upscale = g_sr_upscale && g_sr_mode != 0 ? 1 : 0; // desport
+	const int upscale = g_sr_mode != 0 ? static_cast<int>(g_sr_upscale) : 0; // desport
 	std::printf("DES_DLSS sr=%s fg=%d reflex=%s sr_ready=%d fg_ready=%d combined=%d sr_viewport=%d f2=%d upscale=%d "
 	            "streamline=%s\n",
 	            g_sr_mode != 0 ? g_sr_mode_name : "off", g_generate, g_ready ? g_reflex_name : "off",
@@ -940,10 +940,11 @@ void Initialize() {
 		}
 		// desport: phase B: with frame generation too, both share one frame index per guest frame (SrWithFrameGeneration).
 	}
-	// desport: KYTY_DLSS_UPSCALE=1: real upscaling (SrUpscale).
-	if (const char* upscale = std::getenv("KYTY_DLSS_UPSCALE"); upscale != nullptr && std::strcmp(upscale, "1") == 0) {
-		g_sr_upscale = g_sr_mode != 0;
-		if (!g_sr_upscale) std::printf("DLSS: KYTY_DLSS_UPSCALE=1 needs KYTY_DLSS=<mode>; off\n");
+	// desport: KYTY_DLSS_UPSCALE=1|2: real upscaling (SrUpscaleMode; 2: the scene composite at the output size).
+	if (const char* upscale = std::getenv("KYTY_DLSS_UPSCALE");
+	    upscale != nullptr && (std::strcmp(upscale, "1") == 0 || std::strcmp(upscale, "2") == 0)) {
+		g_sr_upscale = g_sr_mode != 0 ? static_cast<uint32_t>(upscale[0] - '0') : 0u;
+		if (g_sr_upscale == 0) std::printf("DLSS: KYTY_DLSS_UPSCALE=%s needs KYTY_DLSS=<mode>; off\n", upscale);
 	}
 	// desport: end KYTY_DLSS
 	if (g_learning_enabled && (requested_frames > 0 || g_fg_runtime_toggle || g_sr_mode != 0)) { // desport: SR too
@@ -1757,7 +1758,7 @@ bool SrWithFrameGeneration() { // desport: phase B
 }
 
 bool SrUpscale() { // desport: KYTY_DLSS_UPSCALE
-	return g_sr_upscale && SrActive();
+	return g_sr_upscale != 0 && SrActive();
 }
 
 void EndSrFrame() {
@@ -1917,21 +1918,31 @@ SrLast    g_sr_last;
 SrOptions g_sr_options;
 SrStats   g_sr_stats;
 
-// desport: KYTY_DLSS_UPSCALE (Kyty.Gpu): the TAA output of the frame's TAA dispatch, the output size learned from the
-// draw that scales it up, and the image of that size DLSS writes (kept in General). A replaced image is left
-// allocated (it may still be in flight): at most UpscaleMaxImages sizes per run.
+// desport: KYTY_DLSS_UPSCALE (Kyty.Gpu). An image the engine owns, replaced when its size or format changes; a replaced
+// image is left allocated (it may still be in flight): at most UpscaleMaxImages per kind and run.
 constexpr uint32_t UpscaleMaxImages = 4;
+struct OwnedImage {
+	std::vector<std::unique_ptr<VulkanImage>> images;
+	VulkanImage*  current = nullptr;
+	vk::ImageView view    = nullptr;
+};
+// desport: the frame's TAA output (and the DLSS image of the output size written from its inputs); with
+// KYTY_DLSS_UPSCALE=2 also the scene composite's render-size target (the draw that samples the TAA output into a
+// target of the TAA output's size, 01.007.000 ps 0x95318d27a44b0dd5), its copy at the output size (the same draw
+// recorded again, reading the DLSS image), and the final pass that scales the composite to the output (#257, ps
+// 0x37db6bd367380e9c: scene and UI into the output buffer), whose largest texture (the UI layer) is the output size.
 struct SrUpscaleState {
 	uint64_t     taa_address = 0;
 	vk::Extent2D taa_extent {}, render {}, output {};
 	uint64_t     frame = UINT64_MAX; // g_sr_frame of the last TAA dispatch
-	bool         ready = false;      // DLSS wrote `current` from that dispatch's inputs
-	std::vector<std::unique_ptr<VulkanImage>> images;
-	VulkanImage* current = nullptr;
-	vk::ImageView view   = nullptr;
-	uint64_t     composite_ps = 0;
-	uint32_t     substituted = 0, logged_readers = 0;
-	uint64_t     last_reader = 0;
+	bool         ready = false;      // DLSS wrote `dlss` from that dispatch's inputs
+	OwnedImage   dlss, composite;
+	uint64_t     composite_address = 0, composite_ps = 0, final_address = 0, final_ps = 0;
+	vk::Extent2D composite_extent {};
+	uint64_t     composite_frame = UINT64_MAX;       // the frame the composite target was seen in
+	uint64_t     composite_ready_frame = UINT64_MAX; // the frame the output-size composite was recorded in
+	uint32_t     substituted = 0, replays = 0, logged_readers = 0, logged_writers = 0;
+	uint64_t     last_reader = 0, last_writer = 0;
 	bool         announced = false;
 };
 SrUpscaleState g_up;
@@ -1950,56 +1961,67 @@ void UpscaleNoteOnce(uint32_t bit, const char* format, ...) {
 	std::fflush(stdout);
 }
 
+// desport: `owned` holds an image of `format` and `extent` with `usage` (and a view of it); false when it cannot.
+bool EnsureOwned(GraphicContext& graphics, OwnedImage& owned, vk::Format format, vk::Extent2D extent,
+                 vk::ImageUsageFlags usage, vk::FormatFeatureFlags needed, const char* what, uint32_t note) {
+	auto* image = owned.current;
+	if (image != nullptr && image->format == format && image->extent.width == extent.width &&
+	    image->extent.height == extent.height) {
+		return true;
+	}
+	if (owned.images.size() >= UpscaleMaxImages) {
+		UpscaleNoteOnce(note, "the %s image changed size more than %u times; no more images", what, UpscaleMaxImages);
+		return false;
+	}
+	if ((graphics.physical_device.getFormatProperties(format).optimalTilingFeatures & needed) != needed) {
+		UpscaleNoteOnce(note << 1u, "format %u cannot be the %s image", static_cast<uint32_t>(format), what);
+		return false;
+	}
+	auto                fresh = std::make_unique<VulkanImage>();
+	vk::ImageCreateInfo create {};
+	create.imageType     = vk::ImageType::e2D;
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+	create.mipLevels     = 1;
+	create.arrayLayers   = 1;
+	create.format        = format;
+	create.tiling        = vk::ImageTiling::eOptimal;
+	create.initialLayout = vk::ImageLayout::eUndefined;
+	create.usage         = usage;
+	create.sharingMode   = vk::SharingMode::eExclusive;
+	create.samples       = vk::SampleCountFlagBits::e1;
+	if (!graphics.CreateImage(create, *fresh)) {
+		UpscaleNoteOnce(note << 2u, "cannot allocate the %ux%u %s image", extent.width, extent.height, what);
+		return false;
+	}
+	vk::ImageViewCreateInfo view_info {};
+	view_info.image            = fresh->image;
+	view_info.viewType         = vk::ImageViewType::e2D;
+	view_info.format           = format;
+	view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::ImageView view         = nullptr;
+	if (graphics.device.createImageView(&view_info, nullptr, &view) != vk::Result::eSuccess || view == nullptr) {
+		graphics.DeleteImage(*fresh);
+		UpscaleNoteOnce(note << 2u, "cannot create the %ux%u %s image's view", extent.width, extent.height, what);
+		return false;
+	}
+	owned.current = fresh.get();
+	owned.view    = view;
+	owned.images.push_back(std::move(fresh));
+	return true;
+}
+
 // desport: the output-size image DLSS writes, of `format` (the TAA output's) and `extent`, in General.
 bool PrepareUpscaled(GraphicContext& graphics, vk::CommandBuffer command, vk::Format format, vk::Extent2D extent) {
-	auto* image = g_up.current;
-	if (image == nullptr || image->format != format || image->extent.width != extent.width ||
-	    image->extent.height != extent.height) {
-		if (g_up.images.size() >= UpscaleMaxImages) {
-			UpscaleNoteOnce(1u << 0, "the output size changed more than %u times; no more images", UpscaleMaxImages);
-			return false;
-		}
-		const bool storage = static_cast<bool>(graphics.physical_device.getFormatProperties(format).optimalTilingFeatures &
-		                                       vk::FormatFeatureFlagBits::eStorageImage);
-		if (!storage) {
-			UpscaleNoteOnce(1u << 1, "format %u cannot be a storage image", static_cast<uint32_t>(format));
-			return false;
-		}
-		auto              owned = std::make_unique<VulkanImage>();
-		vk::ImageCreateInfo create {};
-		create.imageType     = vk::ImageType::e2D;
-		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
-		create.mipLevels     = 1;
-		create.arrayLayers   = 1;
-		create.format        = format;
-		create.tiling        = vk::ImageTiling::eOptimal;
-		create.initialLayout = vk::ImageLayout::eUndefined;
-		create.usage         = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
-		               vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
-		create.sharingMode   = vk::SharingMode::eExclusive;
-		create.samples       = vk::SampleCountFlagBits::e1;
-		if (!graphics.CreateImage(create, *owned)) {
-			UpscaleNoteOnce(1u << 2, "cannot allocate a %ux%u output image", extent.width, extent.height);
-			return false;
-		}
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = owned->image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = format;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		vk::ImageView view         = nullptr;
-		if (graphics.device.createImageView(&view_info, nullptr, &view) != vk::Result::eSuccess || view == nullptr) {
-			graphics.DeleteImage(*owned);
-			UpscaleNoteOnce(1u << 3, "cannot create the %ux%u output image's view", extent.width, extent.height);
-			return false;
-		}
-		g_up.current = owned.get();
-		g_up.view    = view;
-		g_up.images.push_back(std::move(owned));
-		image = g_up.current;
+	if (!EnsureOwned(graphics, g_up.dlss, format, extent,
+	                 vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled |
+	                     vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+	                 vk::FormatFeatureFlagBits::eStorageImage | vk::FormatFeatureFlagBits::eSampledImage, "DLSS output",
+	                 1u << 0)) {
+		return false;
 	}
-	if (image->state.layout != vk::ImageLayout::eGeneral) {
-		Transition(command, *image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
+	auto& image = *g_up.dlss.current;
+	if (image.state.layout != vk::ImageLayout::eGeneral) {
+		Transition(command, image, vk::ImageAspectFlagBits::eColor, vk::ImageLayout::eGeneral,
 		           vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
 		           vk::PipelineStageFlagBits2::eComputeShader);
 	}
@@ -2007,9 +2029,9 @@ bool PrepareUpscaled(GraphicContext& graphics, vk::CommandBuffer command, vk::Fo
 }
 
 sl::Resource UpscaledResource() {
-	const auto&  image = *g_up.current;
+	const auto&  image = *g_up.dlss.current;
 	sl::Resource resource(sl::ResourceType::eTex2d, static_cast<VkImage>(image.image), nullptr,
-	                      static_cast<VkImageView>(g_up.view), static_cast<uint32_t>(VK_IMAGE_LAYOUT_GENERAL));
+	                      static_cast<VkImageView>(g_up.dlss.view), static_cast<uint32_t>(VK_IMAGE_LAYOUT_GENERAL));
 	resource.width        = image.extent.width;
 	resource.height       = image.extent.height;
 	resource.nativeFormat = static_cast<uint32_t>(static_cast<VkFormat>(image.format));
@@ -2018,6 +2040,46 @@ sl::Resource UpscaledResource() {
 	resource.flags        = 0;
 	resource.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(image.usage));
 	return resource;
+}
+
+// desport: `a` at least `b` in both directions and larger in one.
+bool LargerExtent(vk::Extent2D a, vk::Extent2D b) {
+	return a.width >= b.width && a.height >= b.height && (a.width > b.width || a.height > b.height);
+}
+
+uint64_t UpscalePsFilter() {
+	static const uint64_t filter = [] {
+		const char* text = std::getenv("KYTY_DLSS_UPSCALE_PS");
+		return text != nullptr && *text != '\0' ? std::strtoull(text, nullptr, 16) : 0ull;
+	}();
+	return filter;
+}
+
+// desport: up to 24 different lines about the draws that read the TAA output or the composite (and write the final
+// target), to check the chain against a capture.
+void UpscaleReader(const char* what, uint64_t address, vk::Extent2D extent, uint64_t ps_hash, vk::Extent2D target,
+                   const char* verdict) {
+	const uint64_t reader = ps_hash ^ (uint64_t {target.width} << 32u) ^ (uint64_t {target.height} << 48u) ^
+	                        reinterpret_cast<uintptr_t>(verdict) ^ reinterpret_cast<uintptr_t>(what);
+	if (reader == g_up.last_reader || g_up.logged_readers >= 24) return;
+	g_up.last_reader = reader;
+	++g_up.logged_readers;
+	LOGF("DLSS upscale: %s 0x%" PRIx64 " %ux%u read by ps 0x%016" PRIx64 " into %ux%u: %s\n", what, address,
+	     extent.width, extent.height, ps_hash, target.width, target.height, verdict);
+	std::printf("DLSS upscale: %s 0x%" PRIx64 " %ux%u read by ps 0x%016" PRIx64 " into %ux%u: %s\n", what, address,
+	            extent.width, extent.height, ps_hash, target.width, target.height, verdict);
+	std::fflush(stdout);
+}
+
+void UpscaleAnnounce(const char* how, uint64_t ps_hash) {
+	if (g_up.announced) return;
+	g_up.announced = true;
+	LOGF("DES_DLSS upscale=%u render=%ux%u output=%ux%u %s=0x%016" PRIx64 " mode=%s\n", g_sr_upscale,
+	     g_up.render.width, g_up.render.height, g_up.output.width, g_up.output.height, how, ps_hash, g_sr_mode_name);
+	std::printf("DES_DLSS upscale=%u render=%ux%u output=%ux%u %s=0x%016" PRIx64 " mode=%s\n", g_sr_upscale,
+	            g_up.render.width, g_up.render.height, g_up.output.width, g_up.output.height, how, ps_hash,
+	            g_sr_mode_name);
+	std::fflush(stdout);
 }
 
 } // namespace
@@ -2158,7 +2220,7 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 		return false;
 	}
 	// desport: KYTY_DLSS_UPSCALE: the game's TAA ran already (its render-size output feeds the bloom chain); DLSS writes
-	// an image of the output size learned from the draw that scales the TAA output up (SrUpscaledView), which that
+	// an image of the output size learned from the draw that scales the TAA output up (SrPlanDraw), which that
 	// draw samples instead. Until that size is known (the first frame), the game's own upscale stays.
 	bool upscaled = false;
 	if (upscale) {
@@ -2415,70 +2477,219 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 #endif
 }
 
-// desport: KYTY_DLSS_UPSCALE, see frame-gen.h. A draw that samples this frame's TAA output into a larger color target
-// is the one that scales it up to the output size: its target's size is DLSS's output size (the largest seen), and
-// once DLSS wrote an image of that size this frame, the draw samples that instead. Up to 16 different readers of the
-// TAA output are logged with what was done, to check against a capture.
-vk::ImageView SrUpscaledView(uint64_t ps_hash, uint64_t address, vk::Extent2D extent, vk::Extent2D target) {
+// desport: KYTY_DLSS_UPSCALE, see frame-gen.h.
+// Mode 1: a draw that samples this frame's TAA output into a larger color target samples the DLSS image instead; its
+// target's size is DLSS's output size (the largest seen). (In 01.007.000 no draw does: the composite runs at the render
+// size, so mode 1 only renders lower and stretches.)
+// Mode 2: the draw that samples the TAA output into a target of the TAA output's size is the scene composite: it is
+// recorded again into an image of the output size, reading the DLSS image, and the draw that samples the composite
+// target into a larger color target (the final pass) samples that image instead. The output size is the largest
+// texture the final pass samples (the UI layer), at most its target. Until it is known, the game's own upscale stays.
+SrDrawPlan SrPlanDraw(GraphicContext& graphics, uint64_t ps_hash, uint64_t target_address, vk::Extent2D target,
+                      vk::Format target_format, bool replayable, std::span<const SrDrawTexture> textures) {
+	SrDrawPlan plan;
 #ifdef KYTY_FRAMEGEN_STREAMLINE
-	if (!g_sr_upscale || address == 0 || address != g_up.taa_address || g_up.frame != g_sr_frame ||
-	    extent != g_up.taa_extent) {
-		return nullptr;
-	}
-	static const uint64_t ps_filter = [] {
-		const char* text = std::getenv("KYTY_DLSS_UPSCALE_PS");
-		return text != nullptr && *text != '\0' ? std::strtoull(text, nullptr, 16) : 0ull;
-	}();
-	const bool    larger  = target.width >= extent.width && target.height >= extent.height &&
-	                    (target.width > extent.width || target.height > extent.height);
-	const char*   verdict = "substituted";
-	vk::ImageView view    = nullptr;
-	if (!larger) {
-		verdict = "kept (target not larger than the TAA output)";
-	} else if (ps_filter != 0 && ps_hash != ps_filter) {
-		verdict = "kept (not KYTY_DLSS_UPSCALE_PS)";
-	} else if (g_up.output != target) {
-		if (g_up.output.width == 0 ||
-		    uint64_t {target.width} * target.height > uint64_t {g_up.output.width} * g_up.output.height) {
-			g_up.output = target;
-			verdict     = "kept, output size learned (DLSS writes it from the next frame)";
-		} else {
-			verdict = "kept (smaller than the learned output size)";
+	// The 01.007.000 composite and final pass, also before the chain is known (a menu without the TAA must not store
+	// them as table draws for later).
+	constexpr uint64_t CompositePs = 0x95318d27a44b0dd5ull, FinalPs = 0x37db6bd367380e9cull;
+	plan.involved = g_sr_upscale != 0 && (ps_hash == CompositePs || ps_hash == FinalPs);
+	if (g_sr_upscale == 0 || g_up.frame != g_sr_frame) return plan;
+	const uint64_t filter = UpscalePsFilter();
+	int            taa = -1, composite = -1;
+	for (size_t i = 0; i < textures.size(); ++i) {
+		const auto& texture = textures[i];
+		if (texture.address == 0) continue;
+		if (texture.address == g_up.taa_address && texture.extent == g_up.taa_extent) taa = static_cast<int>(i);
+		if (g_sr_upscale == 2 && texture.address == g_up.composite_address && texture.extent == g_up.composite_extent &&
+		    g_up.composite_frame == g_sr_frame) {
+			composite = static_cast<int>(i);
 		}
-	} else if (g_up.ready && g_up.current != nullptr) {
-		view              = g_up.view;
-		g_up.composite_ps = ps_hash;
-		++g_up.substituted;
-		if (!g_up.announced) {
-			g_up.announced = true;
-			LOGF("DES_DLSS upscale=1 render=%ux%u output=%ux%u composite_ps=0x%016" PRIx64 " mode=%s\n",
-			     g_up.render.width, g_up.render.height, target.width, target.height, ps_hash, g_sr_mode_name);
-			std::printf("DES_DLSS upscale=1 render=%ux%u output=%ux%u composite_ps=0x%016" PRIx64 " mode=%s\n",
-			            g_up.render.width, g_up.render.height, target.width, target.height, ps_hash, g_sr_mode_name);
+	}
+	if (taa >= 0 || composite >= 0) plan.involved = true;
+	// The final target's writers (mode 2), once it is known.
+	if (g_sr_upscale == 2 && target_address != 0 && target_address == g_up.final_address && g_up.logged_writers < 8) {
+		const uint64_t writer = ps_hash ^ (uint64_t {target.width} << 32u) ^ (uint64_t {target.height} << 48u);
+		if (writer != g_up.last_writer) {
+			g_up.last_writer = writer;
+			++g_up.logged_writers;
+			LOGF("DLSS upscale: final target 0x%" PRIx64 " %ux%u written by ps 0x%016" PRIx64 " (%zu textures)\n",
+			     target_address, target.width, target.height, ps_hash, textures.size());
+			std::printf("DLSS upscale: final target 0x%" PRIx64 " %ux%u written by ps 0x%016" PRIx64 " (%zu textures)\n",
+			            target_address, target.width, target.height, ps_hash, textures.size());
 			std::fflush(stdout);
 		}
-	} else {
-		verdict = "kept (DLSS did not run for this TAA output)";
 	}
-	const uint64_t reader = ps_hash ^ (uint64_t {target.width} << 32u) ^ (uint64_t {target.height} << 48u) ^
-	                        reinterpret_cast<uintptr_t>(verdict);
-	if (reader != g_up.last_reader && g_up.logged_readers < 16) {
-		g_up.last_reader = reader;
-		++g_up.logged_readers;
-		LOGF("DLSS upscale: TAA output 0x%" PRIx64 " %ux%u read by ps 0x%016" PRIx64 " into %ux%u: %s\n", address,
-		     extent.width, extent.height, ps_hash, target.width, target.height, verdict);
-		std::printf("DLSS upscale: TAA output 0x%" PRIx64 " %ux%u read by ps 0x%016" PRIx64 " into %ux%u: %s\n",
-		            address, extent.width, extent.height, ps_hash, target.width, target.height, verdict);
+	if (taa >= 0 && g_sr_upscale == 1) {
+		const char* verdict = "substituted";
+		if (!LargerExtent(target, g_up.taa_extent)) {
+			verdict = "kept (target not larger than the TAA output)";
+		} else if (filter != 0 && ps_hash != filter) {
+			verdict = "kept (not KYTY_DLSS_UPSCALE_PS)";
+		} else if (g_up.output != target) {
+			if (g_up.output.width == 0 ||
+			    uint64_t {target.width} * target.height > uint64_t {g_up.output.width} * g_up.output.height) {
+				g_up.output = target;
+				verdict     = "kept, output size learned (DLSS writes it from the next frame)";
+			} else {
+				verdict = "kept (smaller than the learned output size)";
+			}
+		} else if (g_up.ready && g_up.dlss.current != nullptr) {
+			plan.swap_slot    = taa;
+			plan.swap_view    = g_up.dlss.view;
+			g_up.composite_ps = ps_hash;
+			++g_up.substituted;
+			UpscaleAnnounce("composite_ps", ps_hash);
+		} else {
+			verdict = "kept (DLSS did not run for this TAA output)";
+		}
+		UpscaleReader("TAA output", g_up.taa_address, g_up.taa_extent, ps_hash, target, verdict);
+		return plan;
+	}
+	if (taa >= 0 && g_sr_upscale == 2) {
+		const char* verdict = "kept (target not the TAA output's size)";
+		if (target == g_up.taa_extent && target_address != 0 && (filter == 0 || ps_hash == filter)) {
+			// The scene composite at the render size.
+			g_up.composite_address = target_address;
+			g_up.composite_extent  = target;
+			g_up.composite_frame   = g_sr_frame;
+			g_up.composite_ps      = ps_hash;
+			if (!replayable) {
+				verdict = "composite seen, not replayable (needs one color target, no depth, a plain draw)";
+			} else if (g_up.output.width == 0) {
+				verdict = "composite seen, waiting for the final pass to learn the output size";
+			} else if (!g_up.ready || g_up.dlss.current == nullptr) {
+				verdict = "composite seen, DLSS did not run for this TAA output";
+			} else if (!LargerExtent(g_up.output, target)) {
+				verdict = "composite seen, output not larger than the render size";
+			} else if (!EnsureOwned(graphics, g_up.composite, target_format, g_up.output,
+			                        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+			                            vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+			                        vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eSampledImage,
+			                        "composite", 1u << 8)) {
+				verdict = "composite seen, no output-size image";
+			} else {
+				plan.replay         = true;
+				plan.replay_slot    = taa;
+				plan.replay_texture = g_up.dlss.view;
+				plan.replay_view    = g_up.composite.view;
+				plan.replay_extent  = g_up.output;
+				verdict             = "composite, recorded again at the output size from the DLSS image";
+			}
+		} else if (target == g_up.taa_extent) {
+			verdict = "kept (not KYTY_DLSS_UPSCALE_PS)";
+		}
+		UpscaleReader("TAA output", g_up.taa_address, g_up.taa_extent, ps_hash, target, verdict);
+	}
+	if (composite >= 0) {
+		const char* verdict = "kept (target not larger than the composite)";
+		if (LargerExtent(target, g_up.composite_extent)) {
+			// The final pass: the output size is its largest texture (the UI layer), at most its target.
+			vk::Extent2D output = g_up.composite_extent;
+			for (const auto& texture: textures) {
+				if (uint64_t {texture.extent.width} * texture.extent.height > uint64_t {output.width} * output.height)
+					output = texture.extent;
+			}
+			output.width  = std::min(output.width, target.width);
+			output.height = std::min(output.height, target.height);
+			g_up.final_address = target_address;
+			g_up.final_ps      = ps_hash;
+			if (!LargerExtent(output, g_up.composite_extent)) {
+				verdict = "kept (no texture larger than the composite: output = render size)";
+			} else if (g_up.output != output) {
+				g_up.output = output;
+				verdict     = "kept, output size learned (DLSS and the composite copy from the next frame)";
+			} else if (g_up.composite_ready_frame == g_sr_frame && g_up.composite.current != nullptr &&
+			           g_up.composite.current->extent.width == output.width &&
+			           g_up.composite.current->extent.height == output.height) {
+				plan.swap_slot = composite;
+				plan.swap_view = g_up.composite.view;
+				++g_up.substituted;
+				verdict = "substituted by the output-size composite";
+				UpscaleAnnounce("final_ps", ps_hash);
+			} else {
+				verdict = "kept (no output-size composite this frame)";
+			}
+		}
+		UpscaleReader("composite", g_up.composite_address, g_up.composite_extent, ps_hash, target, verdict);
+	}
+#else
+	(void)graphics; // desport
+	(void)ps_hash;
+	(void)target_address;
+	(void)target;
+	(void)target_format;
+	(void)replayable;
+	(void)textures;
+#endif
+	return plan;
+}
+
+// desport: KYTY_DLSS_UPSCALE=2, around the composite's second recording (outside any rendering): the output-size image
+// to General, its previous readers (last frame's final pass) done before it is written; then its writes visible to
+// the final pass.
+void SrCompositeBegin(vk::CommandBuffer command) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto* image = g_up.composite.current;
+	if (image == nullptr) return;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
+	barrier.oldLayout           = image->state.layout == vk::ImageLayout::eGeneral ? vk::ImageLayout::eGeneral
+	                                                                                : vk::ImageLayout::eUndefined;
+	barrier.newLayout           = vk::ImageLayout::eGeneral;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image->image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	image->state = {vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+	                vk::ImageLayout::eGeneral};
+#else
+	(void)command; // desport
+#endif
+}
+
+void SrCompositeEnd(vk::CommandBuffer command) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	auto* image = g_up.composite.current;
+	if (image == nullptr) return;
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eColorAttachmentWrite;
+	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eShaderRead;
+	barrier.oldLayout           = vk::ImageLayout::eGeneral;
+	barrier.newLayout           = vk::ImageLayout::eGeneral;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image               = image->image;
+	barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	image->state               = {vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead,
+	                              vk::ImageLayout::eGeneral};
+	g_up.composite_ready_frame = g_sr_frame;
+	if (++g_up.replays % 1800u == 1u) {
+		LOGF("DLSS upscale: %u composites at %ux%u (final pass samples %u)\n", g_up.replays, image->extent.width,
+		     image->extent.height, g_up.substituted);
+		std::printf("DLSS upscale: %u composites at %ux%u (final pass samples %u)\n", g_up.replays, image->extent.width,
+		            image->extent.height, g_up.substituted);
 		std::fflush(stdout);
 	}
-	return view;
 #else
-	(void)ps_hash; // desport
-	(void)address;
-	(void)extent;
-	(void)target;
-	return nullptr;
+	(void)command; // desport
 #endif
+}
+
+uint32_t SrUpscaleMode() { // desport
+	return SrActive() ? g_sr_upscale : 0u;
 }
 // desport: end DLSS SR/DLAA
 

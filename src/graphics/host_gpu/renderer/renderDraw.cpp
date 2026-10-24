@@ -1662,25 +1662,32 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel) {
 		descriptor_stages[1] = &*bindings.pixel;
 	}
-	// desport: begin KYTY_DLSS_UPSCALE: the draw that samples this frame's TAA output into a larger color target (the
-	// scene composite that scales it up to the output size) samples DLSS's output-size image instead, so it runs 1:1.
-	// FrameGen::SrUpscaledView decides (and learns the output size from this draw); CommitBindings swaps the view.
+	// desport: begin KYTY_DLSS_UPSCALE (FrameGen::SrPlanDraw): mode 1, the draw that samples this frame's TAA output into a
+	// larger color target samples DLSS's output-size image instead; mode 2, the scene composite (the TAA output into a
+	// target of its size) is recorded again at the output size after this draw (below), and the final pass samples that
+	// copy instead of the composite's target. CommitBindings swaps the view.
 	m_desport_image_swap = {};
+	FrameGen::SrDrawPlan desport_plan;
 	if (FrameGen::SrUpscale() && bindings.pixel.has_value() && state.color_count > 0 && state.color_info[0].image_id) {
-		const auto     target = state.color_info[0].Extent();
-		const uint64_t ps     = state.ps_active && state.ps_input_info.stage.program != nullptr
-		                            ? state.ps_input_info.stage.program->shader_hash
-		                            : 0;
-		for (uint32_t i = 0; i < bindings.pixel->images.size(); ++i) {
+		std::array<FrameGen::SrDrawTexture, 32> textures {};
+		const size_t texture_count = std::min<size_t>(bindings.pixel->images.size(), textures.size());
+		for (size_t i = 0; i < texture_count; ++i) {
 			const auto& texture = bindings.pixel->images[i];
 			if (!texture.mip_views.empty()) continue;
 			const auto& info = texture.desc.info;
-			if (const auto view = FrameGen::SrUpscaledView(ps, info.data.address, {info.extent.width, info.extent.height},
-			                                               target);
-			    view != nullptr) {
-				m_desport_image_swap = {&*bindings.pixel, i, view};
-				break;
-			}
+			textures[i]      = {info.data.address, {info.extent.width, info.extent.height}};
+		}
+		const uint64_t ps = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                        ? state.ps_input_info.stage.program->shader_hash
+		                        : 0;
+		const bool replayable = state.color_count == 1 && !state.depth_info.image_id && !mesh_active &&
+		                        emit.gpu_args == 0 && emit.direct_run.empty() &&
+		                        !buffer.GetRegisters().GetClipControl().clip_disable;
+		desport_plan = FrameGen::SrPlanDraw(m_context.GetGraphics(), ps, state.color_info[0].desc.info.data.address,
+		                                    state.color_info[0].Extent(), state.color_info[0].desc.view_info.format,
+		                                    replayable, std::span {textures.data(), texture_count});
+		if (desport_plan.swap_slot >= 0) {
+			m_desport_image_swap = {&*bindings.pixel, static_cast<uint32_t>(desport_plan.swap_slot), desport_plan.swap_view};
 		}
 	}
 	// desport: end KYTY_DLSS_UPSCALE
@@ -1761,6 +1768,64 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 #endif
 	desport_viewport_restore.Restore(); // desport: ultrawide movie pillarbox (the draw is recorded)
+	// desport: begin KYTY_DLSS_UPSCALE=2: the scene composite once more, into the output-size image (General), with the
+	// DLSS image in place of the TAA output and the viewport and scissor scaled from the draw's target; the final pass
+	// samples it (FrameGen::SrPlanDraw). Same pipeline: the image has the target's view format, one color attachment.
+	if (desport_plan.replay) {
+		m_context.GetCommandScheduler().EndRendering();
+		m_desport_image_swap = {&*bindings.pixel, static_cast<uint32_t>(desport_plan.replay_slot),
+		                        desport_plan.replay_texture};
+		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
+		               std::span {descriptor_stages.data(), descriptor_stage_count});
+		const auto replay = buffer.Handle();
+		FrameGen::SrCompositeBegin(replay);
+		CommitVertexBuffers(replay, vertex_bindings);
+		CommitIndexBuffer(replay, index_binding);
+		CommitGraphicsState(buffer, state.vs_input_info, state.color_info, state.color_count, state.depth_info,
+		                    pipeline.pipeline, {});
+		const auto  dynamic = ResolveGraphicsDynamicParams(buffer, false, state.color_info, state.color_count,
+		                                                   state.depth_info);
+		const auto  source  = state.color_info[0].Extent();
+		const auto  extent  = desport_plan.replay_extent;
+		const float sx      = static_cast<float>(extent.width) / static_cast<float>(source.width);
+		const float sy      = static_cast<float>(extent.height) / static_cast<float>(source.height);
+		vk::Viewport viewport = dynamic.viewports[0];
+		viewport.x *= sx;
+		viewport.width *= sx;
+		viewport.y *= sy;
+		viewport.height *= sy;
+		const auto scaled = [](int32_t value, float scale, uint32_t limit) {
+			return std::clamp(static_cast<int64_t>(std::lround(static_cast<double>(value) * scale)), int64_t {0},
+			                  static_cast<int64_t>(limit));
+		};
+		const auto& guest_scissor = dynamic.scissors[0];
+		const auto  left   = scaled(guest_scissor.offset.x, sx, extent.width);
+		const auto  top    = scaled(guest_scissor.offset.y, sy, extent.height);
+		const auto  right  = scaled(guest_scissor.offset.x + static_cast<int32_t>(guest_scissor.extent.width), sx, extent.width);
+		const auto  bottom = scaled(guest_scissor.offset.y + static_cast<int32_t>(guest_scissor.extent.height), sy, extent.height);
+		vk::Rect2D  scissor {};
+		scissor.offset = vk::Offset2D {static_cast<int32_t>(left), static_cast<int32_t>(top)};
+		scissor.extent = vk::Extent2D {static_cast<uint32_t>(std::max<int64_t>(right - left, 0)),
+		                               static_cast<uint32_t>(std::max<int64_t>(bottom - top, 0))};
+		vk::RenderingAttachmentInfo color {};
+		color.imageView   = desport_plan.replay_view;
+		color.imageLayout = vk::ImageLayout::eGeneral;
+		color.loadOp      = vk::AttachmentLoadOp::eLoad;
+		color.storeOp     = vk::AttachmentStoreOp::eStore;
+		vk::RenderingInfo rendering_info {};
+		rendering_info.renderArea.extent    = extent;
+		rendering_info.layerCount           = 1;
+		rendering_info.colorAttachmentCount = 1;
+		rendering_info.pColorAttachments    = &color;
+		replay.beginRendering(rendering_info);
+		replay.setViewportWithCount(1, &viewport);
+		replay.setScissorWithCount(1, &scissor);
+		EmitDrawPrimitives(ucfg, replay, state.vs_input_info, draw, emit);
+		replay.endRendering();
+		buffer.InvalidateGraphicsState();
+		FrameGen::SrCompositeEnd(replay);
+	}
+	// desport: end KYTY_DLSS_UPSCALE=2
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1787,11 +1852,14 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (m_native_xpr_verify.record != nullptr)
 		NativeXprVerify(buffer, state, rendering, std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 	// (A table draw of vertices too: TableStore stores what a table try asked for.)
+	// desport: KYTY_DLSS_UPSCALE: a draw of the chain is never stored (desport_plan.involved): a table or native draw
+	// would replay it without the plan.
 	if (m_table_xpr)
-		TableStore(buffer, state, topology, primitive_restart_enable, rendering, !mesh_active && vertex_bindings.count == 0);
+		TableStore(buffer, state, topology, primitive_restart_enable, rendering,
+		           !mesh_active && vertex_bindings.count == 0 && !desport_plan.involved); // desport
 	if (m_native_xpr_store) {
 		m_native_xpr_store = false;
-		if (!mesh_active && emit.indexed && vertex_bindings.count == 0)
+		if (!mesh_active && emit.indexed && vertex_bindings.count == 0 && !desport_plan.involved) // desport
 			NativeXprStore(buffer, state, topology, primitive_restart_enable, rendering,
 			               std::span {descriptor_stages.data(), descriptor_stage_count}, emit);
 		else
