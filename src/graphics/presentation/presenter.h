@@ -33,6 +33,8 @@ public:
 	// --hdr and the display takes HDR10: the game is told it may output HDR.
 	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
+	// desport: KYTY_FPS_LIMIT=display: the refresh rate (Hz) of the window's display, 0 while there is no window.
+	[[nodiscard]] uint32_t       DisplayRefreshRate() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
 	// KYTY_FLIP_RATE caps the frame's flip. With frame generation only frames carrying its inputs
 	// are capped (the game's 3D view): movies and menus keep a flip per vblank.

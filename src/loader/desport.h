@@ -71,6 +71,42 @@ bool MoviePlaying();
 // desport: KYTY_ULTRAWIDE_MOVIES (desportUltrawide.cpp): the horizontal scale (< 1) that keeps a 16:9 movie at 16:9 in a
 // wider target (`target_width` x `target_height`), or 0 when movies are left to stretch (or not ultrawide).
 float UltrawideMovieScale(uint32_t target_width, uint32_t target_height);
+// desport: unified MoviePlaying() (declared above): KYTY_FPS_LIMIT also keeps flips on vblank ticks while it is true.
+
+// desport: KYTY_FPS_LIMIT (desportFps.cpp): frame rate without the vblank as a ceiling.
+//   unset    the engine as before: a flip only on a vblank tick (the ceiling is --vblank-frequency).
+//   0        no limit: a finished frame is flipped at once, between vblank ticks.
+//   <n>      at most n flips a second (20..1000), between vblank ticks.
+//   display  at most the display's refresh rate (queried from the window's display).
+// The vblank keeps its rate (--vblank-frequency); movies (.bk2 open), the game's own sceVideoOutSetFlipRate(1|2) and
+// KYTY_FLIP_RATE keep flipping on vblank ticks. With a limit, the game's time step is freed from its 1/59.94 s floor
+// through console variables (KYTY_FPS_GAME_CONVARS, see GameConvarLines). Logs "DES_FPS_LIMIT ..." at boot.
+namespace Fps {
+
+// A limit is set (any value of KYTY_FPS_LIMIT that parsed).
+bool Requested();
+// Flips follow the limit now (requested and, for "display", the display's rate known).
+bool Pacing();
+// The flip allowed by the limit is due (always true without a period).
+bool Due();
+// Steady-clock ns of the next allowed flip (0: now / no period).
+uint64_t NextDueNs();
+uint64_t NowNs();
+// A flip was presented (`between_vblanks`: outside a vblank tick).
+void OnFlip(bool between_vblanks);
+// "display": the window's display refresh rate (Hz), 0 while unknown. Pacing starts once a rate is set.
+bool NeedsDisplayRate();
+void SetDisplayRate(uint32_t hz);
+// The boot line: "DES_FPS_LIMIT mode=<off|unlimited|fixed|display> ...".
+void LogBoot(uint32_t vblank_hz);
+// Every 30 s while pacing: "DES_FPS_LIMIT stats t=<ms> between_vblanks=<n> on_vblank=<n> movie_hold=<0|1>".
+void MaybeLogStats();
+// "+name=value\n" lines added to the game's command-line file (loader/gameArgs.cpp) while a limit is requested:
+// KYTY_FPS_GAME_CONVARS (default "gameMinDeltaTime=0.001;gameDeltaTimeCorrectionTolorance=0.1"; "0" = none), minus the
+// names KYTY_GAME_CONVARS already sets.
+std::string GameConvarLines();
+
+} // namespace Fps
 
 // desport: KYTY_FAULT_CLASSIFY=1 (PA: where do the guest faults come from?): atomic counters in GpuResourceManager::HandleFault, by
 // access, mapping kind, outcome and thread, reported every 5 s as one line:

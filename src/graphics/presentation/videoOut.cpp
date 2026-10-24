@@ -214,7 +214,8 @@ public:
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot();
-	bool Flip(uint32_t micros);
+	bool Flip(uint32_t micros, bool between_vblanks = false); // desport: KYTY_FPS_LIMIT flips between vblank ticks
+	bool FrontReady(); // desport: KYTY_FPS_LIMIT: the oldest GPU flip is recorded and waits for its present
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
 	void Wait(VideoOutConfig& cfg, int index);
 
@@ -272,6 +273,9 @@ public:
 	void VblankBegin();
 	void VblankEnd();
 	void PresentThread(std::stop_token token);
+	// desport: KYTY_FPS_LIMIT: until the next vblank tick (QueryPerformanceCounter `deadline`), flips each finished frame
+	// as soon as the limit allows it, instead of sleeping until the tick.
+	void FlipBetweenVblanks(const std::stop_token& token, uint64_t deadline, uint64_t frequency);
 
 private:
 	Common::Mutex            m_mutex;
@@ -500,15 +504,24 @@ static int FlipRateFloor() {
 	return floor;
 }
 
-static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped) {
+// desport: `between_vblanks`: a KYTY_FPS_LIMIT flip outside a vblank tick (VideoOutDriver::Impl::FlipBetweenVblanks).
+static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation, bool capped, bool between_vblanks) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
 	// desport: movie pacing: while a Bink movie plays, at least Desport::MovieFlipFloor() vblanks between flips
 	if (const int floor = std::max(capped ? FlipRateFloor() : 0, Desport::MovieFlipFloor()); floor > cfg.flip_rate) {
+		if (between_vblanks) return false; // desport: KYTY_FPS_LIMIT: movies and KYTY_FLIP_RATE stay on vblank ticks
 		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(floor) + 1u;
 	}
 	const int interval = cfg.flip_rate + 1;
+	// desport: KYTY_FPS_LIMIT: with the game flipping every vblank (its flip rate 0, FPS_Unlocked/FPS_60) and no movie
+	// open, the limit decides, not the tick: on a tick and between ticks alike. The game's own flip rate 1/2 (30/20 fps),
+	// movies at 60 Hz and below (no movie floor there) and an unknown display rate keep the vblank pacing.
+	if (interval <= 1 && Desport::Fps::Pacing() && !Desport::MoviePlaying()) {
+		return Desport::Fps::Due();
+	}
+	if (between_vblanks) return false; // desport: KYTY_FPS_LIMIT
 
 	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
@@ -807,14 +820,51 @@ void VideoOutDriver::Impl::VblankEnd() {
 	}
 }
 
+void VideoOutDriver::Impl::FlipBetweenVblanks(const std::stop_token& token, uint64_t deadline, uint64_t frequency) {
+	// The GPU thread does not wake this thread when a flip becomes ready, so it polls: at most this long between looks
+	// (a finished frame waits up to this for its flip), or until the limit's due time when that comes sooner.
+	constexpr uint64_t POLL_US = 500;
+	for (;;) {
+		Desport::Fps::MaybeLogStats();
+		if (token.stop_requested()) {
+			return;
+		}
+		const auto now = Common::Timer::QueryPerformanceCounter();
+		if (now >= deadline) {
+			return;
+		}
+		uint64_t wait_us = std::min<uint64_t>((deadline - now) * 1000000u / frequency, POLL_US);
+		if (Desport::Fps::Pacing() && !Desport::MoviePlaying() && !m_presenter.IsGuestPaused()) {
+			const auto due = Desport::Fps::NextDueNs();
+			const auto ns  = Desport::Fps::NowNs();
+			if (Desport::Fps::Due()) {
+				if (m_flip_queue.FrontReady() && m_flip_queue.Flip(0, true)) {
+					continue; // flipped; the next one may be ready already
+				}
+			} else if (due > ns) {
+				wait_us = std::min<uint64_t>(wait_us, (due - ns + 999u) / 1000u);
+			}
+		}
+		Common::Thread::SleepMicro(static_cast<uint32_t>(std::max<uint64_t>(wait_us, 1)));
+	}
+}
+
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
+	Desport::Fps::LogBoot(Config::GetVblankFrequency()); // desport: KYTY_FPS_LIMIT
 
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		// desport: KYTY_FPS_LIMIT=display: the display's rate, once the window is there
+		if (Desport::Fps::NeedsDisplayRate()) {
+			Desport::Fps::SetDisplayRate(m_presenter.DisplayRefreshRate());
+		}
+		if (total_wait > 0 && Desport::Fps::Pacing()) {
+			// desport: KYTY_FPS_LIMIT: flips between the vblank ticks instead of sleeping until the next one
+			FlipBetweenVblanks(token, sleep_begin + static_cast<uint64_t>(total_wait), frequency);
+		} else if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
@@ -1123,7 +1173,14 @@ void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
 	}
 }
 
-bool FlipQueue::Flip(uint32_t micros) {
+// desport: KYTY_FPS_LIMIT: Flip(0) waits on the queue's condition variable when it is empty (a timeout rounded up to a
+// timer tick); the vblank thread asks first, so a poll between ticks never sleeps past the next one.
+bool FlipQueue::FrontReady() {
+	Common::LockGuard lock(m_mutex);
+	return !m_processing && !m_requests.empty() && m_requests.front().state == RequestState::Ready;
+}
+
+bool FlipQueue::Flip(uint32_t micros, bool between_vblanks) { // desport: KYTY_FPS_LIMIT
 	KYTY_PROFILER_BLOCK("FlipQueue::Flip");
 
 	m_mutex.Lock();
@@ -1148,7 +1205,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	r.cfg->mutex.Lock();
 	const bool capped = r.frame != nullptr && Graphics::Presenter::FlipRateApplies(*r.frame);
-	if (!IsFlipDueLocked(*r.cfg, r.generation, capped)) {
+	if (!IsFlipDueLocked(*r.cfg, r.generation, capped, between_vblanks)) { // desport: KYTY_FPS_LIMIT
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
@@ -1180,6 +1237,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	if (r.cfg->opened && !r.cfg->closing && r.cfg->generation == r.generation) {
 		r.cfg->flip_status.count++;
 		r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
+		Desport::Fps::OnFlip(between_vblanks); // desport: KYTY_FPS_LIMIT cadence (no-op without a limit)
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;

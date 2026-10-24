@@ -1,6 +1,7 @@
 #include "loader/gameArgs.h"
 
 #include "common/file.h"
+#include "loader/desport.h" // desport: KYTY_FPS_LIMIT
 
 #include <cctype>
 #include <cstdio>
@@ -27,7 +28,7 @@ const std::string& ExtraLines() {
 			if (first != std::string::npos && first < end && last >= first) out += "+" + list.substr(first, last - first + 1) + "\n";
 			at = end + 1;
 		}
-		return out;
+		return out + Desport::Fps::GameConvarLines(); // desport: KYTY_FPS_LIMIT frees the game's time step
 	}();
 	return lines;
 }
