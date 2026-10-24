@@ -68,6 +68,13 @@ inline std::atomic_uint64_t g_flips {0};
 // The steady-clock time (ns) of flip n at [n % FlipTimes], for frame-time percentiles (Measure).
 constexpr size_t             FlipTimes = 8192;
 inline std::atomic<int64_t>  g_flip_times[FlipTimes] {};
+// desport: DES_FRAME (window line next to DES_FPS, loader/desport.cpp) is on unless DES_FRAME=0; g_render_cycles is the
+// render thread's CurrentThreadCycles at its last flip (one call a frame).
+inline std::atomic_bool     g_perf_on {[] {
+	const char* value = std::getenv("DES_FRAME");
+	return value == nullptr || std::atoi(value) != 0;
+}()};
+inline std::atomic<uint64_t> g_render_cycles {0};
 inline std::atomic_bool     g_render_known {false};
 // pthread_t on Linux, a thread HANDLE on Windows (LocalPlatform::CurrentThreadHandle).
 inline uint64_t              g_render_thread {};
@@ -98,6 +105,9 @@ inline void Flip() {
 	const auto flip = g_flips.load(std::memory_order_relaxed);
 	g_flip_times[flip % FlipTimes].store(std::chrono::steady_clock::now().time_since_epoch().count(),
 	                                     std::memory_order_relaxed);
+	// desport: DES_FRAME: the render thread's run time so far (TSC ticks), read by the 5 s window line (Desport::FlipMilestone).
+	if (g_perf_on.load(std::memory_order_relaxed))
+		g_render_cycles.store(LocalPlatform::CurrentThreadCycles(), std::memory_order_relaxed);
 	g_flips.store(flip + 1, std::memory_order_release);
 	if (SlowLog::HitchThreshold() > 0.0) {
 		using C = LiveCounters::Id;

@@ -6,12 +6,14 @@
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "live-control.h" // desport: DES_FRAME flip times and render-thread waits
 #include "local-platform.h" // desport: DES_MEM process memory
 #include "loader/systemContent.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -122,6 +125,105 @@ void Milestone(std::string_view name, std::string_view detail) {
 	                   : fmt::format("DES_MILESTONE {} t={} {}\n", name, ElapsedMs(), detail));
 }
 
+// desport: DES_FRAME, a line next to every DES_FPS (same 5 s window; off with DES_FRAME=0). Everything is read from counters
+// the engine already keeps (the render thread's flip times, wait sums and LiveCounters), so the hot path only pays one
+// CurrentThreadCycles call per flip (LiveControl::Flip):
+//   DES_FRAME t=<ms> frames=<render flips> vblank=<Hz> v1=<n> v2=<n> v3=<n> v4p=<n> p50=<ms> p95=<ms> p99=<ms> max=<ms>
+//     gpu_wait=.. readback_wait=.. download_wait=.. compile=.. record_wait=.. upload_wait=.. idle=.. cpu=..
+//     (ms a frame; the render thread's, upload_wait any thread's) then, as counts in the window: sync_reads_guest=..
+//     sync_reads_render=.. rb_reject_size=.. rb_reject_backing=.. rb_reject_image=.. rb_reject_capacity=..
+//     sync_downloads=.. async_readbacks=.. pipeline_static_hits=.. pipeline_static_misses=.. pipeline_driver_hits=..
+// vN: frames that lasted N vblanks (flip to flip, rounded; v4p: 4 or more).
+namespace {
+
+constexpr const char* PerfWaitNames[LiveCensus::Waits] = {"gpu_wait", "readback_wait", "download_wait", "compile", "record_wait"};
+constexpr LiveCounters::Id PerfCounters[] = {
+    LiveCounters::SyncReadsGuest,       LiveCounters::SyncReadsRender,     LiveCounters::RbRejectSize,
+    LiveCounters::RbRejectBacking,      LiveCounters::RbRejectImage,       LiveCounters::RbRejectCapacity,
+    LiveCounters::SyncDownloads,        LiveCounters::AsyncReadbacks,      LiveCounters::PipelineStaticHits,
+    LiveCounters::PipelineStaticMisses, LiveCounters::PipelineDriverHits};
+
+struct PerfSnapshot {
+	uint64_t flips     = 0;
+	int64_t  steady_ns = 0;
+	int64_t  waits[LiveCensus::Waits] {};
+	int64_t  idle_ns = 0, upload_ns = 0;
+	uint64_t cycles = 0, tsc = 0;
+	uint64_t counters[std::size(PerfCounters)] {};
+};
+
+std::mutex   g_perf_mutex;
+PerfSnapshot g_perf_prev;
+
+PerfSnapshot PerfTake() {
+	PerfSnapshot s;
+	s.flips     = LiveControl::g_flips.load(std::memory_order_acquire);
+	s.steady_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+	for (size_t i = 0; i < LiveCensus::Waits; ++i) s.waits[i] = LiveCensus::g_waits_ns[i];
+	s.idle_ns   = LiveControl::g_render_idle_ns;
+	s.upload_ns = LiveCensus::g_upload_wait_ns.load(std::memory_order_relaxed);
+	s.cycles    = LiveControl::g_render_cycles.load(std::memory_order_relaxed);
+	s.tsc       = __rdtsc();
+	for (size_t i = 0; i < std::size(PerfCounters); ++i) s.counters[i] = LiveCounters::Value(PerfCounters[i]);
+	return s;
+}
+
+void PerfBegin() {
+	if (!LiveControl::g_perf_on.load(std::memory_order_relaxed)) return;
+	std::scoped_lock lock(g_perf_mutex);
+	g_perf_prev = PerfTake();
+}
+
+void PerfWindow(uint64_t now_ms) {
+	if (!LiveControl::g_perf_on.load(std::memory_order_relaxed)) return;
+	std::scoped_lock lock(g_perf_mutex);
+	const auto       cur    = PerfTake();
+	const auto&      prev   = g_perf_prev;
+	const uint64_t   frames = cur.flips - prev.flips;
+	std::string      out    = fmt::format("DES_FRAME t={} frames={}", now_ms, frames);
+	const uint32_t   hz     = Config::GetVblankFrequency();
+	const double     period = 1000.0 / static_cast<double>(hz != 0 ? hz : 60);
+	if (frames != 0) {
+		// The render thread's flip-to-flip times of the window (the ring keeps the last LiveControl::FlipTimes flips).
+		const uint64_t      n = std::min<uint64_t>(frames, LiveControl::FlipTimes - 2);
+		std::vector<double> times;
+		times.reserve(n);
+		uint64_t hist[4] {};
+		for (uint64_t j = std::max<uint64_t>(cur.flips - n, 1); j < cur.flips; ++j) {
+			const auto   a  = LiveControl::g_flip_times[j % LiveControl::FlipTimes].load(std::memory_order_relaxed);
+			const auto   b  = LiveControl::g_flip_times[(j - 1) % LiveControl::FlipTimes].load(std::memory_order_relaxed);
+			const double ms = static_cast<double>(a - b) / 1e6;
+			times.push_back(ms);
+			hist[std::clamp<long long>(std::llround(ms / period), 1, 4) - 1]++;
+		}
+		std::sort(times.begin(), times.end());
+		// Nearest-rank percentile.
+		const auto pct = [&](double p) {
+			if (times.empty()) return 0.0;
+			const auto rank = static_cast<size_t>(std::ceil(p * static_cast<double>(times.size())));
+			return times[std::min(times.size() - 1, rank == 0 ? size_t {0} : rank - 1)];
+		};
+		out += fmt::format(" vblank={} v1={} v2={} v3={} v4p={} p50={:.2f} p95={:.2f} p99={:.2f} max={:.2f}", hz, hist[0], hist[1],
+		                   hist[2], hist[3], pct(0.50), pct(0.95), pct(0.99), times.empty() ? 0.0 : times.back());
+		const double per_frame = 1.0 / (1e6 * static_cast<double>(frames));
+		for (size_t i = 0; i < LiveCensus::Waits; ++i)
+			out += fmt::format(" {}={:.3f}", PerfWaitNames[i], static_cast<double>(cur.waits[i] - prev.waits[i]) * per_frame);
+		out += fmt::format(" upload_wait={:.3f} idle={:.3f}", static_cast<double>(cur.upload_ns - prev.upload_ns) * per_frame,
+		                   static_cast<double>(cur.idle_ns - prev.idle_ns) * per_frame);
+		if (cur.cycles > prev.cycles && cur.tsc > prev.tsc)
+			out += fmt::format(" cpu={:.3f}", static_cast<double>(cur.cycles - prev.cycles) *
+			                                      static_cast<double>(cur.steady_ns - prev.steady_ns) /
+			                                      static_cast<double>(cur.tsc - prev.tsc) * per_frame);
+	}
+	for (size_t i = 0; i < std::size(PerfCounters); ++i)
+		out += fmt::format(" {}={}", LiveCounters::Names[PerfCounters[i]], cur.counters[i] - prev.counters[i]);
+	out += "\n";
+	Emit(out);
+	g_perf_prev = cur;
+}
+
+} // namespace
+
 void FlipMilestone(bool from_gpu) {
 	static std::atomic_uint64_t flips {0};
 	const auto                  n = flips.fetch_add(1) + 1;
@@ -137,11 +239,13 @@ void FlipMilestone(bool from_gpu) {
 	if (start == 0) {
 		window_start_ms.compare_exchange_strong(start, now);
 		window_start_flips.store(n);
+		PerfBegin(); // desport: DES_FRAME
 	} else if (now - start >= 5000 && window_start_ms.compare_exchange_strong(start, now)) {
 		const auto frames = n - window_start_flips.exchange(n);
 		Emit(
 		    fmt::format("DES_FPS t={} fps={:.1f}\n", now, 1000.0 * static_cast<double>(frames) /
 		                                                     static_cast<double>(now - start)));
+		PerfWindow(now); // desport: DES_FRAME
 	}
 }
 
