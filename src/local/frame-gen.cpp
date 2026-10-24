@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <cstdarg> // desport: DLSS SR log helper
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
@@ -28,6 +29,7 @@
 // NVIDIA Streamline SDK headers (_Build/deps/streamline/sdk/include, see CMakeLists.txt).
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h> // desport: DLSS Super Resolution / DLAA
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
@@ -60,6 +62,13 @@ const auto g_process_start_time = std::chrono::steady_clock::now();
 Camera   g_camera;              // Kyty.Gpu: the current guest frame
 Sources  g_sources;             // Kyty.Gpu: the current guest frame
 uint64_t g_guest_frame = 0;     // Kyty.Gpu
+
+// desport: DLSS SR (KYTY_DLSS). g_sr_mode is a sl::DLSSMode value (0 = off), set at Initialize.
+uint32_t         g_sr_mode     = 0;        // desport
+const char*      g_sr_mode_name = "off";   // desport
+bool             g_sr_ready    = false;    // desport: the feature is loaded and supported (OnDevice)
+std::atomic_bool g_sr_failed {false};      // desport: given up (the game's TAA runs from then on)
+uint64_t         g_sr_frame    = 0;        // desport: Kyty.Gpu, guest frames (EndSrFrame / PrepareInputs)
 
 struct CaptureStats {
 	uint32_t frames = 0;
@@ -600,6 +609,10 @@ struct Api {
 	PFun_slReflexSetOptions*     reflex_set_options  = nullptr;
 	PFun_slReflexSleep*          reflex_sleep        = nullptr;
 	PFun_slPCLSetMarker*         pcl_set_marker      = nullptr;
+	PFun_slEvaluateFeature*      evaluate_feature    = nullptr; // desport: DLSS SR
+	PFun_slAllocateResources*    allocate_resources  = nullptr; // desport: DLSS SR
+	PFun_slDLSSGetOptimalSettings* dlss_get_optimal_settings = nullptr; // desport: DLSS SR
+	PFun_slDLSSSetOptions*       dlss_set_options    = nullptr; // desport: DLSS SR
 };
 // slReflexSleep once a presented frame, before its markers: NVIDIA's Reflex guide requires it every frame (whatever
 // the Reflex mode), and DLSS-G's pacer on Vulkan relies on Reflex. Without it every DLSS-G present blocked ~34 ms
@@ -835,7 +848,8 @@ bool Requested() {
 void BypassCommandHooks(vk::Device device) {
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	// KYTY_FRAMEGEN_HOOKS=1 keeps Streamline's wrappers (for comparison).
-	if ((g_generate == 0 && !g_fg_runtime_toggle) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
+	// desport: the DLSS SR path also runs with Streamline's command-list state tracking off.
+	if ((g_generate == 0 && !g_fg_runtime_toggle && g_sr_mode == 0) || std::getenv("KYTY_FRAMEGEN_HOOKS") != nullptr) {
 		return;
 	}
 	// The real loader: Streamline itself forwards to it.
@@ -875,7 +889,31 @@ void Initialize() {
 	};
 	g_learning_enabled = !switched_off("KYTY_FRAMEGEN_LEARN");
 	g_hold_enabled     = !switched_off("KYTY_FRAMEGEN_CAMERA_HOLD");
-	if (g_learning_enabled && (requested_frames > 0 || g_fg_runtime_toggle)) {
+	// desport: begin KYTY_DLSS (values of sl::DLSSMode: 1 performance, 2 balanced, 3 quality, 4 ultra performance,
+	// 6 DLAA); every line to 'desport: end' is new.
+	if (const char* dlss = std::getenv("KYTY_DLSS"); dlss != nullptr && *dlss != '\0') {
+		const std::string text = dlss;
+		struct Mode { const char* name; uint32_t value; };
+		constexpr Mode modes[] {{"dlaa", 6}, {"quality", 3}, {"balanced", 2}, {"performance", 1},
+		                        {"ultra_performance", 4}};
+		for (const auto& mode: modes) {
+			if (text == mode.name) {
+				g_sr_mode      = mode.value;
+				g_sr_mode_name = mode.name;
+			}
+		}
+		if (g_sr_mode == 0 && text != "off" && text != "0") {
+			std::printf("DLSS: KYTY_DLSS=%s is not off|dlaa|quality|balanced|performance|ultra_performance; off\n", dlss);
+		}
+		// desport: phase A: the SR and DLSS-G would share Streamline's frame tokens from two threads.
+		if (g_sr_mode != 0 && (requested_frames > 0 || g_fg_runtime_toggle)) {
+			LOGF("DLSS: KYTY_DLSS=%s with frame generation is not supported yet; DLSS SR off\n", dlss);
+			std::printf("DLSS: KYTY_DLSS=%s with frame generation is not supported yet; DLSS SR off\n", dlss);
+			g_sr_mode = 0;
+		}
+	}
+	// desport: end KYTY_DLSS
+	if (g_learning_enabled && (requested_frames > 0 || g_fg_runtime_toggle || g_sr_mode != 0)) { // desport: SR too
 		LoadLayouts();
 	}
 	g_fps_hud_runtime_toggle = std::getenv("KYTY_FPS_HUD_RUNTIME_TOGGLE") != nullptr;
@@ -890,7 +928,7 @@ void Initialize() {
 		std::printf("Frame generation: runtime toggle enabled; F2 starts %s\n",
 		            g_fg_active.load(std::memory_order_relaxed) ? "on" : "off");
 	}
-	if (g_generate == 0 && !g_fg_runtime_toggle) {
+	if (g_generate == 0 && !g_fg_runtime_toggle && g_sr_mode == 0) { // desport: Streamline for DLSS SR too
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -925,6 +963,7 @@ void Initialize() {
 		LOGF("frame generation: cannot load %s\n", interposer.string().c_str());
 		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
 		g_generate = 0;
+		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
 		return;
 	}
 	const auto load = [&](auto& function, const char* name) {
@@ -940,6 +979,7 @@ void Initialize() {
 	    !load(g_api.set_tag_for_frame, "slSetTagForFrame")) {
 		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
 		g_generate = 0;
+		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
 		return;
 	}
 	static const std::wstring plugin_dir = dir.wstring();
@@ -957,6 +997,24 @@ void Initialize() {
 		if (text.find("reflex") != std::string::npos) features.push_back(sl::kFeatureReflex);
 		if (text.find("pcl") != std::string::npos) features.push_back(sl::kFeaturePCL);
 	}
+	// desport: begin DLSS Super Resolution (KYTY_DLSS) feature and its evaluate entry points (new lines to 'end').
+	if (g_sr_mode != 0) {
+		if (std::find(features.begin(), features.end(), sl::kFeatureDLSS) == features.end()) {
+			features.push_back(sl::kFeatureDLSS);
+		}
+		if (!load(g_api.evaluate_feature, "slEvaluateFeature") ||
+		    !load(g_api.allocate_resources, "slAllocateResources")) {
+			LOGF("DLSS: sl.interposer.dll lacks slEvaluateFeature/slAllocateResources; DLSS SR off\n");
+			std::printf("DLSS: sl.interposer.dll lacks slEvaluateFeature/slAllocateResources; DLSS SR off\n");
+			g_sr_mode = 0;
+			std::erase(features, sl::kFeatureDLSS);
+		}
+		if (features.empty()) {
+			g_generate = 0;
+			return;
+		}
+	}
+	// desport: end DLSS Super Resolution feature
 	sl::Preferences           preferences {};
 	preferences.showConsole        = false;
 	preferences.logLevel           = std::getenv("KYTY_FRAMEGEN_VERBOSE") ? sl::LogLevel::eVerbose
@@ -977,30 +1035,51 @@ void Initialize() {
 		LOGF("frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		g_generate = 0;
+		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
 		return;
 	}
 	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
 	// goes through Streamline, which adds what DLSS-G needs.
 	SetEnvironmentVariableW(L"SDL_VULKAN_LIBRARY", interposer.c_str());
 	_putenv_s("SDL_VULKAN_LIBRARY", interposer.string().c_str());
-	LOGF("Streamline loaded from %s, frame generation=%d\n",
-	     dir.string().c_str(), g_generate);
+	LOGF("Streamline loaded from %s, frame generation=%d, DLSS SR=%s\n", // desport: DLSS SR mode
+	     dir.string().c_str(), g_generate, g_sr_mode != 0 ? g_sr_mode_name : "off");
 #else
 	LOGF("frame generation: this build has no Streamline support\n");
 	g_generate = 0;
+	g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
 #endif
 }
 
 void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Device device) {
 	(void)instance;
 	(void)device;
-	if (g_generate == 0 && !g_fg_runtime_toggle) {
+	if (g_generate == 0 && !g_fg_runtime_toggle && g_sr_mode == 0) { // desport: DLSS SR too
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	bool loaded              = false;
+	// desport: begin DLSS SR, independent of DLSS-G (phase A runs it without frame generation); new lines to 'end'.
+	if (g_sr_mode != 0) {
+		bool sr_loaded = false;
+		if (g_api.is_feature_supported(sl::kFeatureDLSS, adapter) != sl::Result::eOk ||
+		    g_api.is_feature_loaded(sl::kFeatureDLSS, sr_loaded) != sl::Result::eOk || !sr_loaded) {
+			LOGF("DLSS: DLSS Super Resolution is not supported on this device; the game's TAA stays\n");
+			std::printf("DLSS: DLSS Super Resolution is not supported on this device; the game's TAA stays\n");
+		} else if (FeatureFunction(sl::kFeatureDLSS, "slDLSSGetOptimalSettings", g_api.dlss_get_optimal_settings) &&
+		           FeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", g_api.dlss_set_options)) {
+			g_sr_ready = true;
+			LOGF("DLSS: Super Resolution ready, mode %s\n", g_sr_mode_name);
+			std::printf("DLSS: Super Resolution ready, mode %s\n", g_sr_mode_name);
+			std::fflush(stdout);
+		}
+	}
+	if (g_generate == 0 && !g_fg_runtime_toggle) { // desport: DLSS SR only, no DLSS-G setup
+		return;
+	}
+	// desport: end DLSS SR
 	if (g_api.is_feature_supported(sl::kFeatureDLSS_G, adapter) != sl::Result::eOk ||
 	    g_api.is_feature_loaded(sl::kFeatureDLSS_G, loaded) != sl::Result::eOk || !loaded) {
 		LOGF("frame generation: DLSS-G is not supported on this device\n");
@@ -1362,7 +1441,7 @@ void SetStaticRect(float x0, float y0, float x1, float y1) {
 }
 
 void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
-	if (!Enabled()) {
+	if (!Enabled() && !SrActive()) { // desport: the DLSS SR needs the camera too
 		return;
 	}
 	const auto layout = std::find_if(CameraShaders.begin(), CameraShaders.end(),
@@ -1444,7 +1523,7 @@ void OnDraw(uint64_t vs_hash, std::span<const uint32_t> srt) {
 
 void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId motion,
                 uint64_t motion_address) {
-	if (!Enabled() || !IsTaaShader(cs_hash)) {
+	if ((!Enabled() && !SrActive()) || !IsTaaShader(cs_hash)) { // desport: DLSS SR too
 		return;
 	}
 	++g_capture_stats.taa_dispatches;
@@ -1553,5 +1632,529 @@ void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs) {
 	}
 	inputs.valid = false;
 }
+
+// desport: begin DLSS SR/DLAA (KYTY_DLSS), every line to 'desport: end' is new
+// desport: DLSS Super Resolution / DLAA (KYTY_DLSS) in place of the game's TAA dispatch (docs/DLSS_PLAN.md, phase
+// A: without DLSS-G). Renderer thread only. The TAA dispatch's images: depth (slot 1) and motion vectors (slot 3) as
+// DLSS-G takes them; the color input and the output were not confirmed by a frame capture yet, so they are chosen
+// from the shader's metadata (output: the written storage image; color: a sampled color image of the motion
+// vectors' extent), KYTY_DLSS_*_SLOT overriding, and logged for checking against a capture.
+bool SrRequested() {
+	return g_sr_mode != 0;
+}
+
+bool SrActive() {
+	return g_sr_ready && g_sr_mode != 0 && !g_sr_failed.load(std::memory_order_relaxed);
+}
+
+void EndSrFrame() {
+	if (!SrActive()) {
+		return;
+	}
+	// desport: as PrepareInputs does for DLSS-G: OnDraw keeps the frame's first camera, so it ends at the flip.
+	if (g_camera.valid) {
+		for (uint32_t i = 0; i < g_learn_snapshot_count; ++i) {
+			auto& snapshot = g_learn_snapshots[i];
+			LearnFrom(*snapshot.layout, std::span<const uint32_t>(snapshot.srt.data(), snapshot.words), g_camera);
+		}
+		g_last_camera       = g_camera;
+		g_last_camera_frame = g_capture_frame;
+	} else if (g_learned_camera.valid) {
+		g_last_camera       = g_learned_camera;
+		g_last_camera_frame = g_capture_frame;
+	}
+	g_camera.valid         = false;
+	g_learned_camera.valid = false;
+	g_learn_snapshot_count = 0;
+	++g_capture_frame;
+	++g_sr_frame;
+}
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+namespace {
+
+// desport: best guess for the TAA dispatch's color slot, used only when the metadata does not single one out.
+constexpr int      SrGuessColorSlot = 0;
+constexpr int      SrDepthSlot      = 1; // (renderCompute.cpp's FrameGen::OnDispatch)
+constexpr int      SrMotionSlot     = 3;
+constexpr uint32_t SrViewport       = 1; // (DLSS-G uses viewport 0)
+
+// desport: one log line per kind of problem (each falls back to the game's TAA for that dispatch).
+enum SrIssue : uint32_t {
+	SrIssueSlots    = 1u << 0,
+	SrIssueOutput   = 1u << 1,
+	SrIssueColor    = 1u << 2,
+	SrIssueRange    = 1u << 3,
+	SrIssueOptions  = 1u << 4,
+	SrIssueToken    = 1u << 5,
+	SrIssueEvaluate = 1u << 6,
+	SrIssueTwice    = 1u << 7,
+};
+std::atomic<uint32_t> g_sr_issues {0};
+
+void SrIssueOnce(uint32_t issue, const char* format, ...) {
+	if ((g_sr_issues.fetch_or(issue, std::memory_order_relaxed) & issue) != 0) {
+		return;
+	}
+	char    text[512];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	LOGF("DLSS: %s; the game's TAA runs instead\n", text);
+	std::printf("DLSS: %s; the game's TAA runs instead\n", text);
+	std::fflush(stdout);
+}
+
+int SlotSetting(const char* name, int fallback) {
+	const char* text = std::getenv(name);
+	if (text == nullptr || *text == '\0') return fallback;
+	char*      end   = nullptr;
+	const long value = std::strtol(text, &end, 10);
+	return end != text && *end == '\0' && value >= 0 && value < 64 ? static_cast<int>(value) : fallback;
+}
+
+bool Setting(const char* name, bool fallback) {
+	const char* text = std::getenv(name);
+	if (text == nullptr || *text == '\0') return fallback;
+	return std::strcmp(text, "0") != 0;
+}
+
+bool HdrFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eR32G32B32Sfloat:
+		case vk::Format::eB10G11R11UfloatPack32:
+		case vk::Format::eE5B9G9R9UfloatPack32: return true;
+		default: return false;
+	}
+}
+
+// desport: KYTY_DLSS_PRESET. Default: DLSS 4.5 (nvngx_dlss 310.x), the second-generation transformer: preset M,
+// and L for ultra performance (sl_dlss.h names them the defaults of performance and ultra performance). "sdk": the
+// SDK/driver's own default per mode (K for DLAA/quality/balanced). J, K, L, M: that preset in every mode.
+struct SrPresets {
+	sl::DLSSPreset dlaa, quality, balanced, performance, ultra_performance;
+	const char*    name;
+};
+SrPresets ReadPresets() {
+	const char*       text  = std::getenv("KYTY_DLSS_PRESET");
+	const std::string value = text != nullptr ? text : "";
+	const auto        all   = [](sl::DLSSPreset preset, const char* name) {
+        return SrPresets {preset, preset, preset, preset, preset, name};
+	};
+	if (value == "sdk") return all(sl::DLSSPreset::eDefault, "sdk default");
+	if (value == "J" || value == "j") return all(sl::DLSSPreset::ePresetJ, "J");
+	if (value == "K" || value == "k") return all(sl::DLSSPreset::ePresetK, "K");
+	if (value == "L" || value == "l") return all(sl::DLSSPreset::ePresetL, "L");
+	if (value == "M" || value == "m") return all(sl::DLSSPreset::ePresetM, "M");
+	if (!value.empty() && value != "default") {
+		std::printf("DLSS: KYTY_DLSS_PRESET=%s is not default|sdk|J|K|L|M; default\n", text);
+	}
+	return {sl::DLSSPreset::ePresetM, sl::DLSSPreset::ePresetM, sl::DLSSPreset::ePresetM, sl::DLSSPreset::ePresetM,
+	        sl::DLSSPreset::ePresetL, "DLSS 4.5 (M; L for ultra performance)"};
+}
+
+// desport: KYTY_DLSS_JITTER_SIGN=<x><y>, '+' or '-': the jitter in render pixels is (x * jx * w / 2, y * jy * h / 2)
+// of the game's NDC jitter (default "+-", DLSS-G's conversion in BeforePresent; not validated for SR).
+std::array<float, 2> JitterSign() {
+	const char*          text = std::getenv("KYTY_DLSS_JITTER_SIGN");
+	std::array<float, 2> sign {1.0f, -1.0f};
+	if (text != nullptr && std::strlen(text) >= 2) {
+		for (int i = 0; i < 2; ++i) sign[i] = text[i] == '-' ? -1.0f : 1.0f;
+	}
+	return sign;
+}
+
+sl::Resource SrResource(const SrSlot& slot) {
+	sl::Resource resource(sl::ResourceType::eTex2d, static_cast<VkImage>(slot.image), nullptr,
+	                      static_cast<VkImageView>(slot.view),
+	                      static_cast<uint32_t>(static_cast<VkImageLayout>(slot.layout)));
+	resource.width        = slot.extent.width;
+	resource.height       = slot.extent.height;
+	resource.nativeFormat = static_cast<uint32_t>(static_cast<VkFormat>(slot.view_format));
+	resource.mipLevels    = 1;
+	resource.arrayLayers  = 1;
+	resource.flags        = 0;
+	resource.usage        = static_cast<uint32_t>(static_cast<VkImageUsageFlags>(slot.usage));
+	return resource;
+}
+
+// desport: the last evaluated frame and the applied options (Kyty.Gpu).
+struct SrLast {
+	bool         valid = false;
+	uint64_t     frame = 0;
+	vk::Extent2D output {}, render {};
+	int          color = -1, output_slot = -1;
+	CameraFrame  camera;
+	uint32_t     logged_configs = 0;
+	uint64_t     signature      = 0;
+};
+struct SrOptions {
+	bool         set = false, allocated = false, hdr = true;
+	vk::Extent2D output {};
+	uint32_t     min_w = 0, min_h = 0, max_w = 0, max_h = 0; // the render size range (0: unknown)
+};
+struct SrStats {
+	uint32_t evaluated = 0, resets = 0, held = 0, learned = 0;
+};
+SrLast    g_sr_last;
+SrOptions g_sr_options;
+SrStats   g_sr_stats;
+uint32_t  g_sr_token_index = 0;
+
+} // namespace
+#endif
+
+bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs_hash, std::span<const SrSlot> slots) {
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+	if (!SrActive() || !IsTaaShader(cs_hash)) {
+		return false;
+	}
+	static const int  color_setting  = SlotSetting("KYTY_DLSS_COLOR_SLOT", -1);
+	static const int  output_setting = SlotSetting("KYTY_DLSS_OUTPUT_SLOT", -1);
+	static const int  depth_slot     = SlotSetting("KYTY_DLSS_DEPTH_SLOT", SrDepthSlot);
+	static const int  motion_slot    = SlotSetting("KYTY_DLSS_MOTION_SLOT", SrMotionSlot);
+	static const auto presets        = ReadPresets();
+	static const auto jitter_sign    = JitterSign();
+	static const bool auto_exposure  = Setting("KYTY_DLSS_AUTOEXPOSURE", true);
+	static const bool hdr_forced     = std::getenv("KYTY_DLSS_HDR") != nullptr && *std::getenv("KYTY_DLSS_HDR") != '\0';
+	static const bool hdr_setting    = Setting("KYTY_DLSS_HDR", true);
+	static const float cut_distance  = [] {
+        const char* text = std::getenv("KYTY_DLSS_CUT_DISTANCE");
+        return text != nullptr && std::atof(text) > 0 ? static_cast<float>(std::atof(text)) : 8.0f;
+	}();
+	static const bool pixels_mv = [] {
+		const char* mv = std::getenv("KYTY_FRAMEGEN_MV");
+		return mv != nullptr && std::string(mv) == "px";
+	}();
+	static const float mv_sign = [] {
+		const char* sign = std::getenv("KYTY_FRAMEGEN_MV_SIGN");
+		return sign != nullptr && std::atof(sign) > 0 ? 1.0f : -1.0f;
+	}();
+
+	const auto count  = static_cast<int>(slots.size());
+	const auto usable = [&](int i) {
+		return i >= 0 && i < count && slots[i].image != nullptr && slots[i].view != nullptr &&
+		       slots[i].layout != vk::ImageLayout::eUndefined;
+	};
+	if (!usable(depth_slot) || !usable(motion_slot)) {
+		SrIssueOnce(SrIssueSlots,
+		            "TAA dispatch 0x%016" PRIx64 " has no depth (slot %d) or motion vectors (slot %d) among its %d images",
+		            cs_hash, depth_slot, motion_slot, count);
+		return false;
+	}
+	const vk::Extent2D render = slots[motion_slot].extent;
+	// Output: the written storage image (the largest, if several), unless KYTY_DLSS_OUTPUT_SLOT says.
+	int output = output_setting;
+	if (output < 0) {
+		uint64_t best = 0;
+		for (int i = 0; i < count; ++i) {
+			const uint64_t area = uint64_t {slots[i].extent.width} * slots[i].extent.height;
+			if (usable(i) && slots[i].written && slots[i].storage && i != depth_slot && i != motion_slot &&
+			    area > best) {
+				output = i;
+				best   = area;
+			}
+		}
+	}
+	// Color input: a sampled color image of the render size (an HDR format first), unless KYTY_DLSS_COLOR_SLOT says.
+	int color = color_setting;
+	if (color < 0) {
+		for (int i = 0; i < count; ++i) {
+			const auto& slot = slots[i];
+			if (!usable(i) || i == depth_slot || i == motion_slot || i == output || slot.written ||
+			    IsDepthFormat(slot.format) || slot.extent != render) {
+				continue;
+			}
+			if (color < 0 || (HdrFormat(slot.format) && !HdrFormat(slots[color].format))) color = i;
+		}
+		if (color < 0 && SrGuessColorSlot != output && SrGuessColorSlot != depth_slot &&
+		    SrGuessColorSlot != motion_slot) {
+			color = SrGuessColorSlot;
+		}
+	}
+	// The choice, once per configuration (up to 8), with every image of the dispatch, to check against a capture.
+	uint64_t signature = static_cast<uint64_t>(color + 1) | static_cast<uint64_t>(output + 1) << 8u;
+	for (int i = 0; i < count; ++i) {
+		signature = (signature * 1099511628211ull) ^
+		            (static_cast<uint64_t>(slots[i].format) << 32u) ^
+		            (static_cast<uint64_t>(slots[i].extent.width) << 16u) ^ slots[i].extent.height;
+	}
+	if (signature != g_sr_last.signature && g_sr_last.logged_configs < 8) {
+		++g_sr_last.logged_configs;
+		std::string list;
+		for (int i = 0; i < count; ++i) {
+			char item[192];
+			std::snprintf(item, sizeof(item), "%s%d:fmt=%u view=%u %ux%u%s%s layout=%u", i == 0 ? "" : " | ", i,
+			              static_cast<uint32_t>(slots[i].format), static_cast<uint32_t>(slots[i].view_format),
+			              slots[i].extent.width, slots[i].extent.height, slots[i].written ? " written" : "",
+			              slots[i].storage ? " storage" : "", static_cast<uint32_t>(slots[i].layout));
+			list += item;
+		}
+		LOGF("DLSS: TAA 0x%016" PRIx64 " mode=%s render=%ux%u color=%d%s output=%d%s depth=%d motion=%d; images: %s\n",
+		     cs_hash, g_sr_mode_name, render.width, render.height, color, color_setting >= 0 ? "(env)" : "(auto)",
+		     output, output_setting >= 0 ? "(env)" : "(auto)", depth_slot, motion_slot, list.c_str());
+		std::printf("DLSS: TAA 0x%016" PRIx64 " mode=%s render=%ux%u color=%d%s output=%d%s depth=%d motion=%d; "
+		            "images: %s\n",
+		            cs_hash, g_sr_mode_name, render.width, render.height, color, color_setting >= 0 ? "(env)" : "(auto)",
+		            output, output_setting >= 0 ? "(env)" : "(auto)", depth_slot, motion_slot, list.c_str());
+		std::fflush(stdout);
+	}
+	g_sr_last.signature = signature;
+	if (!usable(output) || !usable(color) || output == color) {
+		SrIssueOnce(SrIssueSlots,
+		            "no color input (%d) or output (%d) slot found in the TAA dispatch (set KYTY_DLSS_COLOR_SLOT / "
+		            "KYTY_DLSS_OUTPUT_SLOT)",
+		            color, output);
+		return false;
+	}
+	const auto& out            = slots[output];
+	const bool  storage_format = static_cast<bool>(
+        graphics.physical_device.getFormatProperties(out.format).optimalTilingFeatures &
+        vk::FormatFeatureFlagBits::eStorageImage);
+	if (!(out.usage & vk::ImageUsageFlagBits::eStorage) || out.layout != vk::ImageLayout::eGeneral || !storage_format ||
+	    out.view_format != out.format || out.base_level != 0 || out.layer_count != 1) {
+		SrIssueOnce(SrIssueOutput,
+		            "the output image (slot %d, format %u, view %u, layout %u, level %u, layers %u) cannot be a DLSS "
+		            "storage output",
+		            output, static_cast<uint32_t>(out.format), static_cast<uint32_t>(out.view_format),
+		            static_cast<uint32_t>(out.layout), out.base_level, out.layer_count);
+		return false;
+	}
+	const auto& in = slots[color];
+	if (IsDepthFormat(in.format) || in.extent.width < render.width || in.extent.height < render.height ||
+	    out.extent.width < render.width || out.extent.height < render.height) {
+		SrIssueOnce(SrIssueColor,
+		            "the color input (slot %d, %ux%u, format %u) or the output (%ux%u) does not fit the render size %ux%u",
+		            color, in.extent.width, in.extent.height, static_cast<uint32_t>(in.format), out.extent.width,
+		            out.extent.height, render.width, render.height);
+		return false;
+	}
+	if (g_sr_last.valid && g_sr_last.frame == g_sr_frame) {
+		SrIssueOnce(SrIssueTwice, "a second TAA dispatch in one frame");
+		return false;
+	}
+
+	std::lock_guard          api_lock(g_streamline_mutex);
+	const sl::ViewportHandle viewport {SrViewport};
+	auto* const              native_command = static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
+	const bool               hdr            = hdr_forced ? hdr_setting : HdrFormat(in.format);
+	const vk::Extent2D       output_extent  = out.extent;
+	// Options (and the render size range) when the output size or the color's range changes.
+	if (!g_sr_options.set || g_sr_options.output != output_extent || g_sr_options.hdr != hdr) {
+		sl::DLSSOptions options {};
+		options.mode                   = static_cast<sl::DLSSMode>(g_sr_mode);
+		options.outputWidth            = output_extent.width;
+		options.outputHeight           = output_extent.height;
+		options.colorBuffersHDR        = hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.useAutoExposure        = auto_exposure ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.dlaaPreset             = presets.dlaa;
+		options.qualityPreset          = presets.quality;
+		options.balancedPreset         = presets.balanced;
+		options.performancePreset      = presets.performance;
+		options.ultraPerformancePreset = presets.ultra_performance;
+		sl::DLSSOptimalSettings optimal {};
+		if (g_api.dlss_get_optimal_settings(options, optimal) == sl::Result::eOk) {
+			g_sr_options.min_w = optimal.renderWidthMin;
+			g_sr_options.min_h = optimal.renderHeightMin;
+			g_sr_options.max_w = optimal.renderWidthMax;
+			g_sr_options.max_h = optimal.renderHeightMax;
+			LOGF("DLSS: mode %s, output %ux%u: optimal render %ux%u, range %ux%u..%ux%u\n", g_sr_mode_name,
+			     output_extent.width, output_extent.height, optimal.optimalRenderWidth, optimal.optimalRenderHeight,
+			     g_sr_options.min_w, g_sr_options.min_h, g_sr_options.max_w, g_sr_options.max_h);
+			std::printf("DLSS: mode %s, output %ux%u: optimal render %ux%u, range %ux%u..%ux%u\n", g_sr_mode_name,
+			            output_extent.width, output_extent.height, optimal.optimalRenderWidth,
+			            optimal.optimalRenderHeight, g_sr_options.min_w, g_sr_options.min_h, g_sr_options.max_w,
+			            g_sr_options.max_h);
+		} else {
+			g_sr_options.min_w = g_sr_options.min_h = g_sr_options.max_w = g_sr_options.max_h = 0;
+		}
+		if (const auto result = g_api.dlss_set_options(viewport, options); result != sl::Result::eOk) {
+			SrIssueOnce(SrIssueOptions, "slDLSSSetOptions failed (%d)", static_cast<int>(result));
+			return false;
+		}
+		LOGF("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d, auto exposure %d\n", g_sr_mode_name,
+		     presets.name, output_extent.width, output_extent.height, hdr ? 1 : 0, auto_exposure ? 1 : 0);
+		std::printf("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d, auto exposure %d\n",
+		            g_sr_mode_name, presets.name, output_extent.width, output_extent.height, hdr ? 1 : 0,
+		            auto_exposure ? 1 : 0);
+		std::fflush(stdout);
+		g_sr_options.set    = true;
+		g_sr_options.output = output_extent;
+		g_sr_options.hdr    = hdr;
+	}
+	if (g_sr_options.max_w != 0 && (render.width < g_sr_options.min_w || render.height < g_sr_options.min_h ||
+	                                render.width > g_sr_options.max_w || render.height > g_sr_options.max_h)) {
+		SrIssueOnce(SrIssueRange,
+		            "render size %ux%u is outside DLSS %s's range %ux%u..%ux%u for %ux%u (DLAA needs the output's size "
+		            "as render size)",
+		            render.width, render.height, g_sr_mode_name, g_sr_options.min_w, g_sr_options.min_h,
+		            g_sr_options.max_w, g_sr_options.max_h, output_extent.width, output_extent.height);
+		return false;
+	}
+
+	// The camera: the frame's (a listed or a learned shader), else the last one held still (no jitter).
+	Camera camera = g_camera;
+	if (!camera.valid && g_learned_camera.valid) {
+		camera = g_learned_camera;
+		++g_sr_stats.learned;
+	}
+	if (!camera.valid && g_last_camera.valid) {
+		camera                = g_last_camera;
+		camera.prev_view_proj = camera.view_proj;
+		camera.jitter_ndc     = {0.0f, 0.0f};
+		++g_sr_stats.held;
+	}
+	const auto frame = camera.valid ? Decompose(camera.view_proj) : CameraFrame {};
+
+	// History reset: the first frame, a gap (frames without the TAA: menus, loading, movies), a new size or slot
+	// choice, no camera, or a cut (a move over KYTY_DLSS_CUT_DISTANCE world units, default 8, or a turn over ~37 degrees).
+	bool reset = !g_sr_last.valid || g_sr_last.frame + 1 != g_sr_frame || g_sr_last.output != output_extent ||
+	             g_sr_last.render != render || g_sr_last.color != color || g_sr_last.output_slot != output ||
+	             !frame.valid;
+	if (!reset && g_sr_last.camera.valid) {
+		const auto& last = g_sr_last.camera;
+		const float dx = frame.position.x - last.position.x, dy = frame.position.y - last.position.y,
+		            dz = frame.position.z - last.position.z;
+		const float turn =
+		    frame.forward.x * last.forward.x + frame.forward.y * last.forward.y + frame.forward.z * last.forward.z;
+		reset = std::sqrt(dx * dx + dy * dy + dz * dz) > cut_distance || turn < 0.8f;
+	}
+
+	// Constants as BeforePresent fills them for DLSS-G (reversed Z, the game's vectors in UV units along the motion,
+	// negated), plus the jitter.
+	sl::Constants constants {};
+	Mat4          identity;
+	for (uint32_t i = 0; i < 4; ++i) {
+		identity[i] = sl::float4(i == 0, i == 1, i == 2, i == 3);
+	}
+	const float width                   = static_cast<float>(render.width);
+	const float height                  = static_cast<float>(render.height);
+	constants.cameraViewToClip          = identity;
+	constants.clipToCameraView          = identity;
+	constants.clipToLensClip            = identity;
+	constants.clipToPrevClip            = identity;
+	constants.prevClipToClip            = identity;
+	constants.jitterOffset              = sl::float2(0.0f, 0.0f);
+	constants.mvecScale = pixels_mv ? sl::float2(mv_sign / width, mv_sign / height) : sl::float2(mv_sign, mv_sign);
+	constants.cameraPinholeOffset       = sl::float2(0.0f, 0.0f);
+	constants.cameraPos                 = sl::float3(0, 0, 0);
+	constants.cameraUp                  = sl::float3(0, 1, 0);
+	constants.cameraRight               = sl::float3(1, 0, 0);
+	constants.cameraFwd                 = sl::float3(0, 0, 1);
+	constants.cameraNear                = 0.1f;
+	constants.cameraFar                 = 100000.0f;
+	constants.cameraFOV                 = 1.0f;
+	constants.cameraAspectRatio         = width / height;
+	constants.motionVectorsInvalidValue = sl::INVALID_FLOAT;
+	constants.depthInverted             = sl::Boolean::eTrue;
+	constants.cameraMotionIncluded      = sl::Boolean::eTrue;
+	constants.motionVectors3D           = sl::Boolean::eFalse;
+	constants.reset                     = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+	constants.orthographicProjection    = sl::Boolean::eFalse;
+	constants.motionVectorsDilated      = sl::Boolean::eFalse;
+	constants.motionVectorsJittered     = sl::Boolean::eFalse;
+	if (frame.valid) {
+		Mat4 projection;
+		projection[0]              = sl::float4(frame.sx, 0, 0, 0);
+		projection[1]              = sl::float4(0, frame.sy, 0, 0);
+		projection[2]              = sl::float4(frame.cx, frame.cy, 0, 1);
+		projection[3]              = sl::float4(0, 0, frame.z_near, 0);
+		constants.cameraViewToClip = projection;
+		Inverted(projection, constants.clipToCameraView);
+		const auto current  = Transposed(camera.view_proj);
+		const auto previous = Transposed(camera.prev_view_proj);
+		Mat4       clip_to_world;
+		if (Inverted(current, clip_to_world)) {
+			constants.clipToPrevClip = Multiply(clip_to_world, previous);
+			Inverted(constants.clipToPrevClip, constants.prevClipToClip);
+		}
+		constants.jitterOffset      = sl::float2(jitter_sign[0] * camera.jitter_ndc[0] * width * 0.5f,
+		                                         jitter_sign[1] * camera.jitter_ndc[1] * height * 0.5f);
+		constants.cameraPos         = frame.position;
+		constants.cameraUp          = frame.up;
+		constants.cameraRight       = frame.right;
+		constants.cameraFwd         = frame.forward;
+		constants.cameraNear        = frame.z_near;
+		constants.cameraFOV         = 2.0f * std::atan(1.0f / std::fabs(frame.sy));
+		constants.cameraAspectRatio = std::fabs(frame.sy / frame.sx);
+	}
+
+	sl::FrameToken* token = nullptr;
+	const uint32_t  index = ++g_sr_token_index;
+	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) {
+		SrIssueOnce(SrIssueToken, "slGetNewFrameToken failed");
+		return false;
+	}
+	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
+		SrIssueOnce(SrIssueEvaluate, "slSetConstants failed (%d)", static_cast<int>(result));
+		return false;
+	}
+	auto             depth_resource  = SrResource(slots[depth_slot]);
+	auto             motion_resource = SrResource(slots[motion_slot]);
+	auto             color_resource  = SrResource(in);
+	auto             output_resource = SrResource(out);
+	const sl::Extent render_rect {0, 0, render.width, render.height};
+	const sl::Extent output_rect {0, 0, output_extent.width, output_extent.height};
+	const sl::ResourceTag tags[] {
+	    sl::ResourceTag(&depth_resource, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate,
+	                    &render_rect),
+	    sl::ResourceTag(&motion_resource, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate,
+	                    &render_rect),
+	    sl::ResourceTag(&color_resource, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate,
+	                    &render_rect),
+	    sl::ResourceTag(&output_resource, sl::kBufferTypeScalingOutputColor,
+	                    sl::ResourceLifecycle::eValidUntilEvaluate, &output_rect),
+	};
+	if (const auto result = g_api.set_tag_for_frame(*token, viewport, tags, 4u, native_command);
+	    result != sl::Result::eOk) {
+		SrIssueOnce(SrIssueEvaluate, "slSetTagForFrame failed (%d)", static_cast<int>(result));
+		return false;
+	}
+	if (!g_sr_options.allocated) {
+		g_sr_options.allocated = true; // (a failure leaves the allocation to the first evaluate)
+		if (const auto result = g_api.allocate_resources(native_command, sl::kFeatureDLSS, viewport);
+		    result != sl::Result::eOk) {
+			LOGF("DLSS: slAllocateResources failed (%d)\n", static_cast<int>(result));
+		}
+	}
+	const sl::BaseStructure* inputs[] {&viewport};
+	if (const auto result = g_api.evaluate_feature(sl::kFeatureDLSS, *token, inputs, 1u, native_command);
+	    result != sl::Result::eOk) {
+		SrIssueOnce(SrIssueEvaluate, "slEvaluateFeature failed (%d)", static_cast<int>(result));
+		return false;
+	}
+	g_sr_last.valid       = true;
+	g_sr_last.frame       = g_sr_frame;
+	g_sr_last.output      = output_extent;
+	g_sr_last.render      = render;
+	g_sr_last.color       = color;
+	g_sr_last.output_slot = output;
+	g_sr_last.camera      = frame;
+	++g_sr_stats.evaluated;
+	g_sr_stats.resets += reset ? 1u : 0u;
+	if (g_sr_stats.evaluated % 1800u == 1u) {
+		LOGF("DLSS: %u frames upscaled (%u history resets, %u learned cameras, %u held cameras), %ux%u -> %ux%u\n",
+		     g_sr_stats.evaluated, g_sr_stats.resets, g_sr_stats.learned, g_sr_stats.held, render.width,
+		     render.height, output_extent.width, output_extent.height);
+		std::printf("DLSS: %u frames upscaled (%u history resets, %u learned cameras, %u held cameras), %ux%u -> "
+		            "%ux%u\n",
+		            g_sr_stats.evaluated, g_sr_stats.resets, g_sr_stats.learned, g_sr_stats.held, render.width,
+		            render.height, output_extent.width, output_extent.height);
+		std::fflush(stdout);
+	}
+	return true;
+#else
+	(void)graphics;
+	(void)command;
+	(void)cs_hash;
+	(void)slots;
+	return false;
+#endif
+}
+// desport: end DLSS SR/DLAA
 
 } // namespace Libs::Graphics::FrameGen

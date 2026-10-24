@@ -1470,7 +1470,8 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (FrameCapture::Active()) {
 		CaptureFrameDraw(buffer, draw, state, bindings.vertex, bindings.pixel);
 	}
-	if (FrameGen::CaptureRequested() && state.vs_input_info.stage.program != nullptr) {
+	// desport: the camera for DLSS SR (KYTY_DLSS) as well
+	if ((FrameGen::CaptureRequested() || FrameGen::SrActive()) && state.vs_input_info.stage.program != nullptr) {
 		FrameGen::OnDraw(state.vs_input_info.stage.program->shader_hash,
 		                 state.vs_input_info.stage.resources.flattened_srt);
 	}

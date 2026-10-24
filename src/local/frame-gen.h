@@ -119,6 +119,37 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
                    FrameInputs& inputs);
 void DestroyInputs(GraphicContext& graphics, FrameInputs& inputs);
 
+// desport: DLSS Super Resolution / DLAA in place of the game's TAA dispatch (phase A: without DLSS-G).
+// KYTY_DLSS=off|dlaa|quality|balanced|performance|ultra_performance (default off); KYTY_DLSS_PRESET=default|sdk|J|K|L|M
+// (default: DLSS 4.5's second-generation transformer presets, M, and L for ultra_performance; sdk: the SDK's own);
+// KYTY_DLSS_COLOR_SLOT / KYTY_DLSS_OUTPUT_SLOT / KYTY_DLSS_DEPTH_SLOT / KYTY_DLSS_MOTION_SLOT override the TAA
+// dispatch's image slots (default: depth 1, motion 3, color and output chosen from the shader's metadata);
+// KYTY_DLSS_JITTER_SIGN=<x><y> ('+' or '-', default "+-"); KYTY_DLSS_AUTOEXPOSURE=0|1 (default 1); KYTY_DLSS_HDR=0|1
+// (default: from the color format). With KYTY_FRAMEGEN (or its runtime toggle) the SR stays off (phase B).
+// desport: one image the TAA dispatch binds, as the renderer resolved it (renderCompute.cpp).
+struct SrSlot {
+	vk::Image           image  = nullptr;
+	vk::ImageView       view   = nullptr;
+	vk::ImageLayout     layout = vk::ImageLayout::eUndefined;
+	vk::Format          format = vk::Format::eUndefined;      // the image's
+	vk::Format          view_format = vk::Format::eUndefined; // the bound view's
+	vk::Extent2D        extent {};
+	vk::ImageUsageFlags usage {};
+	uint32_t            base_level = 0, level_count = 1, layer_count = 1;
+	bool                written = false, storage = false;
+};
+// desport: KYTY_DLSS asked for a mode (process start).
+[[nodiscard]] bool SrRequested();
+// desport: DLSS SR loaded and supported on this device, and not given up.
+[[nodiscard]] bool SrActive();
+// desport: renderer thread, in place of the TAA dispatch, after its bindings were committed (the images are in
+// their binding layouts): records DLSS SR into `command`, writing the TAA's output image. False: nothing recorded,
+// the caller runs the game's dispatch.
+[[nodiscard]] bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs_hash,
+                              std::span<const SrSlot> slots);
+// desport: at the guest flip when the DLSS-G capture does not run (PrepareInputs): ends the frame's camera.
+void EndSrFrame();
+
 } // namespace FrameGen
 } // namespace Libs::Graphics
 

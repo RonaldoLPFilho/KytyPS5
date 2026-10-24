@@ -33,5 +33,16 @@ inline Size RenderSizeFor(uint32_t height) {
 	const uint32_t width = (height * 16u / 9u + 4u) / 8u * 8u;
 	return {width, height};
 }
+// desport: KYTY_DLSS without KYTY_RENDER_HEIGHT: the render height of the DLSS mode for the 3840x2160 output
+// (quality 2/3, balanced 0.58, performance 1/2, ultra performance 1/3); 0 for none. DLAA (render = output, 2160)
+// stays at the game's 1440 for now: heights over 1440 are untested (RenderSizeFor's limit), so DLSS falls back to
+// the game's TAA there (frame-gen.cpp logs the range).
+inline uint32_t DlssRenderHeight(std::string_view mode) {
+	if (mode == "quality") return 1440;           // desport: (the game's own render size)
+	if (mode == "balanced") return 1253;          // desport
+	if (mode == "performance") return 1080;       // desport
+	if (mode == "ultra_performance") return 720;  // desport
+	return 0;                                     // desport: off, dlaa, unknown
+}
 } // namespace DemonsSoulsRenderSize
 } // namespace Loader

@@ -12,6 +12,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/demonsSouls.h"
+#include "graphics/host_gpu/renderer/cache/textureCache.h" // desport: DLSS SR reads the TAA images
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -28,6 +29,9 @@
 #include "libs/errno.h"
 #include "frame-capture.h"
 #include "frame-gen.h"
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+#include "vulkan-recording.h" // desport: DLSS SR drains the recording queue
+#endif
 #include "native-preparation-state.h"
 #include "live-counters.h"
 
@@ -1009,6 +1013,51 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u}, chain);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 9);
+	// desport: begin DLSS SR/DLAA (KYTY_DLSS) in place of the game's TAA dispatch. CommitBindings put every image
+	// in its binding layout (storage output: General); DLSS writes the TAA's output image and the dispatch is
+	// skipped. Anything DLSS cannot do falls back to the dispatch (EvaluateSr logs why, once).
+	if (FrameGen::SrActive() && FrameGen::IsTaaShader(program.shader_hash) && indirect_args == 0) {
+		auto&                         textures = m_context.GetTextureCache();
+		std::vector<FrameGen::SrSlot> sr_slots(bindings.images.size());
+		for (size_t i = 0; i < bindings.images.size(); ++i) {
+			const auto& binding = bindings.images[i];
+			auto&       slot    = sr_slots[i];
+			if (!binding.image_id || binding.image_view == nullptr) continue;
+			const auto& backing = textures.GetImage(binding.image_id).backing;
+			slot.image       = backing.image;
+			slot.view        = binding.image_view;
+			slot.layout      = binding.layout;
+			slot.format      = backing.format;
+			slot.view_format = binding.desc.view_info.format;
+			slot.extent      = {backing.extent.width, backing.extent.height};
+			slot.usage       = backing.usage;
+			slot.base_level  = binding.desc.view_info.base_level;
+			slot.level_count = binding.desc.view_info.level_count;
+			slot.layer_count = binding.desc.view_info.layer_count;
+			if (i < program.info.images.size()) {
+				slot.written = program.info.images[i].written;
+				slot.storage = program.info.images[i].resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+			}
+		}
+		// Handle() records a compute chain's pending barrier; earlier shader reads finish before DLSS writes.
+		auto sr_buffer = buffer.Handle();
+		ShaderWriteHazardBarrier(sr_buffer, vk::PipelineStageFlagBits::eComputeShader);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// NGX records through its own Vulkan entry points, not the recording thunks: the queued commands first.
+		LocalVulkanRecording::Drain();
+#endif
+		if (FrameGen::EvaluateSr(m_context.GetGraphics(), sr_buffer, program.shader_hash, sr_slots)) {
+			// DLSS's compute writes visible to what follows; its pipelines and descriptors are rebound by the next
+			// dispatch (bindPipeline and push descriptors every time), the graphics state is invalidated.
+			ShaderAccessBarrier(sr_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			buffer.InvalidateGraphicsState();
+			ResetBindings();
+			m_context.GetCommandScheduler().CompleteDispatch();
+			phase.reset();
+			return;
+		}
+	}
+	// desport: end DLSS SR/DLAA
 	const bool continues_chain = chain && buffer.ComputeChainPending();
 	bool has_storage_writes = HasShaderBufferWrites(input_info.stage);
 	has_storage_writes =

@@ -20,6 +20,11 @@
 #   .\run-windows.ps1 -Vblank 240            another virtual vblank rate (default 60, the console's)
 #   .\run-windows.ps1 -RenderHeight 1080     Demon's Souls renders its 3D at 1920x1080 instead of 2560x1440
 #                                            (720-1440; its 4K output and UI stay): faster where the GPU limits
+#   .un-windows.ps1 -Dlss performance     desport: DLSS Super Resolution in place of the game's TAA (off, quality,
+#                                            balanced, performance, ultra_performance; dlaa not yet); the render
+#                                            height follows the mode unless -RenderHeight; not with -FrameGen
+#   .un-windows.ps1 -DlssPreset M         desport: DLSS preset (default: DLSS 4.5's M, L for ultra_performance;
+#                                            sdk: the SDK's own; J, K, L, M)
 #   .\run-windows.ps1 -Game <folder>         the game (the folder with eboot.bin); remembered in
 #                                            game-path.txt, a folder dialog when none is known
 #   .\run-windows.ps1 -Game <file.zar>       the game folder packed into a ZArchive (read without extracting it)
@@ -55,6 +60,8 @@ param(
 	[switch]$AspectFit,
 	[int]$Language = -1,
 	[int]$FrameGen = 0,
+	[string]$Dlss = '',       # desport: KYTY_DLSS
+	[string]$DlssPreset = '', # desport: KYTY_DLSS_PRESET
 	[string]$Affinity = '',
 	[switch]$Prompt,
 	[switch]$Follow,
@@ -321,6 +328,9 @@ if ($Threads -gt 0) { $environment['KYTY_SHADER_WARMUP_THREADS'] = "$Threads" }
 if (!$environment.Contains('KYTY_HITCH_LOG_MS')) { $environment['KYTY_HITCH_LOG_MS'] = '100' }
 if ($AspectFit) { $environment['KYTY_PRESENT_ASPECT'] = 'fit' }
 if ($FrameGen -gt 0) { $environment['KYTY_FRAMEGEN'] = "$FrameGen" }
+# desport: -Dlss / -DlssPreset: DLSS Super Resolution in place of the game's TAA (src/local/frame-gen.h).
+if ($Dlss -ne '') { $environment['KYTY_DLSS'] = $Dlss }
+if ($DlssPreset -ne '') { $environment['KYTY_DLSS_PRESET'] = $DlssPreset }
 # -Set KEY=VALUE overrides a switch of the config; KEY= drops it. Several: -Set A=1,B=2 (a comma
 # starts a new pair only before KEY=, so values such as 1,2,3,6,7 stay whole).
 foreach ($pair in ($Set | ForEach-Object { $_ -split ',(?=[A-Za-z_][A-Za-z0-9_]*=)' })) {
