@@ -418,6 +418,24 @@ public:
 	// before it creates buffers over ranges recorded earlier.
 	[[nodiscard]] bool IsGpuMapped(uint64_t vaddr, uint64_t size) const noexcept;
 
+	// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). GPU thread, around a compute-ring dispatch's preparation.
+	// GPU writes noted by engine operations (uploads, joins, image copies; not the dispatches' own written bindings).
+	[[nodiscard]] uint64_t EngineWriteNotes() const noexcept { return m_write_notes - m_binding_write_notes; }
+	// The write log's position, and its notes kept apart (no merging into an earlier note) until EndAsyncCandidate.
+	[[nodiscard]] uint64_t BeginAsyncCandidate() noexcept {
+		m_note_apart = true;
+		return m_gpu_writes_base + m_gpu_writes.size();
+	}
+	void EndAsyncCandidate() noexcept { m_note_apart = false; }
+	// The write log dates every write that may be in flight (KYTY_READBACK_QUEUE on and started).
+	[[nodiscard]] bool AsyncWriteLogValid();
+	// Between commands: the latest graphics-queue epoch of a possibly unfinished GPU write to the ranges ({begin, end});
+	// false when the log cannot tell.
+	[[nodiscard]] bool InflightGfxWriteDependency(std::span<const std::pair<uint64_t, uint64_t>> ranges, uint64_t& epoch);
+	// The writes noted since `position` (BeginAsyncCandidate) are the async queue's.
+	void MarkAsyncWrites(uint64_t position);
+	// desport: end KYTY_ASYNC_COMPUTE
+
 private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
@@ -430,7 +448,8 @@ private:
 	// from the front.
 	struct GpuWrite {
 		uint64_t begin, end;
-		bool     big = false; // spans more granules than GpuWriteSpan: in m_gpu_big_writes, not m_gpu_write_last
+		bool     big   = false; // spans more granules than GpuWriteSpan: in m_gpu_big_writes, not m_gpu_write_last
+		bool     async = false; // desport: KYTY_ASYNC_COMPUTE: recorded into the async queue's buffer
 	};
 	// The ticks of the stamped writes, oldest first: (end, tick) dates the writes numbered from the previous entry's end
 	// (the head's number for the first) up to `end`. (A tick in every entry: each was written once and read once more,
@@ -453,12 +472,19 @@ private:
 	}
 	void ResetGpuWrites();
 	void                  NoteGpuWrite(uint64_t vaddr, uint64_t size);
+	// desport: KYTY_ASYNC_COMPUTE: `queue` picks the writes looked at (any, the graphics queue's, the async queue's).
+	enum class WriteQueue : uint8_t { Any, Gfx, Async };
 	[[nodiscard]] uint64_t InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
-	                                         bool between_commands);
+	                                         bool between_commands, WriteQueue queue = WriteQueue::Any);
+	// desport: KYTY_ASYNC_COMPUTE: per granule, as m_gpu_write_last, the last small async write (made with the first).
+	std::unique_ptr<uint64_t[]> m_gpu_write_last_async;
+	uint64_t                    m_write_notes         = 0;
+	uint64_t                    m_binding_write_notes = 0;
+	bool                        m_note_apart          = false;
 	// The graphics tick a transfer-queue copy of `ranges` ({begin, end}) waits for; false when
 	// the copy must drain the graphics queue as before.
 	[[nodiscard]] bool ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-	                                      bool between_commands, uint64_t& wait_tick);
+	                                      bool between_commands, uint64_t& wait_tick, bool* async_producer = nullptr);
 	std::vector<GpuWrite> m_gpu_writes;
 	size_t                m_gpu_writes_head    = 0;
 	size_t                m_gpu_writes_stamped = 0;

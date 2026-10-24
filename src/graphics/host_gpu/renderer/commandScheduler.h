@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 
 #include <queue>
@@ -121,10 +122,29 @@ public:
 	// Drops what was recorded (never submitted): the buffers are free again.
 	void DiscardRecorded(Recorder& recorder);
 
+	// desport: begin KYTY_ASYNC_COMPUTE (src/local/async-compute.h). The async queue is up.
+	[[nodiscard]] bool AsyncReady() const noexcept { return m_async_pool != nullptr; }
+	// The open epoch already had its async submission (another needs a graphics flush first: at most one an epoch).
+	[[nodiscard]] bool AsyncEpochUsed() const noexcept { return m_async_epoch_submitted == m_master.CurrentTick(); }
+	[[nodiscard]] bool AsyncOpen() const noexcept { return !m_async_command.IsInvalid(); }
+	// The async buffer of the open epoch (begun if needed); its submission waits for the graphics timeline at `dependency`
+	// (and at the dependencies given before it), which must be below the open epoch.
+	[[nodiscard]] CommandBuffer& AsyncCommand(uint64_t dependency);
+	// A dispatch was recorded into the async buffer: after KYTY_DISPATCH_BATCH of them it is submitted (with a graphics
+	// flush: the next one gets a fresh epoch).
+	void CompleteAsyncDispatch();
+	// Submits the async buffer, if open, signalling the async timeline with the open epoch. Any graphics submission does
+	// this first (SubmitBuffers).
+	void SubmitAsync();
+	// A sparse binding the next submission must wait for (WaitBeforeNextSubmit) is pending.
+	[[nodiscard]] bool HasPendingSubmitWait() const noexcept { return m_next_wait_semaphore != nullptr; }
+	// desport: end KYTY_ASYNC_COMPUTE
+
 private:
 	class CommandPool {
 	public:
-		CommandPool(GraphicContext& graphics, MasterSemaphore& master);
+		// desport: KYTY_ASYNC_COMPUTE: `family` (default: the graphics queue's).
+		CommandPool(GraphicContext& graphics, MasterSemaphore& master, uint32_t family = UINT32_MAX);
 		~CommandPool();
 		KYTY_CLASS_NO_COPY(CommandPool);
 
@@ -199,6 +219,16 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	// desport: KYTY_ASYNC_COMPUTE: the async queue family's pool (null: off), the async buffer of the open epoch, the
+	// graphics epoch its submission waits for, the epoch of the last async submission, the dispatches in the open buffer,
+	// the last async epoch a graphics submission waited for, the last async epoch handed to the driver.
+	std::unique_ptr<CommandPool> m_async_pool;
+	CommandBuffer                m_async_command;
+	uint64_t                     m_async_dependency      = 0;
+	uint64_t                     m_async_epoch_submitted = 0;
+	uint32_t                     m_async_dispatches      = 0;
+	uint64_t                     m_gfx_async_waited      = 0;
+	std::atomic<uint64_t>        m_async_driver_tick {0};
 };
 
 } // namespace Libs::Graphics

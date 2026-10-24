@@ -34,6 +34,7 @@
 #endif
 #include "native-preparation-state.h"
 #include "live-counters.h"
+#include "async-compute.h" // desport: KYTY_ASYNC_COMPUTE
 
 #include <unordered_map>
 #include <xxhash.h>
@@ -660,10 +661,18 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// indirect dispatch of threads: the normal path reads its counts).
 	const bool thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	m_dispatch_declined          = nullptr;
+	// desport: KYTY_ASYNC_COMPUTE (async-compute.h): a compute ring's dispatch takes the normal path, whose bindings tell
+	// what it reads and writes (it may go to the async queue there).
+	const bool async_ring = Role() == 0 && Spec::Current() == nullptr && AsyncCompute::SliceActive() &&
+	                        m_context.GetCommandScheduler().AsyncReady();
 	if (kyty_local_table_dispatch_mode.load(std::memory_order_relaxed) != 0 && (!thread_dimensions || indirect_args == 0) &&
-	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0)) &&
-	    TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions))
-		return;
+	    (indirect_args != 0 || (thread_group_x != 0 && thread_group_y != 0 && thread_group_z != 0))) {
+		if (async_ring) {
+			AsyncCompute::Add(AsyncCompute::TableSkipped);
+		} else if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, indirect_args, thread_dimensions)) {
+			return;
+		}
+	}
 	// A direct dispatch of no thread groups (with thread dimensions: no threads) runs nothing: skipped before its
 	// program is prepared (about 60 a frame at 1-1, each evaluating its resource tables first).
 	if (indirect_args == 0 && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) return;
@@ -930,12 +939,42 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	auto& pipeline =
 	    m_context.GetPipelineCache().CreateComputePipeline(input_info, compute_program);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 3);
+	// desport: begin KYTY_ASYNC_COMPUTE. What the preparation records or notes decides whether the dispatch can go to the
+	// async buffer: the work counter, the engine writes noted and the write log's position, the open epoch.
+	auto&            async_cache     = m_context.GetBufferCache();
+	auto&            async_scheduler = m_context.GetCommandScheduler();
+	AsyncCompute::Id async_refusal   = AsyncCompute::Count; // (Count: none so far)
+	uint64_t         async_work = 0, async_notes = 0, async_position = 0, async_epoch = 0, async_writes = 0;
+	if (async_ring) {
+		AsyncCompute::Add(AsyncCompute::Candidates);
+		async_work     = AsyncCompute::RecordedWork();
+		async_notes    = async_cache.EngineWriteNotes();
+		async_position = async_cache.BeginAsyncCandidate();
+		async_epoch    = async_scheduler.CurrentTick();
+		if (async_scheduler.AsyncEpochUsed()) async_refusal = AsyncCompute::FbEpoch;
+	}
+	struct AsyncCandidateEnd {
+		BufferCache* cache;
+		~AsyncCandidateEnd() {
+			if (cache != nullptr) cache->EndAsyncCandidate();
+		}
+	} async_candidate_end {async_ring ? &async_cache : nullptr};
+	// desport: end KYTY_ASYNC_COMPUTE
 	NativePreparationScratch<PreparedBindings> binding_storage(
 	    kyty_local_binding_scratch_mode.load(std::memory_order_relaxed) != 0);
 	auto& bindings = binding_storage.Get();
 	PrepareBindingsInto(input_info.stage, bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 4);
 	FindBuffers(bindings);
+	// desport: KYTY_ASYNC_COMPUTE: the in-flight graphics writes to what it binds, before its own writes are noted.
+	if (async_ring && async_refusal == AsyncCompute::Count) {
+		thread_local std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		ranges.clear();
+		for (const auto& source: bindings.buffer_sources)
+			if (source.size != 0) ranges.emplace_back(source.address, source.address + source.size);
+		if (indirect_args != 0) ranges.emplace_back(indirect_args, indirect_args + 3u * sizeof(uint32_t));
+		if (!async_cache.InflightGfxWriteDependency(ranges, async_writes)) async_refusal = AsyncCompute::FbNoLog;
+	}
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 5);
 	PrepareBdaBindings(bindings);
 	phase.emplace(LiveCensus::DispatchPhase, census_shader, 6);
@@ -1008,6 +1047,83 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const bool        chain            = DemonsSouls::IsSupportedGame();
+	// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). The dispatch goes to the async buffer when its preparation left
+	// nothing in the graphics buffer it depends on and it touches nothing but buffers; its submission waits for the
+	// graphics timeline at the largest of its dependency bounds. Else it is recorded below, as before.
+	if (async_ring) {
+		auto& slice = AsyncCompute::t_slice;
+		const auto refusal = [&]() -> AsyncCompute::Id {
+			if (async_refusal != AsyncCompute::Count) return async_refusal;
+			if (!program.info.images.empty() || !bindings.images.empty()) return AsyncCompute::FbImages;
+			if (program.info.uses_dma) return AsyncCompute::FbDma;
+			if (bindings.gds.buffer != nullptr) return AsyncCompute::FbGds;
+			if (AsyncCompute::RecordedWork() != async_work) return AsyncCompute::FbWork;
+			if (async_cache.EngineWriteNotes() != async_notes) return AsyncCompute::FbNotes;
+			if (async_scheduler.HasPendingSubmitWait()) return AsyncCompute::FbSparse;
+			if (FrameGen::SrActive() && FrameGen::IsTaaShader(program.shader_hash)) return AsyncCompute::FbTaa;
+			if (async_scheduler.CurrentTick() != async_epoch || async_scheduler.AsyncEpochUsed()) return AsyncCompute::FbEpoch;
+			if (!async_cache.AsyncWriteLogValid()) return AsyncCompute::FbNoLog;
+			return AsyncCompute::Count;
+		};
+		async_refusal = refusal();
+		uint64_t         dependency = 0;
+		AsyncCompute::Id source     = AsyncCompute::DepLabel;
+		if (async_refusal == AsyncCompute::Count) {
+			const std::pair<uint64_t, AsyncCompute::Id> bounds[] {{slice.label_dep, AsyncCompute::DepLabel},
+			                                                     {async_writes, AsyncCompute::DepWrites},
+			                                                     {slice.wait_dep, AsyncCompute::DepWait},
+			                                                     {AsyncCompute::QueueGfxEpoch(), AsyncCompute::DepOwn}};
+			for (const auto& [bound, id]: bounds)
+				if (bound > dependency) dependency = bound, source = id;
+			if (dependency >= async_scheduler.CurrentTick()) async_refusal = AsyncCompute::FbDepOpen;
+		}
+		if (async_refusal != AsyncCompute::Count) {
+			AsyncCompute::Add(async_refusal);
+		} else {
+			auto& async_buffer = async_scheduler.AsyncCommand(dependency);
+			async_cache.MarkAsyncWrites(async_position);
+			const uint64_t    work_before = AsyncCompute::RecordedWork();
+			PreparedBindings* async_stage = &bindings;
+			CommitBindings(async_buffer, vk::PipelineBindPoint::eCompute, pipeline, std::span {&async_stage, 1u}, chain);
+			const auto async_vk        = chain ? async_buffer.ChainHandle() : async_buffer.Handle();
+			const bool async_continues = chain && async_buffer.ComputeChainPending();
+			if (HasShaderBufferWrites(input_info.stage) && !async_continues)
+				ShaderWriteHazardBarrier(async_vk, vk::PipelineStageFlagBits::eComputeShader);
+			async_vk.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+			if (indirect_args != 0) {
+				vk::BufferMemoryBarrier args_barrier {};
+				args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite |
+				                             vk::AccessFlagBits::eMemoryWrite;
+				args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+				args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+				args_barrier.buffer              = indirect_buffer;
+				args_barrier.offset              = indirect_offset;
+				args_barrier.size                = 3u * sizeof(uint32_t);
+				async_vk.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eDrawIndirect,
+				                         vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
+				async_vk.dispatchIndirect(indirect_buffer, indirect_offset);
+			} else {
+				async_vk.dispatch(thread_group_x, thread_group_y, thread_group_z);
+			}
+			DeviceFault::NoteDispatch(async_epoch, program.shader_hash, indirect_args != 0 ? 0 : thread_group_x,
+			                          indirect_args != 0 ? 0 : thread_group_y, indirect_args != 0 ? 0 : thread_group_z,
+			                          indirect_args);
+			if (chain) {
+				async_buffer.ContinueComputeChain();
+			} else {
+				ShaderAccessBarrier(async_vk, vk::PipelineStageFlagBits::eComputeShader);
+			}
+			slice.async_work += AsyncCompute::RecordedWork() - work_before;
+			AsyncCompute::Add(AsyncCompute::Async);
+			AsyncCompute::Add(source);
+			ResetBindings();
+			async_scheduler.CompleteAsyncDispatch();
+			phase.reset();
+			return;
+		}
+	}
+	// desport: end KYTY_ASYNC_COMPUTE
 	auto              vk_buffer        = chain ? buffer.ChainHandle() : buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

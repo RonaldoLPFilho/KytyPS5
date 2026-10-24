@@ -31,6 +31,7 @@
 #include "frame-capture.h"
 #include "live-control.h"
 #include "performance-switches.h"
+#include "async-compute.h" // desport: KYTY_ASYNC_COMPUTE
 #include "speculation-state.h"
 #include "xpr-capture.h"
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
@@ -248,7 +249,11 @@ void GuestGpu::ProcessCommands() {
 		PageManager::FlushDeferredProtection();
 		LiveCounters::Add(LiveCounters::GuestCommands);
 		LiveTrace::Event(LiveTrace::GuestCommand, 1, 0);
+		// desport: KYTY_ASYNC_COMPUTE: what a guest command records inside a compute slice (a readback's copy) is not that
+		// queue's graphics-queue work (AsyncCompute::QueueGfxEpoch).
+		const uint64_t async_work = AsyncCompute::t_slice.active ? AsyncCompute::RecordedWork() : 0;
 		command();
+		if (AsyncCompute::t_slice.active) AsyncCompute::t_slice.async_work += AsyncCompute::RecordedWork() - async_work;
 		LiveTrace::Event(LiveTrace::GuestCommand, 0, 0);
 	}
 }
@@ -619,6 +624,8 @@ static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
 	}
 	auto* spec = Spec::Current();
 	if (spec == nullptr) {
+		// desport: KYTY_ASYNC_COMPUTE: the label's graphics epoch, published before the write.
+		AsyncCompute::NoteCpWrite(reinterpret_cast<uint64_t>(dst), size);
 		std::memcpy(dst, src, size);
 		Spec::NoteHostWrite(reinterpret_cast<uint64_t>(dst), size);
 		// (The labels a speculation's waits check: none without speculation.)
@@ -697,6 +704,8 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		SuspendPm4();
 	} else if (Spec::Current() == nullptr) { // (a speculation's commit publishes them)
 		BdaDirtyRegions::Publish();
+		// desport: KYTY_ASYNC_COMPUTE: a compute slice's dispatches after this wait wait for the label's graphics epoch.
+		AsyncCompute::NoteWaitPassed(reinterpret_cast<uint64_t>(addr), sizeof(T));
 	}
 }
 
@@ -836,6 +845,9 @@ void GuestGpu::Enqueue(Submission submission) {
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());
 	submission.enqueue_ns = ReadbackLatency::Stats() ? ReadbackLatency::NowNs() : 0; // desport: KYTY_READBACK_LATENCY
+	// desport: KYTY_ASYNC_COMPUTE: the labels the guest may have acted on.
+	if (submission.queue_id != 0 && AsyncCompute::On())
+		submission.async_label_epoch = AsyncCompute::g_gfx_label_epoch.load(std::memory_order_seq_cst);
 	if (submission.queue_id != 0) m_compute_queued.fetch_add(1, std::memory_order_relaxed); // desport
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
@@ -1213,8 +1225,27 @@ bool GuestGpu::Process(Submission& submission) {
 			if (first_slice) {
 				GraphicsDbgDumpDcb("cc", num_dw, buffer);
 			}
+			// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). Its dispatches may go to the async buffer, submitted
+			// at the slice's end (before the graphics flush below). An epoch has one async submission at most: one made
+			// since the last graphics submission (a guest readback's) is followed by a graphics flush first.
+			auto&      async_scheduler = m_renderer.GetCommandScheduler();
+			const bool async = AsyncCompute::On() && async_scheduler.AsyncReady() &&
+			                   kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0;
+			if (async) {
+				if (async_scheduler.AsyncEpochUsed()) {
+					async_scheduler.Flush();
+					AsyncCompute::Add(AsyncCompute::EpochFlushes);
+				}
+				AsyncCompute::BeginSlice(submission.queue_id, submission.async_label_epoch);
+			}
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
+			if (async) {
+				AsyncCompute::EndSlice();
+				async_scheduler.SubmitAsync();
+				AsyncCompute::Report(); // (every 5 s)
+			}
+			// desport: end KYTY_ASYNC_COMPUTE
 			if (submission.command_execution.MadeProgress()) {
 				if (complete) {
 					m_renderer.GetGpuResources().EndSubmission();

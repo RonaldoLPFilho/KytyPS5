@@ -77,6 +77,13 @@ struct GraphicContext {
 	// copies (src/local/readback-queue.h); buffers are then shared with its family.
 	uint32_t                           readback_family = static_cast<uint32_t>(-1);
 	vk::Queue                          readback_queue  = nullptr;
+	// desport: KYTY_ASYNC_COMPUTE (set at device creation, src/local/async-compute.h): the queue the guest's compute-ring
+	// dispatches are submitted to (1: a compute-only family's, 2: another queue of the graphics family); buffers are
+	// shared with its family when it differs. Null: off.
+	uint32_t                           async_family      = static_cast<uint32_t>(-1);
+	uint32_t                           async_queue_index = 0;
+	vk::Queue                          async_queue       = nullptr;
+	Common::Mutex                      async_queue_mutex;
 	// Windows: a second queue of the graphics family used only for vkQueuePresentKHR. The
 	// driver can block a present in the kernel until earlier GPU work on its queue is done;
 	// on the graphics queue that held queue_mutex against the very submissions that work

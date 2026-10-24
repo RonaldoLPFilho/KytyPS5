@@ -83,6 +83,9 @@ private:
 		// async-compute submission (not blocked: it goes on right after).
 		uint64_t enqueue_ns = 0;
 		bool     yielded    = false;
+		// desport: KYTY_ASYNC_COMPUTE: the largest graphics epoch of a label written before it was queued (the guest
+		// acted on labels written before at most: its async dispatches wait for that epoch).
+		uint64_t async_label_epoch = 0;
 	};
 
 	void              Enqueue(Submission submission);

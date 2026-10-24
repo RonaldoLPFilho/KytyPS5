@@ -11,6 +11,7 @@
 #include "parallel-pages.h"
 #include "readback-queue.h"
 #include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
+#include "async-compute.h"    // desport: KYTY_ASYNC_COMPUTE
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -188,6 +189,10 @@ struct BufferCache::GuestReadback {
 	// at `tick`), and the graphics tick of the last GPU write it waited for. Mode 3 also copies
 	// on the graphics queue at `tick` into `verify`.
 	uint64_t queue_value = 0, producer_tick = 0;
+	// desport: KYTY_ASYNC_COMPUTE: the copy waits for the async timeline at producer_tick (its bytes' in-flight writers
+	// are async dispatches), and the priority operations it waits for after it (image downloads into its window).
+	bool     producer_async = false;
+	uint64_t priority_tick  = 0;
 	Buffer* verify = nullptr;
 	size_t slot = 0;
 	Buffer* download = nullptr;
@@ -455,9 +460,19 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 	request->packed_size = packed_size;
 	// KYTY_READBACK_QUEUE: bytes whose writers the GPU finished (or, mode 2, has been handed)
 	// need not wait behind the rest of the graphics queue.
-	if (ReadbackQueueReady(runs, true, request->producer_tick)) {
+	// desport: KYTY_ASYNC_COMPUTE: or whose in-flight writers are all async dispatches (the copy waits for the async
+	// timeline), while the slot's last graphics-queue copy is done.
+	bool async_producer = false;
+	bool queue_ready    = ReadbackQueueReady(runs, true, request->producer_tick, &async_producer);
+	if (queue_ready && async_producer && !m_scheduler.IsFree(m_download_ticks[slot])) {
+		queue_ready = false;
+		AsyncCompute::Add(AsyncCompute::RbMixed);
+	}
+	if (queue_ready) {
 		// Also after the slot's last graphics-queue copy (it is submitted: that path flushes).
-		request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
+		if (!async_producer) request->producer_tick = std::max(request->producer_tick, m_download_ticks[slot]);
+		request->producer_async = async_producer; // desport: KYTY_ASYNC_COMPUTE
+		if (async_producer) request->priority_tick = m_texture_cache.PendingDownloadTick(begin, end - begin);
 		thread_local std::vector<ReadbackQueue::Queue::Region> regions_home;
 		ScratchValue                                           regions_scratch(regions_home);
 		auto&                                                  regions = *regions_scratch;
@@ -466,7 +481,8 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 			regions.push_back({buffer.Handle(), {envelope.source, envelope.cursor, envelope.size}});
 		request->parts = std::move(parts);
 		request->queue_value = m_readback_queue->Copy(regions, download->Handle(),
-		                                              m_scheduler.GetMasterSemaphore().Handle(),
+		                                              async_producer ? m_scheduler.GetMasterSemaphore().AsyncHandle() // desport
+		                                                             : m_scheduler.GetMasterSemaphore().Handle(),
 		                                              request->producer_tick);
 		LiveTrace::Event(LiveTrace::RbFast, begin, (end - begin) | request->producer_tick << 32u);
 		m_download_queue_values[slot] = request->queue_value;
@@ -579,6 +595,7 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 // current tick, so its tick is only set at the next point between commands. Every GPU write
 // into a guest buffer is noted: shader writes, uploads, image copies and buffer joins.
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
+	++m_write_notes; // desport: KYTY_ASYNC_COMPUTE (EngineWriteNotes)
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
 	// desport: KYTY_READBACK_PREFETCH (1: chunks, 2/3: ranges)
@@ -603,8 +620,10 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	}
 	// Writes not stamped yet all get the same tick at the next point between commands: a range
 	// noted again before then (a dispatch run writing the same buffers) adds nothing.
-	for (size_t i = m_gpu_writes.size(), last = std::max(m_gpu_writes_stamped, i > 4 ? i - 4 : 0); i > last; --i)
-		if (m_gpu_writes[i - 1].begin == vaddr && m_gpu_writes[i - 1].end == vaddr + size) return;
+	// desport: KYTY_ASYNC_COMPUTE: not while a compute-ring dispatch is prepared (its notes may become the async queue's),
+	// nor into an async note.
+	for (size_t i = m_gpu_writes.size(), last = std::max(m_gpu_writes_stamped, i > 4 ? i - 4 : 0); i > last && !m_note_apart; --i)
+		if (m_gpu_writes[i - 1].begin == vaddr && m_gpu_writes[i - 1].end == vaddr + size && !m_gpu_writes[i - 1].async) return;
 	const bool big = ((vaddr + size - 1) >> GpuWriteGranuleBits) - (vaddr >> GpuWriteGranuleBits) >= GpuWriteSpan;
 	m_gpu_writes.push_back({vaddr, vaddr + size, big});
 	if (big) {
@@ -622,7 +641,11 @@ void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 // every noted write is recorded by now and gets its tick; inside a command an undated write
 // may still be recorded later, so it yields UINT64_MAX.
 uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t completed,
-                                        bool between_commands) {
+                                        bool between_commands, WriteQueue queue) {
+	// desport: KYTY_ASYNC_COMPUTE: the writes of one queue only (Gfx, Async), or any.
+	const auto matches = [queue](const GpuWrite& write) {
+		return queue == WriteQueue::Any || write.async == (queue == WriteQueue::Async);
+	};
 	if (between_commands) {
 		const uint64_t current = m_scheduler.CurrentTick();
 		if (m_gpu_writes_stamped < m_gpu_writes.size()) {
@@ -651,7 +674,7 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 	if (end <= begin) {
 		for (size_t i = m_gpu_writes.size(); i > m_gpu_writes_head; --i) {
 			const auto& write = m_gpu_writes[i - 1];
-			if (write.begin < end && begin < write.end) return tick_of(i - 1);
+			if (write.begin < end && begin < write.end && matches(write)) return tick_of(i - 1); // desport
 		}
 		return 0;
 	}
@@ -662,7 +685,7 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 	for (auto it = m_gpu_big_writes.rbegin(); it != m_gpu_big_writes.rend(); ++it) {
 		const auto  index = static_cast<size_t>(*it - m_gpu_writes_base);
 		const auto& write = m_gpu_writes[index];
-		if (write.begin < end && begin < write.end) {
+		if (write.begin < end && begin < write.end && matches(write)) { // desport: KYTY_ASYNC_COMPUTE
 			found = index + 1;
 			break;
 		}
@@ -670,14 +693,16 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 	// The last small write in the range's granules completed (the in-flight writes are the log's tail): none in flight
 	// overlaps it. Else none after that one does (a later one would be the last there), and one before the overlapping
 	// big write is older than it.
-	uint64_t last = 0;
-	for (auto g = begin >> GpuWriteGranuleBits; g <= (end - 1) >> GpuWriteGranuleBits; ++g)
-		last = std::max(last, m_gpu_write_last[GpuWriteCounter(g)]);
+	// desport: KYTY_ASYNC_COMPUTE: the async writes' own last numbers for them (none made yet: none).
+	const uint64_t* last_numbers = queue == WriteQueue::Async ? m_gpu_write_last_async.get() : m_gpu_write_last.get();
+	uint64_t        last         = 0;
+	for (auto g = begin >> GpuWriteGranuleBits; last_numbers != nullptr && g <= (end - 1) >> GpuWriteGranuleBits; ++g)
+		last = std::max(last, last_numbers[GpuWriteCounter(g)]);
 	if (last > m_gpu_writes_base + m_gpu_writes_head) {
 		const auto start = static_cast<size_t>(std::min<uint64_t>(last - m_gpu_writes_base, m_gpu_writes.size()));
 		for (size_t i = start; i > std::max(m_gpu_writes_head, found); --i) {
 			const auto& write = m_gpu_writes[i - 1];
-			if (!write.big && write.begin < end && begin < write.end) {
+			if (!write.big && write.begin < end && begin < write.end && matches(write)) { // desport
 				found = i;
 				break;
 			}
@@ -687,17 +712,42 @@ uint64_t BufferCache::InflightWriteTick(uint64_t begin, uint64_t end, uint64_t c
 }
 
 bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_t>> ranges,
-                                     bool between_commands, uint64_t& wait_tick) {
+                                     bool between_commands, uint64_t& wait_tick, bool* async_producer) {
+	if (async_producer != nullptr) *async_producer = false; // desport: KYTY_ASYNC_COMPUTE
 	const auto mode = kyty_local_readback_queue_mode.load(std::memory_order_relaxed);
 	if (mode == 0 || m_graphics.readback_queue == nullptr || !m_gpu_writes_on) return false;
 	auto& master = m_scheduler.GetMasterSemaphore();
 	master.Refresh();
 	const uint64_t completed = master.KnownGpuTick();
 	uint64_t       producer  = 0;
-	for (const auto& [begin, end]: ranges)
-		producer = std::max(producer, InflightWriteTick(begin, end, completed, between_commands));
+	// desport: begin KYTY_ASYNC_COMPUTE. The graphics queue's writers and the async queue's apart: bytes whose in-flight
+	// writers are all async copy after the async timeline alone (between commands, for a guest readback: the async
+	// buffer of the open epoch is submitted first); writers of both queues keep the graphics path.
+	uint64_t async_writer = 0;
+	const bool with_async = master.AsyncEnabled();
+	for (const auto& [begin, end]: ranges) {
+		producer = std::max(producer, InflightWriteTick(begin, end, completed, between_commands,
+		                                                with_async ? WriteQueue::Gfx : WriteQueue::Any));
+		if (with_async)
+			async_writer = std::max(async_writer, InflightWriteTick(begin, end, completed, between_commands, WriteQueue::Async));
+	}
+	// desport: end KYTY_ASYNC_COMPUTE
 	// Writes before the log started are dated only once everything recorded then completed.
 	if (m_gpu_writes_from == UINT64_MAX || completed < m_gpu_writes_from) return false;
+	// desport: begin KYTY_ASYNC_COMPUTE
+	if (async_writer != 0) {
+		if (producer != 0) AsyncCompute::Add(AsyncCompute::RbMixed);
+		if (producer != 0 || !between_commands || async_producer == nullptr || async_writer == UINT64_MAX) return false;
+		// (A graphics flush: the async buffer goes first, and the next async dispatch gets a fresh epoch.)
+		if (async_writer >= m_scheduler.CurrentTick()) m_scheduler.Flush();
+		// (Never a wait on an async value no submission signals.)
+		if (async_writer > master.LastAsyncEpoch()) return false;
+		if (!m_readback_queue) m_readback_queue = std::make_unique<ReadbackQueue::Queue>(m_graphics);
+		wait_tick       = async_writer;
+		*async_producer = true;
+		return true;
+	}
+	// desport: end KYTY_ASYNC_COMPUTE
 	// Mode 2 waits for an unfinished last writer on the transfer queue; mode 3 does the same and
 	// compares every copy with a graphics-queue copy (the write log must know every writer).
 	if (producer != 0 && (mode < 2 || producer >= m_scheduler.CurrentTick())) return false;
@@ -706,6 +756,44 @@ bool BufferCache::ReadbackQueueReady(std::span<const std::pair<uint64_t, uint64_
 	wait_tick = std::max(producer, completed);
 	return true;
 }
+
+// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). GPU thread.
+bool BufferCache::AsyncWriteLogValid() {
+	if (!m_gpu_writes_on || m_gpu_writes_from == UINT64_MAX) return false;
+	return m_scheduler.GetMasterSemaphore().KnownGpuTick() >= m_gpu_writes_from;
+}
+
+bool BufferCache::InflightGfxWriteDependency(std::span<const std::pair<uint64_t, uint64_t>> ranges, uint64_t& epoch) {
+	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr ||
+	    !m_gpu_writes_on)
+		return false;
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const uint64_t completed = master.KnownGpuTick();
+	uint64_t       latest    = 0;
+	for (const auto& [begin, end]: ranges)
+		if (begin < end) latest = std::max(latest, InflightWriteTick(begin, end, completed, true, WriteQueue::Gfx));
+	if (m_gpu_writes_from == UINT64_MAX || completed < m_gpu_writes_from || latest == UINT64_MAX) return false;
+	epoch = latest;
+	return true;
+}
+
+void BufferCache::MarkAsyncWrites(uint64_t position) {
+	if (!m_gpu_write_last_async) m_gpu_write_last_async = std::make_unique<uint64_t[]>(GpuWriteCounters);
+	const uint64_t end = m_gpu_writes_base + m_gpu_writes.size();
+	for (uint64_t number = std::max(position, m_gpu_writes_base + m_gpu_writes_head); number < end; ++number) {
+		auto& write = m_gpu_writes[static_cast<size_t>(number - m_gpu_writes_base)];
+		write.async = true;
+		if (!write.big)
+			for (auto g = write.begin >> GpuWriteGranuleBits; g <= (write.end - 1) >> GpuWriteGranuleBits; ++g)
+				m_gpu_write_last_async[GpuWriteCounter(g)] = number + 1;
+	}
+	// Dated now, with the open epoch: the async buffer's (a graphics flush before the next point between commands would
+	// date them with the next epoch, which the async timeline may never reach).
+	auto& master = m_scheduler.GetMasterSemaphore();
+	(void)InflightWriteTick(0, 1, master.KnownGpuTick(), true, WriteQueue::Async);
+}
+// desport: end KYTY_ASYNC_COMPUTE
 
 // KYTY_READBACK_QUEUE=3. Any thread.
 void BufferCache::VerifyReadback(uint64_t address, const uint8_t* fast, const uint8_t* reference, uint64_t size,
@@ -747,7 +835,9 @@ void BufferCache::CopyGuestReadback(const std::shared_ptr<GuestReadback>& reques
 	}
 	if (request->queue_value != 0) {
 		m_readback_queue->Wait(request->queue_value);
-		m_scheduler.WaitPriorityOperations(request->producer_tick);
+		// desport: KYTY_ASYNC_COMPUTE: an async producer's epoch is no graphics tick: only the image downloads into the
+		// window it waits for (the priority operations up to the producer's epoch include the graphics backlog).
+		m_scheduler.WaitPriorityOperations(request->producer_async ? request->priority_tick : request->producer_tick);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(request->tick);
 		m_scheduler.WaitPriorityOperations(request->tick);
@@ -2452,11 +2542,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			});
 		}
 		if (request) {
-			const uint64_t wait_start = prefetch || lat ? PrefetchStats::NowNs() : 0; // desport
+			const uint64_t wait_start = prefetch || lat || request->producer_async ? PrefetchStats::NowNs() : 0; // desport
 			CopyGuestReadback(request);
 			if (prefetch) wait_ns += PrefetchStats::NowNs() - wait_start; // desport
+			if (request->producer_async) { // desport: KYTY_ASYNC_COMPUTE (an async epoch, not a graphics tick)
+				AsyncCompute::Add(AsyncCompute::RbAsync);
+				AsyncCompute::Add(AsyncCompute::RbAsyncNs, PrefetchStats::NowNs() - wait_start);
+			}
 			// desport: KYTY_READBACK_LATENCY: the graphics tick it waited for (on the copy queue: its producer's).
-			if (const uint64_t tick = request->queue_value != 0 ? request->producer_tick : request->tick; lat && tick != 0)
+			if (const uint64_t tick = request->queue_value != 0 ? request->producer_tick : request->tick;
+			    lat && tick != 0 && !request->producer_async)
 				ReadbackLatency::NoteRead(tick, lat_start, wait_start, ReadbackLatency::NowNs(), tick >= lat_current,
 				                          lat_driver);
 			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
@@ -3006,6 +3101,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			const std::unique_lock lock(m_gpu_modified_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
+		++m_binding_write_notes; // desport: KYTY_ASYNC_COMPUTE (a binding's own write, not an engine one)
 		NoteGpuWrite(vaddr, size);
 		Spec::NoteGpuWrite(vaddr, size);
 		LiveCounters::AddGranule(vaddr, LiveCounters::GGpuWrites, 1);
@@ -3249,6 +3345,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		Spec::NoteHostWrite(vaddr, size);
+		AsyncCompute::NoteCpWrite(vaddr, size); // desport: KYTY_ASYNC_COMPUTE (a CP write the guest sees now)
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);
 		std::fill(destination, destination + size / sizeof(uint32_t), value);
 		return;
@@ -3285,6 +3382,7 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 			spec->Journal(dst_vaddr, src_vaddr, static_cast<uint32_t>(size), true);
 			return;
 		}
+		AsyncCompute::NoteCpWrite(dst_vaddr, size); // desport: KYTY_ASYNC_COMPUTE (a CP write the guest sees now)
 		CopyGuestMemory(dst_vaddr, src_vaddr, size);
 		return;
 	}

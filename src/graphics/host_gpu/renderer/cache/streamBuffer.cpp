@@ -162,10 +162,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
 	// KYTY_READBACK_QUEUE: the transfer queue reads guest buffers and writes download buffers.
-	const uint32_t families[] {graphics.queue_family, graphics.readback_family};
-	if (graphics.readback_family != static_cast<uint32_t>(-1)) {
+	// desport: KYTY_ASYNC_COMPUTE: and the async-compute queue's family, when it has one of its own (its dispatches bind
+	// guest buffers and stream buffers; never images).
+	uint32_t families[3] {graphics.queue_family, 0, 0};
+	uint32_t family_count = 1;
+	if (graphics.readback_family != static_cast<uint32_t>(-1)) families[family_count++] = graphics.readback_family;
+	if (graphics.async_family != static_cast<uint32_t>(-1) && graphics.async_family != graphics.queue_family &&
+	    graphics.async_family != graphics.readback_family)
+		families[family_count++] = graphics.async_family;
+	if (family_count > 1) {
 		buffer_info.sharingMode           = vk::SharingMode::eConcurrent;
-		buffer_info.queueFamilyIndexCount = 2;
+		buffer_info.queueFamilyIndexCount = family_count;
 		buffer_info.pQueueFamilyIndices   = families;
 	}
 

@@ -40,6 +40,7 @@
 #include "loader/systemContent.h"
 #include "frame-gen.h"
 #include "driver-address-hole.h"
+#include "async-compute.h" // desport: KYTY_ASYNC_COMPUTE
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -621,7 +622,7 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priorities[2] = {1.0f, 1.0f};
+	const float               queue_priorities[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // desport: up to 3 (KYTY_ASYNC_COMPUTE=2)
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.sType            = vk::StructureType::eDeviceQueueCreateInfo;
 	queue_create_info.queueFamilyIndex = queue_family;
@@ -629,7 +630,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	queue_create_info.pQueuePriorities = queue_priorities;
 
 	// KYTY_READBACK_QUEUE: also a queue of a transfer-only family (the copy engine).
-	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {queue_create_info, queue_create_info};
+	// desport: KYTY_ASYNC_COMPUTE=1 adds a third (a compute-only family's queue).
+	std::array<vk::DeviceQueueCreateInfo, 3> queue_create_infos {queue_create_info, queue_create_info, queue_create_info};
 	uint32_t                                 queue_create_count = 1;
 	graphics.readback_family                                    = static_cast<uint32_t>(-1);
 #if defined(_WIN32)
@@ -664,6 +666,50 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 			}
 		}
 	}
+	// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). 1: queue 0 of a compute-only family (the one with the most
+	// queues; RTX: family 2, 8 queues). 2: one more queue of the graphics family. Streamline's interposer adds its own
+	// queues after the ones asked for here, in the same family (sl.interposer vulkan/wrapper.cpp: index += our count),
+	// so index 0 of the compute family stays ours with DLSS-G too.
+	graphics.async_family      = static_cast<uint32_t>(-1);
+	graphics.async_queue_index = 0;
+	if (const uint32_t async_mode = AsyncCompute::RequestedMode(); async_mode != 0) {
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		const char* refused = nullptr;
+		if (async_mode == 1) {
+			uint32_t best = static_cast<uint32_t>(-1);
+			for (uint32_t family = 0; family < family_count; ++family) {
+				const auto flags = families[family].queueFlags;
+				if (family == queue_family || family == graphics.readback_family || families[family].queueCount == 0 ||
+				    !(flags & vk::QueueFlagBits::eCompute) || (flags & vk::QueueFlagBits::eGraphics) ||
+				    families[family].timestampValidBits == 0)
+					continue;
+				if (best == static_cast<uint32_t>(-1) || families[family].queueCount > families[best].queueCount) best = family;
+			}
+			if (best == static_cast<uint32_t>(-1)) {
+				refused = "no_compute_family";
+			} else {
+				graphics.async_family                                     = best;
+				queue_create_infos[queue_create_count].queueFamilyIndex   = best;
+				queue_create_infos[queue_create_count].queueCount         = 1;
+				queue_create_infos[queue_create_count++].pQueuePriorities = queue_priorities;
+			}
+		} else if (queue_family < family_count &&
+		           families[queue_family].queueCount > queue_create_infos[0].queueCount) {
+			graphics.async_family            = queue_family;
+			graphics.async_queue_index       = queue_create_infos[0].queueCount;
+			queue_create_infos[0].queueCount = queue_create_infos[0].queueCount + 1;
+		} else {
+			refused = "graphics_family_full";
+		}
+		if (refused != nullptr) {
+			std::printf("DES_ASYNC_COMPUTE requested=%u applied=0 reason=%s\n", async_mode, refused);
+			std::fflush(stdout);
+		}
+	}
+	// desport: end KYTY_ASYNC_COMPUTE
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.sType = vk::StructureType::ePhysicalDeviceColorWriteEnableFeaturesEXT;
@@ -1460,6 +1506,20 @@ void WindowContext::CreateVulkan() {
 		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
 		EXIT_IF(graphic_ctx.readback_queue == nullptr);
 		DeviceFault::NoteQueue(graphic_ctx.readback_queue, "readback");
+	}
+	// desport: KYTY_ASYNC_COMPUTE: the queue VulkanCreateDevice asked for, and the boot line.
+	if (graphic_ctx.async_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.async_family, graphic_ctx.async_queue_index, &graphic_ctx.async_queue);
+		EXIT_IF(graphic_ctx.async_queue == nullptr);
+		DeviceFault::NoteQueue(graphic_ctx.async_queue, "async-compute");
+		const auto families = graphic_ctx.physical_device.getQueueFamilyProperties();
+		std::printf("DES_ASYNC_COMPUTE requested=%u applied=1 family=%u index=%u flags=%s family_queues=%u "
+		            "graphics_family=%u readback_family=%d unsafe=%u\n",
+		            AsyncCompute::RequestedMode(), graphic_ctx.async_family, graphic_ctx.async_queue_index,
+		            vk::to_string(families[graphic_ctx.async_family].queueFlags).c_str(),
+		            families[graphic_ctx.async_family].queueCount, queue_family,
+		            static_cast<int>(graphic_ctx.readback_family), AsyncCompute::Unsafe() ? 1u : 0u);
+		std::fflush(stdout);
 	}
 	Libs::Graphics::FrameGen::OnDevice(graphic_ctx.instance, graphic_ctx.physical_device, graphic_ctx.device);
 

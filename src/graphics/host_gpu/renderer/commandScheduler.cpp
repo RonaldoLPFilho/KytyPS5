@@ -12,12 +12,17 @@
 #endif
 #include "live-trace-gpu.h"
 #include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
+#include "async-compute.h"    // desport: KYTY_ASYNC_COMPUTE
+#include "loader/desport.h"   // desport: KYTY_ASYNC_COMPUTE (DES_ASYNC_COMPUTE line)
 #include "local-platform.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <optional>
+#include <fmt/format.h> // desport: KYTY_ASYNC_COMPUTE
+#include <mutex>
+#include <string>
 
 extern "C" {
 // Dispatches recorded per submission (KYTY_DISPATCH_BATCH).
@@ -57,11 +62,12 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 
 } // namespace
 
-CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master)
+CommandScheduler::CommandPool::CommandPool(GraphicContext& graphics, MasterSemaphore& master, uint32_t family)
     : m_graphics(graphics), m_master(master) {
-	EXIT_IF(graphics.queue_family == static_cast<uint32_t>(-1));
+	if (family == UINT32_MAX) family = graphics.queue_family; // desport: KYTY_ASYNC_COMPUTE (the async queue's family)
+	EXIT_IF(family == static_cast<uint32_t>(-1));
 	vk::CommandPoolCreateInfo create {};
-	create.queueFamilyIndex = graphics.queue_family;
+	create.queueFamilyIndex = family;
 	create.flags            = vk::CommandPoolCreateFlagBits::eTransient |
 	                          vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 	const auto result       = graphics.device.createCommandPool(&create, nullptr, &m_pool);
@@ -189,7 +195,16 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 			      ++next;
 		      }
 	      }
-      }) {}
+      }),
+      m_async_command(*this) {
+	// desport: KYTY_ASYNC_COMPUTE: the async queue's timeline, pool and epoch source (async-compute.h).
+	if (graphics.async_queue != nullptr && AsyncCompute::RequestedMode() != 0) {
+		m_master.EnableAsync();
+		m_async_pool = std::make_unique<CommandPool>(graphics, m_master, graphics.async_family);
+		AsyncCompute::g_epoch.store(&m_master.CurrentTickValue(), std::memory_order_release);
+		AsyncCompute::g_on.store(true, std::memory_order_release);
+	}
+}
 
 void CommandScheduler::CompleteDispatch() {
 	// Expose command-processor/GPU overlap without a host fence. Bound the
@@ -254,9 +269,11 @@ void CommandScheduler::CompleteDraws(uint32_t draws) {
 // 74.2 -> 75.9, low1 53.9 -> 55.4; Shrine standing unchanged (75.3 / 75.3).
 bool CommandScheduler::GpuBusy() {
 	const auto handed = m_driver_tick.load(std::memory_order_acquire);
-	if (m_master.IsFree(handed)) return false;
+	// desport: KYTY_ASYNC_COMPUTE: the graphics queue's own work (the known tick also waits for async epochs).
+	const auto done = [&] { return m_master.AsyncEnabled() ? m_master.IsGfxFree(handed) : m_master.IsFree(handed); };
+	if (done()) return false;
 	m_master.Refresh();
-	return !m_master.IsFree(handed);
+	return !done();
 }
 
 CommandScheduler::~CommandScheduler() {
@@ -283,6 +300,7 @@ void CommandScheduler::Shutdown() {
 		}
 		m_operation_state = OperationState::Draining;
 	}
+	SubmitAsync(); // desport: KYTY_ASYNC_COMPUTE
 	if (!m_command.IsInvalid()) {
 		Submit();
 	}
@@ -563,6 +581,7 @@ struct DeferredSubmit {
 	uint32_t             timestamp_slot;  // live trace (the last buffer the stream ends)
 	std::atomic<uint64_t>* driver_tick;   // CommandScheduler::m_driver_tick (GpuBusy)
 	MasterSemaphore*       master;        // desport: KYTY_READBACK_LATENCY (the timeline at the hand-over)
+	bool                   async;         // desport: KYTY_ASYNC_COMPUTE (an async-queue submission: tick = its epoch)
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
@@ -614,7 +633,7 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
 	submit.driver_tick->store(submit.tick, std::memory_order_release);
-	if (ReadbackLatency::Stats()) { // desport: KYTY_READBACK_LATENCY
+	if (ReadbackLatency::Stats() && !submit.async) { // desport: KYTY_READBACK_LATENCY (graphics ticks only)
 		submit.master->Refresh();
 		ReadbackLatency::NoteDriver(submit.tick, submit.master->KnownGpuTick());
 	}
@@ -712,6 +731,30 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		}
 		m_next_wait_semaphore = nullptr;
 	}
+	// desport: begin KYTY_ASYNC_COMPUTE. The epoch's async buffer goes first; this graphics submission then waits for the
+	// async timeline at the last async epoch (graphics after async in total order; once per async epoch: the graphics
+	// queue keeps its order).
+	if (m_async_pool != nullptr) {
+		SubmitAsync();
+		const uint64_t last = m_master.LastAsyncEpoch();
+		if (last > m_gfx_async_waited) {
+			if (!m_master.IsAsyncFree(last)) {
+				if (submit.num_wait_semaphores < SubmitInfo::MaxSemaphores) {
+					submit.AddWait(m_master.AsyncHandle(), last);
+				} else {
+					vk::SemaphoreWaitInfo wait {};
+					const auto            semaphore = m_master.AsyncHandle();
+					wait.semaphoreCount             = 1;
+					wait.pSemaphores                = &semaphore;
+					wait.pValues                    = &last;
+					EXIT_NOT_IMPLEMENTED(m_graphics.device.waitSemaphores(&wait, UINT64_MAX) != vk::Result::eSuccess);
+				}
+				AsyncCompute::Add(AsyncCompute::GfxWaits);
+			}
+			m_gfx_async_waited = last;
+		}
+	}
+	// desport: end KYTY_ASYNC_COMPUTE
 	// The work may run once submitted: the pages it writes are read-protected first.
 	PageManager::FlushDeferredProtection();
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
@@ -726,6 +769,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		deferred.tick = m_master.NextTick();
 		ReadbackLatency::NoteEnqueue(deferred.tick); // desport: KYTY_READBACK_LATENCY
 		deferred.master = &m_master;                 // desport
+		deferred.async  = false;                     // desport: KYTY_ASYNC_COMPUTE
 		submit.AddSignal(m_master.Handle(), deferred.tick);
 		deferred.count          = static_cast<uint32_t>(entries.size());
 		deferred.timestamp_slot = UINT32_MAX;
@@ -960,4 +1004,165 @@ void CommandScheduler::BeginNext() {
 	BeginCommand();
 }
 
+// desport: begin KYTY_ASYNC_COMPUTE (async-compute.h). GPU thread.
+CommandBuffer& CommandScheduler::AsyncCommand(uint64_t dependency) {
+	EXIT_IF(m_async_pool == nullptr || t_recorder != nullptr);
+	EXIT_IF(dependency >= m_master.CurrentTick());
+	if (m_async_command.IsInvalid()) {
+		// (One async submission an epoch: the async timeline's values only grow. RenderExecutor::DispatchDirect checks.)
+		EXIT_IF(AsyncEpochUsed());
+		m_async_command.m_buffer      = m_async_pool->Commit();
+		m_async_command.m_registers   = m_command.m_registers;
+		m_async_command.m_user_config = m_command.m_user_config;
+		m_async_command.m_shaders     = m_command.m_shaders;
+		m_async_command.Begin();
+		m_async_dispatches = 0;
+	}
+	m_async_dependency = std::max(m_async_dependency, dependency);
+	return m_async_command;
+}
+
+void CommandScheduler::CompleteAsyncDispatch() {
+	const auto batch = std::clamp(kyty_local_dispatch_batch.load(std::memory_order_relaxed), 1u, 65536u);
+	// (A graphics flush submits the async buffer first, and opens the next epoch for the next one.)
+	if (++m_async_dispatches >= batch) Flush();
+}
+
+void CommandScheduler::SubmitAsync() {
+	if (m_async_command.IsInvalid()) return;
+	EXIT_IF(t_recorder != nullptr || m_async_pool == nullptr);
+	m_async_command.EndRendering();
+	const uint64_t work_before = AsyncCompute::RecordedWork();
+	(void)m_async_command.Handle(); // (a pending compute chain barrier closes it)
+	AsyncCompute::t_slice.async_work += AsyncCompute::RecordedWork() - work_before; // (the async buffer's work)
+	const uint64_t epoch = m_master.CurrentTick();
+	SubmitInfo     submit;
+	if (m_async_dependency != 0 && !m_master.IsGfxFree(m_async_dependency)) m_master.Refresh();
+	if (m_async_dependency != 0 && !m_master.IsGfxFree(m_async_dependency)) {
+		submit.AddWait(m_master.Handle(), m_async_dependency);
+		AsyncCompute::Add(AsyncCompute::SubmitsWait);
+		AsyncCompute::Add(AsyncCompute::DepBacklog, m_async_dependency - m_master.KnownGfxTick());
+	}
+	submit.AddSignal(m_master.AsyncHandle(), epoch);
+	// (Before the hand-over: no Refresh may take the epoch for complete with the graphics timeline alone.)
+	m_master.NoteAsyncEpoch(epoch);
+	PageManager::FlushDeferredProtection();
+	const vk::CommandBuffer buffer = m_async_command.m_buffer;
+	auto&                   graphics = m_graphics;
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+	if (LocalVulkanRecording::DeferredSubmitEnabled()) {
+		DeferredSubmit deferred {};
+		deferred.tick            = epoch;
+		deferred.master          = &m_master;
+		deferred.async           = true;
+		deferred.count           = 1;
+		deferred.commands[0]     = buffer;
+		deferred.ended[0]        = false;
+		deferred.timestamp_slot  = UINT32_MAX; // (the live trace maps graphics ticks to slots)
+		deferred.driver_tick     = &m_async_driver_tick;
+		deferred.upload_sequence = AsyncUpload::SubmitSequence();
+		deferred.queue           = graphics.async_queue;
+		deferred.queue_mutex     = &graphics.async_queue_mutex;
+		deferred.waits           = submit.num_wait_semaphores;
+		deferred.signals         = submit.num_signal_semaphores;
+		for (uint32_t i = 0; i < deferred.waits; ++i) {
+			deferred.wait_semaphores[i] = submit.wait_semaphores[i];
+			deferred.wait_ticks[i]      = submit.wait_ticks[i];
+			deferred.wait_stages[i]     = static_cast<VkPipelineStageFlags>(submit.wait_stages[i]);
+		}
+		for (uint32_t i = 0; i < deferred.signals; ++i) {
+			deferred.signal_semaphores[i] = submit.signal_semaphores[i];
+			deferred.signal_ticks[i]      = submit.signal_ticks[i];
+		}
+		const LocalVulkanRecording::Segment segments[] {{&deferred, sizeof(deferred)}};
+		LocalVulkanRecording::NoteDeferredSubmitQueued();
+		if (!LocalVulkanRecording::EnqueueDeferred(ReplaySubmit, segments, true)) {
+			LocalVulkanRecording::Drain();
+			ReplaySubmit(segments, VULKAN_HPP_DEFAULT_DISPATCHER);
+		}
+	} else
+#endif
+	{
+		EXIT_NOT_IMPLEMENTED(buffer.end() != vk::Result::eSuccess);
+		AsyncUpload::Drain();
+		vk::TimelineSemaphoreSubmitInfo timeline_info {};
+		timeline_info.waitSemaphoreValueCount   = submit.num_wait_semaphores;
+		timeline_info.pWaitSemaphoreValues      = submit.wait_ticks.data();
+		timeline_info.signalSemaphoreValueCount = submit.num_signal_semaphores;
+		timeline_info.pSignalSemaphoreValues    = submit.signal_ticks.data();
+		vk::SubmitInfo submit_info {};
+		submit_info.pNext                = &timeline_info;
+		submit_info.waitSemaphoreCount   = submit.num_wait_semaphores;
+		submit_info.pWaitSemaphores      = submit.wait_semaphores.data();
+		submit_info.pWaitDstStageMask    = submit.wait_stages.data();
+		submit_info.commandBufferCount   = 1;
+		submit_info.pCommandBuffers      = &buffer;
+		submit_info.signalSemaphoreCount = submit.num_signal_semaphores;
+		submit_info.pSignalSemaphores    = submit.signal_semaphores.data();
+		vk::Result result;
+		{
+			Common::LockGuard lock(graphics.async_queue_mutex);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+			DeviceFault::NoteSubmit((uint64_t)(static_cast<VkSemaphore>(m_master.AsyncHandle())), epoch, // NOLINT
+			                        reinterpret_cast<const VkCommandBuffer*>(&buffer), 1,
+			                        reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()),
+			                        submit.wait_ticks.data(), submit.num_wait_semaphores);
+#endif
+			result = graphics.async_queue.submit(1, &submit_info, nullptr);
+			m_async_driver_tick.store(epoch, std::memory_order_release);
+		}
+		if (result != vk::Result::eSuccess) ReportVulkanFatal("vkQueueSubmit (async compute)", result, epoch, 0, 0, 0, 0, 0, 0, 0);
+		EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	}
+	m_async_command.m_buffer = nullptr;
+	m_async_epoch_submitted  = epoch;
+	m_async_dependency       = 0;
+	m_async_dispatches       = 0;
+	AsyncCompute::Add(AsyncCompute::Submits);
+	AsyncCompute::Report();
+}
+// desport: end KYTY_ASYNC_COMPUTE
+
 } // namespace Libs::Graphics
+
+// desport: KYTY_ASYNC_COMPUTE (async-compute.h). Any thread: every 5 s, "DES_ASYNC_COMPUTE t=<ms> window_ms=<ms>
+// candidates= async= fb_nolog= fb_images= fb_dma= fb_gds= fb_work= fb_notes= fb_sparse= fb_taa= fb_dep_open= fb_epoch=
+// table_skipped= submits= submits_wait= dep_backlog= dep_label= dep_writes= dep_wait= dep_own= gfx_waits= epoch_flushes=
+// rb_async= rb_async_wait_us= rb_mixed= slices=" (counts of the window; dep_backlog: the mean, over the submissions that
+// wait, of the graphics epochs still ahead of their dependency at the submission - compare lat_gpu_backlog;
+// rb_async_wait_us: the mean guest wait of those readbacks).
+void AsyncCompute::Report() {
+	namespace A = AsyncCompute;
+	static std::atomic<uint64_t> last_ms {0};
+	static uint64_t              last[A::Count] {};
+	static std::mutex            mutex;
+	const uint64_t               now      = Desport::ElapsedMilliseconds();
+	uint64_t                     previous = last_ms.load(std::memory_order_relaxed);
+	if (previous != 0 && now - previous < 5000) return;
+	std::unique_lock lock(mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return;
+	previous = last_ms.load(std::memory_order_relaxed);
+	if (previous != 0 && now - previous < 5000) return;
+	uint64_t d[A::Count];
+	for (size_t i = 0; i < A::Count; ++i) {
+		const uint64_t value = A::g_values[i].load(std::memory_order_relaxed);
+		d[i]                 = value - last[i];
+		last[i]              = value;
+	}
+	last_ms.store(now, std::memory_order_relaxed);
+	if (previous == 0) return;
+	const auto mean = [](uint64_t sum, uint64_t n, double scale) {
+		return n != 0 ? static_cast<double>(sum) / scale / static_cast<double>(n) : 0.0;
+	};
+	std::string out = fmt::format(
+	    "DES_ASYNC_COMPUTE t={} window_ms={} candidates={} async={} fb_nolog={} fb_images={} fb_dma={} fb_gds={} fb_work={} "
+	    "fb_notes={} fb_sparse={} fb_taa={} fb_dep_open={} fb_epoch={} table_skipped={}",
+	    now, now - previous, d[A::Candidates], d[A::Async], d[A::FbNoLog], d[A::FbImages], d[A::FbDma], d[A::FbGds],
+	    d[A::FbWork], d[A::FbNotes], d[A::FbSparse], d[A::FbTaa], d[A::FbDepOpen], d[A::FbEpoch], d[A::TableSkipped]);
+	out += fmt::format(" submits={} submits_wait={} dep_backlog={:.2f} dep_label={} dep_writes={} dep_wait={} dep_own={} "
+	                   "gfx_waits={} epoch_flushes={} rb_async={} rb_async_wait_us={:.1f} rb_mixed={} slices={}\n",
+	                   d[A::Submits], d[A::SubmitsWait], mean(d[A::DepBacklog], d[A::SubmitsWait], 1.0), d[A::DepLabel],
+	                   d[A::DepWrites], d[A::DepWait], d[A::DepOwn], d[A::GfxWaits], d[A::EpochFlushes], d[A::RbAsync],
+	                   mean(d[A::RbAsyncNs], d[A::RbAsync], 1e3), d[A::RbMixed], d[A::Slices]);
+	Desport::EmitLine(out);
+}
