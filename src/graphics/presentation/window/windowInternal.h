@@ -62,6 +62,10 @@ struct WindowContext {
 
 	Common::Mutex mutex;
 
+	// desport: S-001 minimized window (SDL events) and surface to refresh on restore; read by the present path
+	std::atomic_bool minimized     = false; // desport: S-001
+	std::atomic_bool surface_dirty = false; // desport: S-001
+
 	Common::Mutex                      main_task_mutex;
 	Common::CondVar                    main_task_done;
 	std::vector<std::function<void()>> main_tasks;            // guarded by main_task_mutex
