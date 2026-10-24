@@ -842,7 +842,8 @@ bool CaptureRequested() {
 
 bool Requested() {
 	// Present-id is enabled for the Reflex/frame-generation path.
-	return g_generate > 0 || g_fg_runtime_toggle;
+	// desport: DLSS SR loads Streamline too, whose common plugins enable VK_NV_low_latency2 (needs present-id).
+	return g_generate > 0 || g_fg_runtime_toggle || g_sr_mode != 0;
 }
 
 void BypassCommandHooks(vk::Device device) {
