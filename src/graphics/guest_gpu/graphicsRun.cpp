@@ -594,6 +594,17 @@ void CommandProcessor::DumpConstRam(uint32_t* dst, uint32_t offset, uint32_t dw_
 	memcpy(dst, m_const_ram + offset / 4, static_cast<size_t>(dw_num) * 4);
 }
 
+// desport: KYTY_READBACK_PREFETCH. Before a guest-visible label write (end of pipe, WRITE_DATA): the hot chunks GPU
+// work wrote get their snapshots behind that work (BufferCache::FlushReadbackPrefetch); the guest reads them after its
+// wait for the label ends.
+static void FlushReadbackPrefetch(RenderContext& renderer, bool state_only) {
+	if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) == 0 || state_only ||
+	    !renderer.GetCommandScheduler().Active())
+		return;
+	RenderLockGuard lock(renderer.GetMutex());
+	renderer.GetBufferCache().FlushReadbackPrefetch();
+}
+
 // A guest memory write of the command processor: now, or when a speculative translation is committed
 // (speculation-state.h), in order with its other writes.
 static void WriteGuestMemory(void* dst, const void* src, uint32_t size) {
@@ -712,6 +723,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 	LiveTrace::Event(LiveTrace::LabelWrite, reinterpret_cast<uint64_t>(dst),
 	                 src[write_one_address ? dw_num - 1 : 0] | uint64_t {2} << 56u);
+	FlushReadbackPrefetch(m_renderer, m_state_only); // desport: KYTY_READBACK_PREFETCH
 
 	if (write_one_address) {
 		WriteGuestMemory(dst, src + dw_num - 1, sizeof(uint32_t));
@@ -2297,6 +2309,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
+	FlushReadbackPrefetch(m_renderer, m_state_only); // desport: KYTY_READBACK_PREFETCH
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {
