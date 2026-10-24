@@ -49,6 +49,14 @@ void Unregister(Provider provider); // waits for a report in progress
 
 } // namespace Mem
 
+// desport: movie pacing. Bink movies advance one frame per flip, so with a 120 Hz virtual vblank they play twice as
+// fast. While a .bk2 file is open (the game keeps its movie open for the whole playback), the flip queue flips at most
+// every MovieFlipFloor()+1 vblanks (~60 flips a second). KYTY_MOVIE_PACING=0 turns it off.
+void MovieFileOpened(const char* guest_path);
+void MovieFileClosed(const char* guest_path);
+// Vblanks to leave between two flips while a movie plays (0: none, not playing, 60 Hz or less, or turned off).
+int MovieFlipFloor();
+
 namespace Stats {
 
 // DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as

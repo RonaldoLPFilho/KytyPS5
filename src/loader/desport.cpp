@@ -2,6 +2,7 @@
 // desport: Demon's Souls port layer (milestones, call tracing, game-specific HLE overrides).
 #include "loader/desport.h"
 
+#include "common/emulatorConfig.h" // desport: movie pacing
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
@@ -46,6 +47,25 @@ uint64_t ElapsedMs() {
 std::mutex            g_milestone_mutex;
 std::set<std::string> g_milestones;
 
+// desport: movie pacing (see desport.h). Number of .bk2 files open.
+std::atomic_int g_movie_files {0};
+
+bool MoviePacingEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MOVIE_PACING");
+		return value == nullptr || std::atoi(value) != 0;
+	}();
+	return enabled;
+}
+
+bool IsMoviePath(const char* path) {
+	if (path == nullptr) {
+		return false;
+	}
+	const std::string_view name(path);
+	return name.size() > 4 && (name.substr(name.size() - 4) == ".bk2" || name.substr(name.size() - 4) == ".BK2");
+}
+
 } // namespace
 
 void EmitLine(const std::string& text) { // desport: crash record
@@ -54,6 +74,40 @@ void EmitLine(const std::string& text) { // desport: crash record
 
 uint64_t ElapsedMilliseconds() { // desport: crash record
 	return ElapsedMs();
+}
+
+int MovieFlipFloor() {
+	if (g_movie_files.load(std::memory_order_relaxed) <= 0) {
+		return 0;
+	}
+	// 120 Hz -> 1 (flip every 2nd vblank at the soonest), 180 -> 2, 240 -> 3; below 100 Hz: left alone.
+	if (Config::GetVblankFrequency() < 100u) {
+		return 0;
+	}
+	return std::max(0, static_cast<int>((Config::GetVblankFrequency() + 30u) / 60u) - 1);
+}
+
+void MovieFileOpened(const char* guest_path) {
+	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
+		return;
+	}
+	if (g_movie_files.fetch_add(1) == 0 && Config::GetVblankFrequency() >= 100) {
+		Emit(fmt::format("DES_VBLANK movie_pacing on t={} file={} vblank={}Hz flip_floor={}\n", ElapsedMs(), guest_path,
+		                 Config::GetVblankFrequency(), MovieFlipFloor()));
+	}
+}
+
+void MovieFileClosed(const char* guest_path) {
+	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
+		return;
+	}
+	const int before = g_movie_files.fetch_sub(1);
+	if (before <= 0) {
+		g_movie_files.store(0); // a close we did not count
+	} else if (before == 1 && Config::GetVblankFrequency() >= 100) {
+		Emit(fmt::format("DES_VBLANK movie_pacing off t={} file={} vblank={}Hz\n", ElapsedMs(), guest_path,
+		                 Config::GetVblankFrequency()));
+	}
 }
 
 void Milestone(std::string_view name, std::string_view detail) {
