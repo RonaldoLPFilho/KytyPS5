@@ -69,6 +69,31 @@ const char*      g_sr_mode_name = "off";   // desport
 bool             g_sr_ready    = false;    // desport: the feature is loaded and supported (OnDevice)
 std::atomic_bool g_sr_failed {false};      // desport: given up (the game's TAA runs from then on)
 uint64_t         g_sr_frame    = 0;        // desport: Kyty.Gpu, guest frames (EndSrFrame / PrepareInputs)
+// desport: phase B (KYTY_DLSS with DLSS-G): Streamline frame indices come from one counter for every thread (the SR on
+// Kyty.Gpu, the present thread), so a guest frame's SR evaluate, constants, tags, markers and present share one index.
+std::atomic<uint32_t> g_next_frame_index {0}; // desport
+uint32_t         g_frame_token_index   = 0;     // desport: Kyty.Gpu, the current guest frame's index (0: none yet)
+bool             g_frame_constants_set = false; // desport: Kyty.Gpu, the SR set the current guest frame's constants
+const char*      g_reflex_name = "off";         // desport: the applied Reflex mode (DES_DLSS)
+
+uint32_t NextFrameIndex() { // desport
+	uint32_t index = g_next_frame_index.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (index == 0) index = g_next_frame_index.fetch_add(1, std::memory_order_relaxed) + 1u; // (0 means none)
+	return index;
+}
+
+// desport: the boot line for triage (tools/log_triage.py reads DES_* lines): what DLSS SR, DLSS-G and Reflex do.
+void LogDesDlss(const char* streamline) {
+	const bool combined = g_ready && g_sr_ready && g_sr_mode != 0;
+	std::printf("DES_DLSS sr=%s fg=%d reflex=%s sr_ready=%d fg_ready=%d combined=%d sr_viewport=%d f2=%d streamline=%s\n",
+	            g_sr_mode != 0 ? g_sr_mode_name : "off", g_generate, g_ready ? g_reflex_name : "off",
+	            g_sr_ready ? 1 : 0, g_ready ? 1 : 0, combined ? 1 : 0, combined ? 0 : 1, g_fg_runtime_toggle ? 1 : 0,
+	            streamline);
+	std::fflush(stdout);
+	LOGF("DES_DLSS sr=%s fg=%d reflex=%s sr_ready=%d fg_ready=%d combined=%d streamline=%s\n",
+	     g_sr_mode != 0 ? g_sr_mode_name : "off", g_generate, g_ready ? g_reflex_name : "off", g_sr_ready ? 1 : 0,
+	     g_ready ? 1 : 0, combined ? 1 : 0, streamline);
+}
 
 struct CaptureStats {
 	uint32_t frames = 0;
@@ -419,6 +444,7 @@ struct PresentTagStats {
 	uint32_t no_inputs = 0;
 	uint32_t reused_frames = 0;
 	uint32_t tag_failures = 0;
+	uint32_t sr_constants = 0; // desport: presents whose constants the DLSS SR set (phase B)
 	int32_t  last_tag_result = 0;
 	uint64_t first_guest_frame = 0;
 	uint64_t last_guest_frame = 0;
@@ -906,12 +932,7 @@ void Initialize() {
 		if (g_sr_mode == 0 && text != "off" && text != "0") {
 			std::printf("DLSS: KYTY_DLSS=%s is not off|dlaa|quality|balanced|performance|ultra_performance; off\n", dlss);
 		}
-		// desport: phase A: the SR and DLSS-G would share Streamline's frame tokens from two threads.
-		if (g_sr_mode != 0 && (requested_frames > 0 || g_fg_runtime_toggle)) {
-			LOGF("DLSS: KYTY_DLSS=%s with frame generation is not supported yet; DLSS SR off\n", dlss);
-			std::printf("DLSS: KYTY_DLSS=%s with frame generation is not supported yet; DLSS SR off\n", dlss);
-			g_sr_mode = 0;
-		}
+		// desport: phase B: with frame generation too, both share one frame index per guest frame (SrWithFrameGeneration).
 	}
 	// desport: end KYTY_DLSS
 	if (g_learning_enabled && (requested_frames > 0 || g_fg_runtime_toggle || g_sr_mode != 0)) { // desport: SR too
@@ -930,6 +951,7 @@ void Initialize() {
 		            g_fg_active.load(std::memory_order_relaxed) ? "on" : "off");
 	}
 	if (g_generate == 0 && !g_fg_runtime_toggle && g_sr_mode == 0) { // desport: Streamline for DLSS SR too
+		LogDesDlss("unused"); // desport
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -965,6 +987,7 @@ void Initialize() {
 		std::printf("Frame generation: cannot load %s\n", interposer.string().c_str());
 		g_generate = 0;
 		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
+		LogDesDlss("missing"); // desport
 		return;
 	}
 	const auto load = [&](auto& function, const char* name) {
@@ -979,8 +1002,10 @@ void Initialize() {
 	    !load(g_api.set_constants, "slSetConstants") ||
 	    !load(g_api.set_tag_for_frame, "slSetTagForFrame")) {
 		LOGF("frame generation: sl.interposer.dll lacks an entry point\n");
+		std::printf("Frame generation: sl.interposer.dll lacks an entry point\n"); // desport
 		g_generate = 0;
 		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
+		LogDesDlss("bad_interposer"); // desport
 		return;
 	}
 	static const std::wstring plugin_dir = dir.wstring();
@@ -1012,6 +1037,7 @@ void Initialize() {
 		}
 		if (features.empty()) {
 			g_generate = 0;
+			LogDesDlss("no_features"); // desport
 			return;
 		}
 	}
@@ -1037,6 +1063,7 @@ void Initialize() {
 		std::printf("Frame generation: slInit failed (%d)\n", static_cast<int>(result));
 		g_generate = 0;
 		g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
+		LogDesDlss("init_failed"); // desport
 		return;
 	}
 	// SDL loads the interposer as the Vulkan loader: every instance/device/swapchain call then
@@ -1049,6 +1076,7 @@ void Initialize() {
 	LOGF("frame generation: this build has no Streamline support\n");
 	g_generate = 0;
 	g_sr_mode  = 0; // desport: no Streamline, no DLSS SR
+	LogDesDlss("not_built"); // desport
 #endif
 }
 
@@ -1059,6 +1087,10 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 		return;
 	}
 #ifdef KYTY_FRAMEGEN_STREAMLINE
+	// desport: the DES_DLSS line once the device's features are known, whichever way OnDevice ends.
+	struct DesDlssAtExit {
+		~DesDlssAtExit() { LogDesDlss("loaded"); }
+	} des_dlss_at_exit;
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(physical_device);
 	bool loaded              = false;
@@ -1103,12 +1135,23 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 	reflex.mode            = sl::ReflexMode::eLowLatency;
 	const char* reflex_env = std::getenv("KYTY_FRAMEGEN_REFLEX");
 	if (reflex_env != nullptr && std::strcmp(reflex_env, "off") == 0) {
-		reflex.mode = sl::ReflexMode::eOff;
+		if (g_sr_ready) {
+			// desport: phase B: Reflex stays on with DLSS SR and frame generation together (DLSS-G paces with it).
+			LOGF("DLSS: KYTY_FRAMEGEN_REFLEX=off ignored with DLSS SR and frame generation; Reflex on\n");
+			std::printf("DLSS: KYTY_FRAMEGEN_REFLEX=off ignored with DLSS SR and frame generation; Reflex on\n");
+		} else {
+			reflex.mode = sl::ReflexMode::eOff;
+		}
 	} else if (reflex_env != nullptr && std::strcmp(reflex_env, "boost") == 0) {
 		reflex.mode = sl::ReflexMode::eLowLatencyWithBoost;
 	}
 	if (const auto result = g_api.reflex_set_options(reflex); result != sl::Result::eOk) {
 		LOGF("frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result));
+		std::printf("Frame generation: slReflexSetOptions failed (%d)\n", static_cast<int>(result)); // desport
+		g_reflex_name = "failed"; // desport
+	} else { // desport: DES_DLSS
+		g_reflex_name = reflex.mode == sl::ReflexMode::eOff ? "off"
+		                : reflex.mode == sl::ReflexMode::eLowLatency ? "on" : "boost";
 	}
 	std::printf("Frame generation: Reflex %s, slReflexSleep %s\n",
 	            reflex.mode == sl::ReflexMode::eOff ? "off" : reflex.mode == sl::ReflexMode::eLowLatency ? "on" : "on+boost",
@@ -1121,12 +1164,13 @@ void OnDevice(vk::Instance instance, vk::PhysicalDevice physical_device, vk::Dev
 }
 
 void BeforePresent(const FrameInputs* inputs, vk::Extent2D color_extent, vk::Extent2D backbuffer,
-                   vk::Rect2D region, vk::Format format, uint32_t image_count, bool reusing_last) {
+                   vk::Rect2D region, vk::Format format, uint32_t image_count, bool reusing_last,
+                   uint32_t token_index, bool constants_set) { // desport: phase B
 #ifdef KYTY_FRAMEGEN_STREAMLINE
 	if (!g_ready) {
 		return;
 	}
-	std::lock_guard api_lock(g_streamline_mutex);
+	std::unique_lock api_lock(g_streamline_mutex); // desport: released around slReflexSleep (the SR evaluates meanwhile)
 	const sl::ViewportHandle viewport {0};
 	// A minimized window presents a 0x0 back buffer: DLSS-G cannot be created for it (NGX 0xbad0000a every
 	// present until the window is back), so it is off while minimized and on again with the window.
@@ -1197,19 +1241,40 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D color_extent, vk::Ext
 		g_token = nullptr; // no frame for Streamline: the present goes out untagged
 		return;
 	}
-	++g_frame_index;
+	// desport: phase B: the frame index the DLSS SR evaluated this guest frame with (carried in FrameInputs), so its
+	// constants serve DLSS-G too; a frame without one (blank, reused, before the SR ran) or one older than the last
+	// present (indices must grow at the present) takes a new index and its own constants.
+	bool constants_ready = false;
+	if (SrWithFrameGeneration() && token_index != 0 && token_index > g_frame_index) {
+		g_frame_index   = token_index;
+		constants_ready = constants_set;
+	} else {
+		g_frame_index = NextFrameIndex();
+	}
 	if (g_api.get_new_frame_token(g_token, &g_frame_index) != sl::Result::eOk || g_token == nullptr) {
 		g_token = nullptr;
+		static std::atomic_bool logged {false}; // desport: say it once
+		if (!logged.exchange(true)) {
+			LOGF("frame generation: slGetNewFrameToken failed on the present thread (frame %u); presents go untagged\n",
+			     g_frame_index);
+			std::printf("Frame generation: slGetNewFrameToken failed on the present thread (frame %u); presents go "
+			            "untagged\n",
+			            g_frame_index);
+		}
 		return;
 	}
+	// desport: (g_token stays this index's slot through the sleep below: the renderer thread takes at most one new
+	// index a guest frame, far fewer than Streamline's ring of MAX_FRAMES_IN_FLIGHT = 6 tokens.)
 	auto& token = *g_token;
 	if (g_reflex_sleep && g_api.reflex_sleep != nullptr) {
+		api_lock.unlock(); // desport: the renderer thread's DLSS SR evaluate does not wait for the Reflex sleep
 		const auto sleep_begin = std::chrono::steady_clock::now();
 		g_api.reflex_sleep(token);
 		const double sleep_ms =
 		    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - sleep_begin).count();
 		g_sleep_ms_sum += sleep_ms;
 		g_sleep_ms_max = std::max(g_sleep_ms_max, sleep_ms);
+		api_lock.lock(); // desport
 	}
 	++g_present_tag_stats.presents;
 	if (usable) {
@@ -1310,8 +1375,10 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D color_extent, vk::Ext
 		constants.cameraFOV   = 2.0f * std::atan(1.0f / std::fabs(camera.sy));
 		constants.cameraAspectRatio = std::fabs(camera.sy / camera.sx);
 	}
-	if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk &&
-	    g_presents < 8) {
+	if (constants_ready) {
+		++g_present_tag_stats.sr_constants; // desport: phase B, set once by the DLSS SR for this frame index
+	} else if (const auto result = g_api.set_constants(constants, token, viewport); result != sl::Result::eOk &&
+	           g_presents < 8) {
 		LOGF("frame generation: slSetConstants failed (%d)\n", static_cast<int>(result));
 	}
 
@@ -1363,6 +1430,8 @@ void BeforePresent(const FrameInputs* inputs, vk::Extent2D color_extent, vk::Ext
 	(void)region;
 	(void)format;
 	(void)image_count;
+	(void)token_index;   // desport
+	(void)constants_set; // desport
 #endif
 }
 
@@ -1372,7 +1441,13 @@ void AfterPresent() {
 		return;
 	}
 	std::lock_guard api_lock(g_streamline_mutex);
-	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *g_token);
+	// desport: the token for the present's index again (the renderer thread's DLSS SR may have taken new tokens from
+	// Streamline's small ring since BeforePresent; the same index as the current one returns the same token).
+	sl::FrameToken* present_token = nullptr;
+	if (g_api.get_new_frame_token(present_token, &g_frame_index) != sl::Result::eOk || present_token == nullptr) {
+		present_token = g_token;
+	}
+	g_api.pcl_set_marker(sl::PCLMarker::ePresentEnd, *present_token);
 	const auto presents = ++g_presents;
 	if (presents % 300 == 0) {
 		const auto& stats = g_present_tag_stats;
@@ -1381,9 +1456,10 @@ void AfterPresent() {
 		     stats.presents, stats.tagged_inputs, stats.no_inputs, stats.reused_frames,
 		     stats.tag_failures, stats.last_tag_result, stats.first_guest_frame, stats.last_guest_frame);
 		std::printf("Frame generation: present tags last %u presents: tagged=%u no_inputs=%u reused=%u "
-		            "tag_failures=%u last_result=%d missing_tag_errors=%u mode=%s guest_frame=%" PRIu64 "..%" PRIu64 "\n",
+		            "tag_failures=%u sr_constants=%u last_result=%d missing_tag_errors=%u mode=%s guest_frame=%" PRIu64
+		            "..%" PRIu64 "\n", // desport: sr_constants (phase B)
 		            stats.presents, stats.tagged_inputs, stats.no_inputs, stats.reused_frames,
-		            stats.tag_failures, stats.last_tag_result,
+		            stats.tag_failures, stats.sr_constants, stats.last_tag_result,
 		            g_missing_tag_errors.exchange(0, std::memory_order_relaxed), g_options_fg_enabled ? "on" : "off",
 		            stats.first_guest_frame, stats.last_guest_frame);
 		if (stats.tagged_inputs != 0) {
@@ -1534,7 +1610,23 @@ void OnDispatch(uint64_t cs_hash, ImageId depth, uint64_t depth_address, ImageId
 void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer& command,
                    FrameInputs& inputs) {
 	inputs.valid = false;
+	// desport: phase B: every guest frame carries its Streamline frame index to the present (the one the DLSS SR
+	// evaluated with, else a new one taken here, in guest-frame order), F2 on or off.
+	inputs.token_index   = 0;
+	inputs.constants_set = false;
+	if (SrWithFrameGeneration()) {
+		if (g_frame_token_index == 0) g_frame_token_index = NextFrameIndex();
+		inputs.token_index    = g_frame_token_index;
+		inputs.constants_set  = g_frame_constants_set;
+		g_frame_token_index   = 0;
+		g_frame_constants_set = false;
+	}
 	if (!Enabled()) {
+		if (SrActive()) { // desport: F2 has DLSS-G off, the DLSS SR still runs: its camera ends at the flip
+			g_sources.valid = false;
+			EndSrFrame();
+			return;
+		}
 		// Keep the present-thread Streamline lifecycle alive for F2, but avoid copying the
 		// game's depth and motion images while frame generation is switched off.
 		g_sources.valid        = false;
@@ -1581,6 +1673,7 @@ void PrepareInputs(GraphicContext& graphics, TextureCache& cache, CommandBuffer&
 	g_learned_camera.valid = false;
 	g_learn_snapshot_count = 0;
 	++g_capture_frame;
+	++g_sr_frame; // desport: phase B, the DLSS SR's frame count (EndSrFrame's, which does not run with DLSS-G)
 	++g_guest_frame;
 	++g_capture_stats.frames;
 	if (!ready) {
@@ -1646,6 +1739,10 @@ bool SrRequested() {
 
 bool SrActive() {
 	return g_sr_ready && g_sr_mode != 0 && !g_sr_failed.load(std::memory_order_relaxed);
+}
+
+bool SrWithFrameGeneration() { // desport: phase B
+	return g_ready && SrActive();
 }
 
 void EndSrFrame() {
@@ -1804,7 +1901,6 @@ struct SrStats {
 SrLast    g_sr_last;
 SrOptions g_sr_options;
 SrStats   g_sr_stats;
-uint32_t  g_sr_token_index = 0;
 
 } // namespace
 #endif
@@ -1940,7 +2036,9 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 	}
 
 	std::lock_guard          api_lock(g_streamline_mutex);
-	const sl::ViewportHandle viewport {SrViewport};
+	// desport: phase B: with DLSS-G the SR uses its viewport (0), so one slSetConstants serves both features.
+	const bool               with_fg = SrWithFrameGeneration();
+	const sl::ViewportHandle viewport {with_fg ? 0u : SrViewport};
 	auto* const              native_command = static_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(command));
 	const bool               hdr            = hdr_forced ? hdr_setting : HdrFormat(in.format);
 	const vk::Extent2D       output_extent  = out.extent;
@@ -2084,16 +2182,26 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 		constants.cameraAspectRatio = std::fabs(frame.sy / frame.sx);
 	}
 
+	// desport: phase B: the guest frame's index (PrepareInputs carries it to the present); without DLSS-G a new one.
 	sl::FrameToken* token = nullptr;
-	const uint32_t  index = ++g_sr_token_index;
+	uint32_t        index = 0;
+	if (with_fg) {
+		if (g_frame_token_index == 0) g_frame_token_index = NextFrameIndex();
+		index = g_frame_token_index;
+	} else {
+		index = NextFrameIndex();
+	}
 	if (g_api.get_new_frame_token(token, &index) != sl::Result::eOk || token == nullptr) {
-		SrIssueOnce(SrIssueToken, "slGetNewFrameToken failed");
+		SrIssueOnce(SrIssueToken, "slGetNewFrameToken failed (frame %u, viewport %u)", index,
+		            static_cast<uint32_t>(viewport));
 		return false;
 	}
 	if (const auto result = g_api.set_constants(constants, *token, viewport); result != sl::Result::eOk) {
-		SrIssueOnce(SrIssueEvaluate, "slSetConstants failed (%d)", static_cast<int>(result));
+		SrIssueOnce(SrIssueEvaluate, "slSetConstants failed (%d, frame %u, viewport %u)", static_cast<int>(result), index,
+		            static_cast<uint32_t>(viewport));
 		return false;
 	}
+	if (with_fg) g_frame_constants_set = true; // desport: the present skips its own slSetConstants for this index
 	auto             depth_resource  = SrResource(slots[depth_slot]);
 	auto             motion_resource = SrResource(slots[motion_slot]);
 	auto             color_resource  = SrResource(in);
