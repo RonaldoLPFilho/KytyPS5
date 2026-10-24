@@ -149,6 +149,7 @@ void Milestone(std::string_view name, std::string_view detail) {
 //     (ms a frame; the render thread's, upload_wait any thread's) then, as counts in the window: sync_reads_guest=..
 //     sync_reads_render=.. rb_reject_size=.. rb_reject_backing=.. rb_reject_image=.. rb_reject_capacity=..
 //     sync_downloads=.. async_readbacks=.. pipeline_static_hits=.. pipeline_static_misses=.. pipeline_driver_hits=..
+//     prefetch_hits=.. prefetch_neighbors=.. prefetch_stale=.. prefetch_lost=.. (KYTY_READBACK_PREFETCH)
 // vN: frames that lasted N vblanks (flip to flip, rounded; v4p: 4 or more).
 namespace {
 
@@ -157,7 +158,9 @@ constexpr LiveCounters::Id PerfCounters[] = {
     LiveCounters::SyncReadsGuest,       LiveCounters::SyncReadsRender,     LiveCounters::RbRejectSize,
     LiveCounters::RbRejectBacking,      LiveCounters::RbRejectImage,       LiveCounters::RbRejectCapacity,
     LiveCounters::SyncDownloads,        LiveCounters::AsyncReadbacks,      LiveCounters::PipelineStaticHits,
-    LiveCounters::PipelineStaticMisses, LiveCounters::PipelineDriverHits};
+    LiveCounters::PipelineStaticMisses, LiveCounters::PipelineDriverHits,
+    LiveCounters::PrefetchHits,         LiveCounters::PrefetchNeighbors,   LiveCounters::PrefetchStale,
+    LiveCounters::PrefetchLost}; // desport: KYTY_READBACK_PREFETCH counters
 
 struct PerfSnapshot {
 	uint64_t flips     = 0;

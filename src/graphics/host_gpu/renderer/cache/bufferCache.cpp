@@ -108,6 +108,14 @@ constexpr const char* Names[Count] = {"prefetch_snapshots", "prefetch_bytes", "p
 std::atomic<uint64_t> g_values[Count] {};
 void Add(Id id, uint64_t n = 1) {
 	g_values[id].fetch_add(n, std::memory_order_relaxed);
+	// desport: mirrored into LiveCounters for the DES_FRAME line (desport.cpp)
+	switch (id) {
+		case Hits: LiveCounters::Add(LiveCounters::PrefetchHits, n); break;
+		case Neighbors: LiveCounters::Add(LiveCounters::PrefetchNeighbors, n); break;
+		case Stale: LiveCounters::Add(LiveCounters::PrefetchStale, n); break;
+		case Lost: LiveCounters::Add(LiveCounters::PrefetchLost, n); break;
+		default: break;
+	}
 }
 // GPU thread: TryReadCopyFeedback runs for the neighbor chunks of a hit (counted as neighbors, not hits).
 thread_local bool t_neighbor_pass = false;
