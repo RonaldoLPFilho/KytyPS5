@@ -1280,8 +1280,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		                                                         input_info.stage.program->shader_hash));
 	}
 	// desport: KYTY_GPU_PROFILE: what a bind of this pipeline runs (its dispatches' key; wave64 emulated on 32 lanes).
+	// (desport: and how: two lanes per invocation, lane-local, lockstep halves; GpuProfile::EmulatedTag.)
 	GpuProfile::NotePipeline(pipeline.pipeline, native_bindings ? GpuProfile::PipeCsTable : GpuProfile::PipeCsNormal, 0,
-	                         input_info.stage.program->shader_hash, wave_size, wave_size == 64u && subgroup == 32u);
+	                         input_info.stage.program->shader_hash, wave_size,
+	                         wave_size == 64u && subgroup == 32u
+	                             ? static_cast<uint8_t>(1u + input_info.stage.program->lane_mode)
+	                             : uint8_t {0});
 	if (PipelineSourceLog()) {
 		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f blob=%zu read_us=%.0f cache_us=%.0f "
 		            "create_us=%.0f\n",

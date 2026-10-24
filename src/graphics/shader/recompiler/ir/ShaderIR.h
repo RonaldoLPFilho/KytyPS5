@@ -642,6 +642,9 @@ struct CompiledShaderInfo {
 	TablePlan                     table_plan;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	// desport: how a wave64 compute program runs on 32-lane subgroups (KYTY_GPU_PROFILE's wave tag): 0 two GCN lanes per
+	// invocation, 1 lane-local (Program::lane_local), 2 lane-local with lockstep halves (Program::wave_uniform).
+	uint8_t                       lane_mode           = 0;
 };
 
 struct UniformFillPlan {

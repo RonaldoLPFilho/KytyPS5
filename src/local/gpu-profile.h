@@ -17,7 +17,7 @@
 //   union of the command buffers' [begin, end] on the GPU clock), span_ms (first begin to last end per window),
 //   frame_*_ms (per sampled window), coverage_pct (attributed / busy), dropped (no free query pair), lost, orphans.
 //   rank: calls, calls_per_frame, gpu_ms, ms_per_frame, pct (of busy), avg_us, max_us, target=<w>x<h> (draws) or
-//   groups=<x>x<y>x<z> (dispatches; "indirect"), wave (cs: 32/64, "64e" = wave64 emulated on 32 lanes), verts (draws:
+//   groups=<x>x<y>x<z> (dispatches; "indirect"), wave (cs: 32/64, "64e" = wave64 emulated on 32 lanes; desport: "64l" lane-local, "64s" lockstep halves), verts (draws:
 //   mean vertices x instances per call).
 // Streamline's and frame generation's own command buffers are never touched (they do not go through these entries).
 // The timestamps serialize the sampled window's draws: its frame runs slower than the others (compare with
@@ -83,8 +83,20 @@ struct PipeInfo {
 	uint64_t main     = 0; // graphics: the pixel shader's (0: none); compute: the compute shader's; unknown: the handle
 	uint8_t  pipe     = PipeUnknown;
 	uint8_t  wave     = 0; // compute: 32 or 64
-	uint8_t  emulated = 0; // compute: a wave64 program run on 32-lane subgroups
+	uint8_t  emulated = 0; // compute: a wave64 program run on 32-lane subgroups (desport: 1 two lanes per invocation,
+	                       // 2 lane-local, 3 lane-local with lockstep halves: EmulatedTag)
 };
+
+// desport: the wave tag of an emulated wave64 program ("64e" two GCN lanes per invocation, "64l" lane-local, "64s"
+// lane-local with lockstep halves, KYTY_WAVE64_MODE).
+inline const char* EmulatedTag(uint8_t emulated) {
+	switch (emulated) {
+		case 0: return "";
+		case 2: return "l";
+		case 3: return "s";
+		default: return "e";
+	}
+}
 
 inline bool Requested() {
 	static const bool on = [] {
@@ -104,14 +116,14 @@ inline uint64_t  HandleKey(VkPipeline pipeline) {
     return (uint64_t)(pipeline); // NOLINT (a pointer or an integer, by platform)
 }
 inline void NotePipeline(VkPipeline pipeline, uint8_t pipe, uint64_t vs, uint64_t main, uint32_t wave = 0,
-                         bool emulated = false) {
+                         uint8_t emulated = 0) { // desport: (PipeInfo::emulated)
 	if (!Requested() || pipeline == VK_NULL_HANDLE) return;
 	PipeInfo info;
 	info.vs       = vs;
 	info.main     = main;
 	info.pipe     = pipe;
 	info.wave     = static_cast<uint8_t>(wave);
-	info.emulated = emulated ? 1 : 0;
+	info.emulated = emulated;
 	std::lock_guard lock(g_pipelines.mutex);
 	g_pipelines.infos[HandleKey(pipeline)] = info;
 }
@@ -585,7 +597,7 @@ inline void Report(State& s, Window& w, uint64_t now, uint64_t window_ms, uint64
 		else if (compute) shape = fmt::format("groups={}x{}x{}", key.a, key.b, key.c);
 		else shape = fmt::format("target={}x{}", key.a, key.b);
 		std::string extra;
-		if (compute) extra = key.wave == 0 ? " wave=-" : fmt::format(" wave={}{}", key.wave, key.emulated != 0 ? "e" : "");
+		if (compute) extra = key.wave == 0 ? " wave=-" : fmt::format(" wave={}{}", key.wave, EmulatedTag(key.emulated));
 		else extra = fmt::format(" vs={:016x} verts={:.0f}", key.vs,
 		                         static_cast<double>(agg.work) / static_cast<double>(agg.calls));
 		Desport::EmitLine(fmt::format(

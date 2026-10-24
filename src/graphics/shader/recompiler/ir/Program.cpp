@@ -153,6 +153,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 			result.param_export_mask |= 1u << output.index;
 		}
 	}
+	result.lane_mode = static_cast<uint8_t>(lane_local ? (wave_uniform ? 2u : 1u) : 0u); // desport
 	return result;
 }
 
