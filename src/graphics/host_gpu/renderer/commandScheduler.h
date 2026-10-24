@@ -73,6 +73,8 @@ public:
 	// PendingTick on), which no GPU completion reaches; what it fences gets the real tick when it is committed.
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept;
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// desport: KYTY_READBACK_LATENCY: the last tick handed to the driver (any thread).
+	[[nodiscard]] uint64_t DriverTick() const noexcept { return m_driver_tick.load(std::memory_order_acquire); }
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }

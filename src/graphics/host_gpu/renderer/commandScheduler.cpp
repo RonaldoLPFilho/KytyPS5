@@ -11,6 +11,7 @@
 #include "device-fault.h"
 #endif
 #include "live-trace-gpu.h"
+#include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
 #include "local-platform.h"
 
 #include <algorithm>
@@ -561,6 +562,7 @@ struct DeferredSubmit {
 	uint64_t             upload_sequence; // KYTY_ASYNC_UPLOAD copies these buffers read
 	uint32_t             timestamp_slot;  // live trace (the last buffer the stream ends)
 	std::atomic<uint64_t>* driver_tick;   // CommandScheduler::m_driver_tick (GpuBusy)
+	MasterSemaphore*       master;        // desport: KYTY_READBACK_LATENCY (the timeline at the hand-over)
 };
 void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
                   const vk::detail::DispatchLoaderDynamic& dispatch) {
@@ -612,6 +614,10 @@ void ReplaySubmit(std::span<const LocalVulkanRecording::Segment> segments,
 		EXIT("deferred vkQueueSubmit failed: %d, tick=%" PRIu64 "\n", static_cast<int>(result), submit.tick);
 	}
 	submit.driver_tick->store(submit.tick, std::memory_order_release);
+	if (ReadbackLatency::Stats()) { // desport: KYTY_READBACK_LATENCY
+		submit.master->Refresh();
+		ReadbackLatency::NoteDriver(submit.tick, submit.master->KnownGpuTick());
+	}
 	LocalVulkanRecording::NoteDeferredSubmitDone();
 }
 // A recorded buffer dropped before submission, in order with the commands replayed into it.
@@ -668,6 +674,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	size_t                     n = 0;
 	if (!m_prologue.IsInvalid()) entries[n++] = ClosePrologue();
 	entries[n++]          = {m_command.m_buffer, false, m_command.m_timestamp_slot};
+	ReadbackLatency::t_submit_work = m_recorded_draws + m_recorded_dispatches; // desport: KYTY_READBACK_LATENCY
 	const auto tick       = SubmitBuffers({entries.data(), n}, submit);
 	m_command.m_buffer    = nullptr;
 	m_recorded_dispatches = 0;
@@ -717,6 +724,8 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		// This thread alone allocates ticks and the worker submits them in stream order: no queue
 		// lock here (it only waited for the worker's vkQueueSubmit, 1.2% of the render thread).
 		deferred.tick = m_master.NextTick();
+		ReadbackLatency::NoteEnqueue(deferred.tick); // desport: KYTY_READBACK_LATENCY
+		deferred.master = &m_master;                 // desport
 		submit.AddSignal(m_master.Handle(), deferred.tick);
 		deferred.count          = static_cast<uint32_t>(entries.size());
 		deferred.timestamp_slot = UINT32_MAX;
@@ -764,6 +773,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 	{
 		Common::LockGuard lock(graphics.queue_mutex);
 		tick = m_master.NextTick();
+		ReadbackLatency::NoteEnqueue(tick); // desport: KYTY_READBACK_LATENCY
 		submit.AddSignal(m_master.Handle(), tick);
 
 		vk::TimelineSemaphoreSubmitInfo timeline_info {};
@@ -792,6 +802,10 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 		m_driver_tick.store(tick, std::memory_order_release);
+	}
+	if (ReadbackLatency::Stats() && result == vk::Result::eSuccess) { // desport: KYTY_READBACK_LATENCY
+		m_master.Refresh();
+		ReadbackLatency::NoteDriver(tick, m_master.KnownGpuTick());
 	}
 
 	if (result != vk::Result::eSuccess) {

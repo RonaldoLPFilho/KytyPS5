@@ -6,6 +6,7 @@
 #include "native-buffer-residency.h"
 #include "local-platform.h"
 #include "native-resource-state.h"
+#include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
 
 #include <array>
 #include <atomic>
@@ -87,6 +88,10 @@ inline void InitializePerformanceSwitches() {
 	    // desport: readback prefetch (1: 64 KiB chunks; 2: the written ranges; 3: 2 + eager write-back and a submit at
 	    // the sync point)
 	    Switch {"KYTY_READBACK_PREFETCH", &kyty_local_readback_prefetch_mode, 0, 3},
+	    // desport: readback latency (1: counters, DES_READBACK_LAT; 2: counters and the async-compute yield), and the
+	    // draws or dispatches the graphics queue translates between two yields
+	    Switch {"KYTY_READBACK_LATENCY", &kyty_local_readback_latency_mode, 0, 2},
+	    Switch {"KYTY_READBACK_YIELD_WORK", &kyty_local_readback_yield_work, 1, 65536},
 	    Switch {"KYTY_READBACK_SLOTS", &kyty_local_readback_slots_mode},
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
@@ -177,6 +182,21 @@ inline void InitializePerformanceSwitches() {
 	            prefetch_mode >= 2 ? 16384u : 4096u,
 	            prefetch_mode == 0 ? "off" : prefetch_mode == 1 ? "chunk" : prefetch_mode == 2 ? "range" : "range_eager");
 	std::fflush(stdout);
+	// desport: KYTY_READBACK_LATENCY boot line (the yield needs no speculation: KYTY_SPECULATE=0).
+	{
+		const uint32_t latency_mode = kyty_local_readback_latency_mode.load(std::memory_order_relaxed);
+#if defined(KYTY_LOCAL_VULKAN_RECORDING)
+		const uint32_t deferred_submit = kyty_local_deferred_submit_mode.load(std::memory_order_relaxed);
+#else
+		const uint32_t deferred_submit = 0;
+#endif
+		std::printf("DES_READBACK_LAT mode=%u stats=%u yield=%u yield_work=%u speculate=%u deferred_submit=%u\n", latency_mode,
+		            latency_mode != 0 ? 1u : 0u,
+		            latency_mode >= 2 && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 ? 1u : 0u,
+		            kyty_local_readback_yield_work.load(std::memory_order_relaxed),
+		            kyty_local_speculate_mode.load(std::memory_order_relaxed), deferred_submit);
+		std::fflush(stdout);
+	}
 	// External tools find the render thread by this name (for example to pin it).
 	LocalPlatform::SetThreadName("Kyty.Gpu");
 	// KYTY_RENDER_CPUS (e.g. "1,2,3,6,7"): the CPUs this thread may run on; other threads are

@@ -10,6 +10,7 @@
 #include "async-upload.h"
 #include "parallel-pages.h"
 #include "readback-queue.h"
+#include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 #include "vulkan-recording.h"
 #endif
@@ -23,6 +24,10 @@ volatile std::atomic<uint32_t> kyty_local_copy_feedback_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_write_readback_mode {0};
 // desport: KYTY_READBACK_PREFETCH (BufferCache::FlushReadbackPrefetch).
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_prefetch_mode {0};
+// desport: KYTY_READBACK_LATENCY (readback-latency.h): 1 counters, 2 counters and the async-compute yield;
+// KYTY_READBACK_YIELD_WORK: draws or dispatches the graphics queue translates between two yields.
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_latency_mode {0};
+[[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_yield_work {16};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_readback_slots_mode {0};
 [[gnu::used]] volatile std::atomic<uint32_t> kyty_local_async_upload_mode {0};
 // 1: RangeSet fast paths (rangeSet.h) for the GPU-modified range set.
@@ -2287,6 +2292,62 @@ void BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// desport: KYTY_READBACK_LATENCY. Any thread, after a guest read: every 5 s, "DES_READBACK_LAT t=<ms> window_ms=<ms>
+// lat_waits=<n> lat_async=<n> lat_flushed=<n> lat_lost=<n> lat_submit_us= lat_worker_us= lat_gpu_us= lat_total_us=
+// lat_gpu_backlog= lat_drv_backlog= lat_tick_work= lat_wait_lt500us= lat_wait_lt1ms= lat_wait_lt2ms= lat_wait_lt4ms=
+// lat_wait_ge4ms= submits= submit_lag_us= submit_lag_max_us= worker_busy_pct= cq_subs= cq_wait_us= cq_wait_max_us=
+// gfx_slices= gfx_slice_us= gfx_slice_max_us= yields=" (readback-latency.h; the _us and backlog/work figures are means:
+// per wait with a breakdown, per submission, per async-compute submission, per graphics slice; the maxima of the window).
+static void ReportReadbackLatency() {
+	namespace L = ReadbackLatency;
+	static std::atomic<uint64_t> last_ms {0};
+	static uint64_t              last[L::Count] {};
+	static std::mutex            mutex;
+	const uint64_t               now      = Desport::ElapsedMilliseconds();
+	uint64_t                     previous = last_ms.load(std::memory_order_relaxed);
+	if (previous != 0 && now - previous < 5000) return;
+	std::unique_lock lock(mutex, std::try_to_lock);
+	if (!lock.owns_lock()) return;
+	previous = last_ms.load(std::memory_order_relaxed);
+	if (previous != 0 && now - previous < 5000) return;
+	const auto is_max = [](size_t i) { return i == L::SubmitLagMaxNs || i == L::CqWaitMaxNs || i == L::GfxSliceMaxNs; };
+	uint64_t   d[L::Count];
+	for (size_t i = 0; i < L::Count; ++i) {
+		if (is_max(i)) {
+			d[i] = L::g_values[i].exchange(0, std::memory_order_relaxed);
+			continue;
+		}
+		const uint64_t value = L::g_values[i].load(std::memory_order_relaxed);
+		d[i]                 = value - last[i];
+		last[i]              = value;
+	}
+	last_ms.store(now, std::memory_order_relaxed);
+	if (previous == 0) return;
+	const auto mean = [](uint64_t sum, uint64_t n, double scale) {
+		return n != 0 ? static_cast<double>(sum) / scale / static_cast<double>(n) : 0.0;
+	};
+	const uint64_t split  = d[L::Reads] > d[L::ReadsLost] ? d[L::Reads] - d[L::ReadsLost] : 0;
+	const uint64_t window = now - previous;
+	std::string    out    = fmt::format(
+        "DES_READBACK_LAT t={} window_ms={} lat_waits={} lat_async={} lat_flushed={} lat_lost={} lat_submit_us={:.1f} "
+        "lat_worker_us={:.1f} lat_gpu_us={:.1f} lat_total_us={:.1f} lat_gpu_backlog={:.2f} lat_drv_backlog={:.2f} "
+        "lat_tick_work={:.1f}",
+        now, window, d[L::Reads], d[L::ReadsAsync], d[L::ReadsFlushed], d[L::ReadsLost], mean(d[L::SubmitNs], split, 1e3),
+        mean(d[L::WorkerNs], split, 1e3), mean(d[L::GpuNs], split, 1e3), mean(d[L::TotalNs], split, 1e3),
+        mean(d[L::GpuBacklog], split, 1.0), mean(d[L::DrvBacklog], d[L::Reads], 1.0), mean(d[L::TickWork], split, 1.0));
+	out += fmt::format(" lat_wait_lt500us={} lat_wait_lt1ms={} lat_wait_lt2ms={} lat_wait_lt4ms={} lat_wait_ge4ms={}",
+	                   d[L::WaitLt500], d[L::WaitLt1000], d[L::WaitLt2000], d[L::WaitLt4000], d[L::WaitGe4000]);
+	out += fmt::format(" submits={} submit_lag_us={:.1f} submit_lag_max_us={:.1f} worker_busy_pct={:.1f}", d[L::Submits],
+	                   mean(d[L::SubmitLagNs], d[L::Submits], 1e3), static_cast<double>(d[L::SubmitLagMaxNs]) / 1e3,
+	                   window != 0 ? static_cast<double>(d[L::WorkerBusyNs]) / 1e4 / static_cast<double>(window) : 0.0);
+	out += fmt::format(" cq_subs={} cq_wait_us={:.1f} cq_wait_max_us={:.1f} gfx_slices={} gfx_slice_us={:.1f} "
+	                   "gfx_slice_max_us={:.1f} yields={}\n",
+	                   d[L::CqSubs], mean(d[L::CqWaitNs], d[L::CqSubs], 1e3), static_cast<double>(d[L::CqWaitMaxNs]) / 1e3,
+	                   d[L::GfxSlices], mean(d[L::GfxSliceNs], d[L::GfxSlices], 1e3),
+	                   static_cast<double>(d[L::GfxSliceMaxNs]) / 1e3, d[L::Yields]);
+	Desport::EmitLine(out);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	Desport::Stats::Scope desport_stat("readback", size, vaddr); // desport: DES_STATS readback cost
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -2322,6 +2383,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		// desport: (diagnostics) the fault's time: the read's whole time, its first render-thread turn, its waits.
 		const uint64_t started       = prefetch ? PrefetchStats::NowNs() : 0;
 		uint64_t       prefetch_tick = 0;
+		// desport: KYTY_READBACK_LATENCY counters: the read's start, the last tick handed to the driver then, and the
+		// tick being recorded at the render thread's turn (a tick from it on was submitted by this read).
+		const bool     lat         = ReadbackLatency::Stats();
+		const uint64_t lat_start   = lat ? ReadbackLatency::NowNs() : 0;
+		const uint64_t lat_driver  = lat ? m_scheduler.DriverTick() : 0;
+		uint64_t       lat_current = UINT64_MAX;
 		uint64_t       wait_ns       = 0;
 		if (prefetch) { // desport: sync_age
 			const uint64_t sync = PrefetchStats::g_last_sync_ns.load(std::memory_order_relaxed);
@@ -2349,6 +2416,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		};
 		gpu.SendCommandSync([&] {
 			if (prefetch) PrefetchStats::Add(PrefetchStats::TurnNs, PrefetchStats::NowNs() - started); // desport
+			if (lat) lat_current = m_scheduler.CurrentTick();                                          // desport
 			// desport: KYTY_READBACK_PREFETCH (1: chunk table, 2/3: range table)
 			const bool hot = prefetch && (prefetch_mode == 1 ? NotePrefetchRead(vaddr, size) : NotePrefetchRead2(vaddr, size));
 			if (prefetch) ReportReadbackPrefetch(); // desport
@@ -2373,6 +2441,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_scheduler.GetMasterSemaphore().Wait(prefetch_tick);
 			m_scheduler.WaitPriorityOperations(prefetch_tick);
 			wait_ns += PrefetchStats::NowNs() - wait_start;
+			if (lat) // desport: KYTY_READBACK_LATENCY
+				ReadbackLatency::NoteRead(prefetch_tick, lat_start, wait_start, ReadbackLatency::NowNs(),
+				                          prefetch_tick >= lat_current, lat_driver);
 			PrefetchStats::Add(PrefetchStats::Waits);
 			gpu.SendCommandSync([&] {
 				if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
@@ -2381,9 +2452,13 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			});
 		}
 		if (request) {
-			const uint64_t wait_start = prefetch ? PrefetchStats::NowNs() : 0; // desport
+			const uint64_t wait_start = prefetch || lat ? PrefetchStats::NowNs() : 0; // desport
 			CopyGuestReadback(request);
 			if (prefetch) wait_ns += PrefetchStats::NowNs() - wait_start; // desport
+			// desport: KYTY_READBACK_LATENCY: the graphics tick it waited for (on the copy queue: its producer's).
+			if (const uint64_t tick = request->queue_value != 0 ? request->producer_tick : request->tick; lat && tick != 0)
+				ReadbackLatency::NoteRead(tick, lat_start, wait_start, ReadbackLatency::NowNs(), tick >= lat_current,
+				                          lat_driver);
 			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
 				// An overlapping access may already have retired this request.
 				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
@@ -2395,6 +2470,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			PrefetchStats::Add(PrefetchStats::GuestReadNs, PrefetchStats::NowNs() - started);
 			PrefetchStats::Add(PrefetchStats::WaitNs, wait_ns);
 		}
+		if (lat) ReportReadbackLatency(); // desport: KYTY_READBACK_LATENCY
 		return;
 	}
 	LiveCounters::Add(GuestGpu::IsGpuThread() ? LiveCounters::SyncReadsRender : LiveCounters::SyncReadsGuest);

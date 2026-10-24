@@ -3,6 +3,7 @@
 #include "live-census.h"
 #include "live-counters.h"
 #include "live-trace-gpu.h"
+#include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
 #include "local-platform.h"
 #include "time-census.h"
 
@@ -278,12 +279,15 @@ private:
             }
             if (stopping.load(std::memory_order_acquire)) return;
             auto& chunk = chunks[current % ChunkCount];
+            // desport: KYTY_READBACK_LATENCY: the worker's busy time (worker_busy_pct).
+            const uint64_t busy_from = ReadbackLatency::Stats() ? ReadbackLatency::NowNs() : 0;
             for (auto offset = chunk.first; offset != End;) {
                 const auto* header = reinterpret_cast<const Header*>(chunk.data.data() + offset);
                 header->execute(chunk.data.data() + header->payload);
                 if (header->destroy) header->destroy(chunk.data.data() + header->payload);
                 offset = header->next;
             }
+            if (busy_from != 0) ReadbackLatency::Add(ReadbackLatency::WorkerBusyNs, ReadbackLatency::NowNs() - busy_from);
             chunk.used = 0;
             chunk.count = 0;
             chunk.first = chunk.last = End;
