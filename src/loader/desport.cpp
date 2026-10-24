@@ -125,6 +125,12 @@ void Add(const char* name, uint64_t ns, uint64_t bytes, uint64_t vaddr) {
 	if (!Enabled()) {
 		return;
 	}
+	// A single call over a second is logged on its own: long stalls (a 30 s freeze in the first soak)
+	// must not hide in a 5 s total.
+	if (ns >= 1'000'000'000ull) {
+		Emit(fmt::format("DES_SLOW t={} name={} ms={:.0f} vaddr=0x{:x}\n", ElapsedMs(), name,
+		                  static_cast<double>(ns) / 1e6, vaddr));
+	}
 	auto&            state = GetState();
 	std::string      out;
 	{

@@ -6,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
+#include "loader/desport.h" // desport: DES_STATS
 #include <windows.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
@@ -1271,6 +1272,7 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
+	Desport::Stats::Scope desport_stat("net_resolve"); // desport: DES_STATS/DES_SLOW blocking DNS
 	PRINT_NAME();
 
 	LOGF("\t rid      = %d\n"
@@ -1713,6 +1715,7 @@ int KYTY_SYSV_ABI Bind(int s, const void* addr, uint32_t addrlen) {
 }
 
 int KYTY_SYSV_ABI Connect(int s, const void* addr, uint32_t addrlen) {
+	Desport::Stats::Scope desport_stat("net_connect"); // desport: DES_STATS/DES_SLOW blocking connects
 	PRINT_NAME();
 
 	LOGF("\t s       = %d\n"
