@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 #include "common/virtualMemory.h"
 #include "kernel/memory.h"
+#include "local-platform.h" // desport: DES_MEM process memory
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -90,6 +91,87 @@ void FlipMilestone(bool from_gpu) {
 	}
 }
 
+
+namespace Mem {
+
+namespace {
+
+struct State {
+	std::mutex            mutex; // held while the providers run
+	std::vector<Provider> providers;
+	std::once_flag        started;
+	uint64_t              report_t = 0;
+};
+
+// Leaked: the reporter thread may run past the static destructors at exit.
+State& GetState() {
+	static State* state = new State;
+	return *state;
+}
+
+void EmitCategory(const char* name, uint64_t bytes, uint64_t count) {
+	Emit(fmt::format("DES_MEM t={} name={} bytes={} count={}\n", GetState().report_t, name, bytes, count));
+}
+
+void Report() {
+	auto&            state = GetState();
+	std::scoped_lock lock(state.mutex);
+	state.report_t = ElapsedMs();
+	const auto process = LocalPlatform::ProcessMemory();
+	EmitCategory("process_private", process.private_bytes, 0);
+	EmitCategory("process_working_set", process.working_set, 0);
+	for (const auto provider: state.providers) {
+		provider(&EmitCategory);
+	}
+}
+
+void ReporterLoop() {
+	uint64_t interval = 30;
+	if (const char* value = std::getenv("DES_MEM_INTERVAL_S"); value != nullptr && std::atoi(value) > 0) {
+		interval = static_cast<uint64_t>(std::atoi(value));
+	}
+	std::this_thread::sleep_for(std::chrono::seconds(5)); // the first report: the owners have registered by now
+	for (;;) {
+		Report();
+		std::this_thread::sleep_for(std::chrono::seconds(interval));
+	}
+}
+
+} // namespace
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* mem   = std::getenv("DES_MEM");
+		const char* stats = std::getenv("DES_STATS");
+		return (mem != nullptr && mem[0] == '1') || (stats != nullptr && stats[0] == '1');
+	}();
+	return enabled;
+}
+
+void Register(Provider provider) {
+	if (!Enabled() || provider == nullptr) {
+		return;
+	}
+	auto& state = GetState();
+	{
+		std::scoped_lock lock(state.mutex);
+		if (std::find(state.providers.begin(), state.providers.end(), provider) == state.providers.end()) {
+			state.providers.push_back(provider);
+		}
+	}
+	std::call_once(state.started, [] { std::thread(ReporterLoop).detach(); });
+}
+
+void Unregister(Provider provider) {
+	if (!Enabled()) {
+		return;
+	}
+	auto&            state = GetState();
+	std::scoped_lock lock(state.mutex);
+	state.providers.erase(std::remove(state.providers.begin(), state.providers.end(), provider), state.providers.end());
+}
+
+} // namespace Mem
 
 namespace Stats {
 
