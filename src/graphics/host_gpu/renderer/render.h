@@ -236,6 +236,14 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings, bool compute_chain = false);
+	// desport: KYTY_DLSS_UPSCALE: one texture of the next CommitBindings sampled through another view (layout General)
+	// after its transitions: the DLSS output in place of the TAA output (renderDraw.cpp). Cleared by that call.
+	struct DesportImageSwap {
+		const PreparedBindings* stage = nullptr;
+		uint32_t                index = 0;
+		vk::ImageView           view  = nullptr;
+	};
+	DesportImageSwap m_desport_image_swap; // desport
 
 private:
 	[[nodiscard]] bool ReadOnlyDrawBufferRangeSafe(GuestRange range, const DrawRenderState& state,

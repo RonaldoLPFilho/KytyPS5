@@ -150,6 +150,8 @@ struct SrSlot {
 	vk::ImageUsageFlags usage {};
 	uint32_t            base_level = 0, level_count = 1, layer_count = 1;
 	bool                written = false, storage = false;
+	uint64_t            address = 0;      // desport: KYTY_DLSS_UPSCALE: the guest address of the bound image
+	vk::Extent2D        guest_extent {};  // desport: KYTY_DLSS_UPSCALE: the guest descriptor's size
 };
 // desport: KYTY_DLSS asked for a mode (process start).
 [[nodiscard]] bool SrRequested();
@@ -158,8 +160,23 @@ struct SrSlot {
 // desport: renderer thread, in place of the TAA dispatch, after its bindings were committed (the images are in
 // their binding layouts): records DLSS SR into `command`, writing the TAA's output image. False: nothing recorded,
 // the caller runs the game's dispatch.
+// desport: upscale = KYTY_DLSS_UPSCALE (SrUpscale()): called after the game's TAA dispatch ran instead, DLSS writes
+// an image of the output size (SrUpscaledView) and the TAA's own output is left as the dispatch wrote it.
 [[nodiscard]] bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs_hash,
-                              std::span<const SrSlot> slots);
+                              std::span<const SrSlot> slots, bool upscale = false);
+// desport: KYTY_DLSS_UPSCALE=1 (with KYTY_DLSS; default off): real upscaling. The game renders its scene at the render
+// size (the mode's share of the output: DemonsSoulsRenderSize, or KYTY_ULTRAWIDE_RENDER's RenderHeightFor) and its
+// TAA still runs at that size (its output feeds the bloom chain); DLSS then reconstructs from the TAA's inputs into an
+// image of the output size, which the draw that scales the TAA output up to the output size (01.007.000: the scene
+// composite, ps 0x95318d27a44b0dd5; any draw sampling the TAA output into a larger color target, or only
+// KYTY_DLSS_UPSCALE_PS=<hex>) samples instead: that draw then runs 1:1. The output size is learned from that draw
+// (the first frame keeps the game's own upscale).
+[[nodiscard]] bool SrUpscale();
+// desport: renderer thread, a draw's texture: the DLSS output's view (layout General) to sample in place of the guest
+// image at `address` (guest size `extent`) for a draw with pixel shader `ps_hash` into a color target of `target`
+// size; nullptr: the texture as it is.
+[[nodiscard]] vk::ImageView SrUpscaledView(uint64_t ps_hash, uint64_t address, vk::Extent2D extent,
+                                           vk::Extent2D target);
 // desport: at the guest flip when the DLSS-G capture does not run (PrepareInputs): ends the frame's camera.
 void EndSrFrame();
 // desport: phase B: DLSS SR and DLSS-G both ready (the SR shares DLSS-G's viewport and frame indices).

@@ -1132,9 +1132,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// desport: begin DLSS SR/DLAA (KYTY_DLSS) in place of the game's TAA dispatch. CommitBindings put every image
 	// in its binding layout (storage output: General); DLSS writes the TAA's output image and the dispatch is
 	// skipped. Anything DLSS cannot do falls back to the dispatch (EvaluateSr logs why, once).
-	if (FrameGen::SrActive() && FrameGen::IsTaaShader(program.shader_hash) && indirect_args == 0) {
-		auto&                         textures = m_context.GetTextureCache();
-		std::vector<FrameGen::SrSlot> sr_slots(bindings.images.size());
+	// desport: with KYTY_DLSS_UPSCALE (sr_upscale) the dispatch runs and DLSS follows it (after the dispatch below),
+	// writing an output-size image of its own.
+	const bool sr_taa     = FrameGen::SrActive() && FrameGen::IsTaaShader(program.shader_hash) && indirect_args == 0; // desport
+	const bool sr_upscale = sr_taa && FrameGen::SrUpscale(); // desport: KYTY_DLSS_UPSCALE
+	std::vector<FrameGen::SrSlot> sr_slots;                   // desport
+	if (sr_taa) {
+		auto& textures = m_context.GetTextureCache();
+		sr_slots.resize(bindings.images.size()); // desport
 		for (size_t i = 0; i < bindings.images.size(); ++i) {
 			const auto& binding = bindings.images[i];
 			auto&       slot    = sr_slots[i];
@@ -1154,7 +1159,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 				slot.written = program.info.images[i].written;
 				slot.storage = program.info.images[i].resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 			}
+			slot.address      = binding.desc.info.data.address;                                   // desport: KYTY_DLSS_UPSCALE
+			slot.guest_extent = {binding.desc.info.extent.width, binding.desc.info.extent.height}; // desport
 		}
+	}
+	if (sr_taa && !sr_upscale) { // desport: KYTY_DLSS_UPSCALE runs DLSS after the dispatch instead
 		// Handle() records a compute chain's pending barrier; earlier shader reads finish before DLSS writes.
 		auto sr_buffer = buffer.Handle();
 		ShaderWriteHazardBarrier(sr_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -1234,6 +1243,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	} else {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	// desport: begin KYTY_DLSS_UPSCALE: the game's TAA ran (its render-size output feeds the bloom chain); DLSS reads
+	// the same inputs (still in their binding layouts) and writes its output-size image, which the draw that scales the
+	// TAA output up samples instead (FrameGen::SrUpscaledView). If DLSS records nothing, that draw keeps the TAA output.
+	if (sr_upscale) {
+		// Handle() records a chain's pending barrier (the TAA's writes first); the previous frame's reads of the DLSS
+		// image finish before DLSS writes it again.
+		auto sr_buffer = buffer.Handle();
+		ShaderWriteHazardBarrier(sr_buffer, vk::PipelineStageFlagBits::eComputeShader);
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		LocalVulkanRecording::Drain(); // (NGX records through its own Vulkan entry points)
+#endif
+		if (FrameGen::EvaluateSr(m_context.GetGraphics(), sr_buffer, program.shader_hash, sr_slots, true)) {
+			ShaderAccessBarrier(sr_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			buffer.InvalidateGraphicsState();
+		}
+	}
+	// desport: end KYTY_DLSS_UPSCALE
 	ResetBindings();
 	m_context.GetCommandScheduler().CompleteDispatch();
 	phase.reset();

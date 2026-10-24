@@ -1662,6 +1662,28 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (bindings.pixel) {
 		descriptor_stages[1] = &*bindings.pixel;
 	}
+	// desport: begin KYTY_DLSS_UPSCALE: the draw that samples this frame's TAA output into a larger color target (the
+	// scene composite that scales it up to the output size) samples DLSS's output-size image instead, so it runs 1:1.
+	// FrameGen::SrUpscaledView decides (and learns the output size from this draw); CommitBindings swaps the view.
+	m_desport_image_swap = {};
+	if (FrameGen::SrUpscale() && bindings.pixel.has_value() && state.color_count > 0 && state.color_info[0].image_id) {
+		const auto     target = state.color_info[0].Extent();
+		const uint64_t ps     = state.ps_active && state.ps_input_info.stage.program != nullptr
+		                            ? state.ps_input_info.stage.program->shader_hash
+		                            : 0;
+		for (uint32_t i = 0; i < bindings.pixel->images.size(); ++i) {
+			const auto& texture = bindings.pixel->images[i];
+			if (!texture.mip_views.empty()) continue;
+			const auto& info = texture.desc.info;
+			if (const auto view = FrameGen::SrUpscaledView(ps, info.data.address, {info.extent.width, info.extent.height},
+			                                               target);
+			    view != nullptr) {
+				m_desport_image_swap = {&*bindings.pixel, i, view};
+				break;
+			}
+		}
+	}
+	// desport: end KYTY_DLSS_UPSCALE
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
 	if (mesh_active) {

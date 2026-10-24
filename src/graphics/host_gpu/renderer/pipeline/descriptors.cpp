@@ -1498,8 +1498,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		}
+		// desport: KYTY_DLSS_UPSCALE (m_desport_image_swap): the DLSS output, kept in General, in place of this texture.
+		if (m_desport_image_swap.stage == prepared && m_desport_image_swap.index < descriptors.images.size() &&
+		    descriptors.images[m_desport_image_swap.index].mip_views.empty()) {
+			descriptors.images[m_desport_image_swap.index].image_view = m_desport_image_swap.view; // desport
+			descriptors.images[m_desport_image_swap.index].layout     = vk::ImageLayout::eGeneral; // desport
+		}
 
 	}
+	m_desport_image_swap = {}; // desport: KYTY_DLSS_UPSCALE, this call's only
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	if (RecordLocalDescriptors(m_context, vk_buffer, pipeline_bind_point, pipeline,
 	                           prepared_bindings, m_descriptor_buffers, m_descriptor_images)) return;
