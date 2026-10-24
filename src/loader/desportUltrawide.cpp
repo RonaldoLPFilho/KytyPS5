@@ -416,7 +416,9 @@ void InstallHudLayout(const Loader::Program& program, const char* setting) {
 		Report("DES_ULTRAWIDE hud_layout skipped: the UI layout rectangle function not found"); // desport
 		return;                                                                                 // desport
 	}
-	constexpr uint64_t WrapperOffset = 0x8101000; // desport: next to the HUD size copy (0x8100000)
+	// desport: next to the HUD size copy (0x8100000); fixed-address reservations on Windows need 64 KiB alignment
+	// (0x8101000 always failed with "could not allocate the wrapper near the program").
+	constexpr uint64_t WrapperOffset = 0x8110000;
 	constexpr uint64_t WrapperSize   = 0x1000;    // desport
 	if (program.mapped_size >= WrapperOffset || program.base_vaddr > UINT64_MAX - WrapperOffset - WrapperSize) {
 		Report("DES_ULTRAWIDE hud_layout skipped: no room for the wrapper"); // desport
@@ -471,9 +473,9 @@ float UltrawideMovieScale(uint32_t target_width, uint32_t target_height) {
 		const char* aspect = std::getenv("KYTY_ULTRAWIDE");                                    // desport
 		if (aspect == nullptr || *aspect == '\0') return false;                                // desport
 		const char* mode   = std::getenv("KYTY_ULTRAWIDE_MOVIES");                             // desport
-		if (mode != nullptr && *mode != '\0') return std::string_view(mode) == "pillarbox";    // desport
-		const char* render = std::getenv("KYTY_ULTRAWIDE_RENDER");                             // desport
-		return render != nullptr && std::strcmp(render, "1") == 0;                             // desport: default with RENDER
+		// desport: opt-in only: with KYTY_ULTRAWIDE_HUD=native the filter matched the UI composite (a 3840x2160 texture)
+		// instead of the movie, which the game draws 16:9 from the left edge of the UI space (2026-10-24).
+		return mode != nullptr && std::string_view(mode) == "pillarbox";
 	}();
 	if (!pillarbox || target_height == 0) return 0.0f;                                         // desport
 	const float aspect = static_cast<float>(target_width) / static_cast<float>(target_height);  // desport

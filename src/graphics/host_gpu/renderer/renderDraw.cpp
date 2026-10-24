@@ -1579,14 +1579,34 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		auto&       regs   = buffer.GetRegisters();
 		const auto& guest  = regs.GetScreenViewport().viewports[0];
 		const bool  covers = std::fabs(guest.xscale * 2.0f - static_cast<float>(target.width)) < 2.0f &&
-		                    std::fabs(guest.yscale * 2.0f - static_cast<float>(target.height)) < 2.0f;
+		                    std::fabs(std::fabs(guest.yscale) * 2.0f - static_cast<float>(target.height)) < 2.0f;
+		// With KYTY_ULTRAWIDE_HUD=native the game already draws the movie 16:9 (full height) but from the left edge:
+		// only move it to the centre.
+		const float width16x9   = static_cast<float>(target.height) * 16.0f / 9.0f;
+		const bool  left16x9    = std::fabs(guest.xscale * 2.0f - width16x9) < 2.0f &&
+		                      std::fabs(std::fabs(guest.yscale) * 2.0f - static_cast<float>(target.height)) < 2.0f &&
+		                      std::fabs(guest.xoffset - guest.xscale) < 2.0f;
 		int movie_slot = -1;
-		for (size_t i = 0; scale > 0.0f && covers && i < bindings.pixel->images.size(); ++i) {
+		for (size_t i = 0; scale > 0.0f && (covers || left16x9) && i < bindings.pixel->images.size(); ++i) {
 			const auto& extent = bindings.pixel->images[i].desc.info.extent;
 			if (extent.width * 9u == extent.height * 16u && extent.width >= 640 && extent.width <= 3840 &&
 			    bindings.pixel->images[i].image_id != state.color_info[0].image_id) {
 				movie_slot = static_cast<int>(i);
 				break;
+			}
+		}
+		if (movie_slot < 0 && scale > 0.0f && !bindings.pixel->images.empty() && (covers || left16x9)) { // desport: diagnose movie draws the filter does not recognise (the viewport y scale is negative: compare magnitudes)
+			static std::atomic<uint32_t> missed {0};
+			if (missed.fetch_add(1) < 6) {
+				const auto& first = bindings.pixel->images.empty() ? nullptr : &bindings.pixel->images[0];
+				char        line[256];
+				std::snprintf(line, sizeof(line),
+				              "DES_ULTRAWIDE movie_pillarbox unmatched target=%ux%u viewport=%.0fx%.0f offset=%.0f,%.0f images=%zu "
+				              "first=%ux%u\n",
+				              target.width, target.height, guest.xscale * 2.0f, guest.yscale * 2.0f, guest.xoffset, guest.yoffset,
+				              bindings.pixel->images.size(), first ? first->desc.info.extent.width : 0u,
+				              first ? first->desc.info.extent.height : 0u);
+				Desport::EmitLine(line);
 			}
 		}
 		if (movie_slot >= 0 && regs.GetClipControl().clip_disable) {
@@ -1597,8 +1617,13 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		} else if (movie_slot >= 0) {
 			desport_viewport_restore.context = &regs;
 			desport_viewport_restore.saved   = regs.GetScreenViewport();
-			regs.SetViewportScaleOffset(0, guest.xscale * scale, guest.xoffset, guest.yscale, guest.yoffset, guest.zscale,
-			                            guest.zoffset);
+			if (covers) {
+				regs.SetViewportScaleOffset(0, guest.xscale * scale, guest.xoffset, guest.yscale, guest.yoffset, guest.zscale,
+				                            guest.zoffset);
+			} else { // desport: left-aligned 16:9 movie: centre it
+				regs.SetViewportScaleOffset(0, guest.xscale, guest.xoffset + (static_cast<float>(target.width) - width16x9) * 0.5f,
+				                            guest.yscale, guest.yoffset, guest.zscale, guest.zoffset);
+			}
 			static std::atomic<uint32_t> logged {0};
 			if (logged.fetch_add(1) < 4) {
 				const auto& extent = bindings.pixel->images[movie_slot].desc.info.extent;
@@ -1608,9 +1633,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				char line[256];
 				std::snprintf(line, sizeof(line),
 				              "DES_ULTRAWIDE movie_pillarbox draw ps=0x%016" PRIx64 " texture=%ux%u slot=%d target=%ux%u "
-				              "viewport_width=%.0f->%.0f\n",
+				              "viewport_width=%.0f->%.0f %s\n",
 				              ps, extent.width, extent.height, movie_slot, target.width, target.height,
-				              guest.xscale * 2.0f / scale, guest.xscale * 2.0f);
+				              covers ? guest.xscale * 2.0f / scale : guest.xscale * 2.0f, guest.xscale * 2.0f,
+				              covers ? "narrowed" : "centred");
 				Desport::EmitLine(line);
 			}
 		}
