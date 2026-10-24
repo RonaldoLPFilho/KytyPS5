@@ -1094,6 +1094,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (FrameGen::CaptureRequested()) {
 		FrameGen::PrepareInputs(m_impl->window.graphic_ctx, m_impl->renderer.GetTextureCache(),
 		                        buffer, frame->fg);
+	} else if (FrameGen::SrActive()) { // desport: DLSS SR without DLSS-G: the frame's camera ends at the flip
+		FrameGen::EndSrFrame();         // desport: (PrepareInputs does it with DLSS-G)
 	}
 	return *frame;
 }

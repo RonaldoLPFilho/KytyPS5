@@ -67,6 +67,18 @@ std::optional<uint64_t> FindUniqueData(const Program& program, std::span<const u
 
 void Install(Program* program) {
 	const char* setting = std::getenv("KYTY_RENDER_HEIGHT");
+	// desport: KYTY_DLSS sets the render height when KYTY_RENDER_HEIGHT does not.
+	char        dlss_height[16] {};
+	if (const char* dlss = std::getenv("KYTY_DLSS"); (setting == nullptr || *setting == 0) && dlss != nullptr) {
+		if (const auto height = DlssRenderHeight(dlss); height != 0) {          // desport
+			std::snprintf(dlss_height, sizeof(dlss_height), "%u", height);         // desport
+			setting = dlss_height;                                                 // desport
+			std::printf("Demon's Souls render size: KYTY_DLSS=%s renders %u lines\n", dlss, height); // desport
+		} else if (std::string_view(dlss) == "dlaa") {                            // desport
+			std::printf("Demon's Souls render size: KYTY_DLSS=dlaa needs a 2160-line render size, not "
+			            "supported yet; the game's 2560x1440 kept\n");             // desport
+		}
+	}
 	if (setting == nullptr || *setting == 0 || program == nullptr || !Libs::Graphics::DemonsSouls::IsSupportedGame() ||
 	    program->file_name.filename() != "eboot.bin")
 		return;
