@@ -18,6 +18,8 @@ namespace Desport {
 
 // desport: KYTY_ULTRAWIDE=<width>x<height>|<aspect> (desportUltrawide.cpp): the render setup's 16:9 constant of the main
 // program becomes the given aspect ratio (found by its bytes; logs "DES_ULTRAWIDE aspect=<x> applied|skipped <reason>").
+// With KYTY_ULTRAWIDE=<w>x<h>, KYTY_ULTRAWIDE_RENDER=1 makes the 4K modes output and render that shape and
+// KYTY_ULTRAWIDE_HUD=native|16x9|<w>x<h> sets the UI system's screen size (desport: native ultrawide phases).
 void InstallUltrawide(Loader::Program* program);
 
 // Writes "DES_MILESTONE <name> t=<ms> [detail]" to the console and the log once per name.

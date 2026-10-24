@@ -31,6 +31,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring> // desport: ultrawide
 #include <list>
 #include <thread>
 #include <vector>
@@ -1717,7 +1718,13 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	const bool hdr_allowed = !Loader::SystemContentParamSfoGetInt("ATTRIBUTE", &attribute) ||
 	                         (attribute & 0x20000000) != 0;
 	ctx->mutex.Lock();
-	status->resolution   = (ctx->width >= 3840 || ctx->height >= 2160 ? 2u : 1u);
+	// desport: KYTY_ULTRAWIDE_RENDER=1 reshapes the game's 4K modes (desportUltrawide.cpp); a 4K display keeps it in them
+	// whatever the window size (a 3440x1440 window would otherwise steer it to the 1080p modes, which stay 16:9).
+	static const bool desport_ultrawide = [] {                                              // desport
+		const char* phase = std::getenv("KYTY_ULTRAWIDE_RENDER");                           // desport
+		return phase != nullptr && std::strcmp(phase, "1") == 0 && std::getenv("KYTY_ULTRAWIDE") != nullptr; // desport
+	}();
+	status->resolution   = (desport_ultrawide || ctx->width >= 3840 || ctx->height >= 2160 ? 2u : 1u); // desport: ultrawide
 	status->dynamicRange = hdr_allowed && DriverState().IsHdrSupported() ? 2u : 1u;
 	status->refreshRate =
 	    (ctx->output_mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ || Config::GetVblankFrequency() >= 119
