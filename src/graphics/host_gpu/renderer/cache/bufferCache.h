@@ -315,6 +315,31 @@ private:
 	void NotePrefetchWrite(uint64_t vaddr, uint64_t size);
 	void ServePrefetchNeighbors(uint64_t vaddr);
 	void ReportReadbackPrefetch();
+	// desport: KYTY_READBACK_PREFETCH=2/3 (range snapshots). Hot chunks in a direct-mapped table (by chunk number, so a
+	// GPU write costs a lookup, not a scan), with per-window diagnostics (DES_READBACK_ADDR). Pending: the GPU-written
+	// ranges over hot chunks since the last sync point; each becomes a snapshot of its own (a later write elsewhere in
+	// the chunk leaves it alone). Unserved (mode 3): snapshots no read used yet, written back once their copy finished.
+	struct PrefetchHot2 {
+		uint64_t chunk = 0, tick = 0;
+		uint32_t reads = 0, misses = 0, writes = 0, uploads = 0, snapshots = 0;
+	};
+	struct PrefetchUnserved {
+		size_t   slot = 0;
+		uint64_t address = 0, tick = 0;
+	};
+	static constexpr size_t   PrefetchHot2Entries = 256;
+	static constexpr uint64_t PrefetchHot2Ticks   = 16384;
+	static constexpr size_t   PrefetchMaxRanges   = 512;
+	std::array<PrefetchHot2, PrefetchHot2Entries>  m_prefetch_hot2 {};
+	std::vector<std::pair<uint64_t, uint64_t>>     m_prefetch_ranges;
+	std::vector<PrefetchUnserved>                  m_prefetch_unserved;
+	bool NotePrefetchRead2(uint64_t vaddr, uint64_t size, bool count = true);
+	void NotePrefetchWrite2(uint64_t vaddr, uint64_t size);
+	void FlushReadbackPrefetchRanges();
+	void ServeFinishedPrefetch();
+	[[nodiscard]] bool ServePrefetchSlot(size_t index);
+	[[nodiscard]] bool GuestReadbackPending(uint64_t begin, uint64_t end) const;
+	void ReportPrefetchChunks(uint64_t now);
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;
 	vk::PipelineLayout m_lod_pack_layout = nullptr;

@@ -100,12 +100,42 @@ struct NativeBufferDownloadScope {
 // ... whose snapshot was gone after the wait (normal readback then); stale: snapshots overwritten by GPU work before
 // any read; misses: reads of hot chunks no snapshot served; skips: hot chunks that could not be snapshotted (no free
 // slot, image data, backing); guest_reads/guest_read_ns: every guest readback while the switch is on, end to end.
+// desport: KYTY_READBACK_PREFETCH=2/3 diagnostics after guest_read_ns: skips by reason (owner: no buffer at the
+// range, image: tracked image data over it, backing: unmapped or aliased, slot: every slot in flight); overflow:
+// pending ranges dropped (more than PrefetchMaxRanges between two sync points, or 128 snapshots at one); eager:
+// snapshots written back at a sync point before any read (mode 3); flushes: submits at a sync point (mode 3); what the
+// reads no snapshot served did (cold: chunk not hot; joined: a pending readback; new_queue/new_gfx: a new readback on
+// the copy queue / behind the graphics queue; nothing: no GPU-owned byte left; sync: a synchronous download; blocked:
+// a pending readback over its pages refused the snapshots); turn/wait: the first render-thread turn and the copy
+// waits, per read; sync_age: how long after the last sync point (label write) of the command processor it faulted.
 namespace PrefetchStats {
-enum Id : uint32_t { Snapshots, Bytes, Hits, Neighbors, Waits, Lost, Stale, Misses, Skips, GuestReads, GuestReadNs, Count };
-constexpr const char* Names[Count] = {"prefetch_snapshots", "prefetch_bytes", "prefetch_hits",   "prefetch_neighbors",
-                                      "prefetch_waits",     "prefetch_lost",  "prefetch_stale",  "prefetch_misses",
-                                      "prefetch_skips",     "guest_reads",    "guest_read_ns"};
+enum Id : uint32_t {
+	Snapshots, Bytes, Hits, Neighbors, Waits, Lost, Stale, Misses, Skips, GuestReads, GuestReadNs,
+	SkipOwner, SkipImage, SkipBacking, SkipSlot, Overflow, Eager, Flushes,
+	ReadsCold, ReadsJoined, ReadsNewQueue, ReadsNewGfx, ReadsNothing, ReadsSync, ReadsBlocked,
+	TurnNs, WaitNs, AgeLt50, AgeLt250, AgeLt1000, AgeGe1000, Count
+};
+constexpr const char* Names[Count] = {
+    "prefetch_snapshots",  "prefetch_bytes",     "prefetch_hits",     "prefetch_neighbors",
+    "prefetch_waits",      "prefetch_lost",      "prefetch_stale",    "prefetch_misses",
+    "prefetch_skips",      "guest_reads",        "guest_read_ns",     "prefetch_skip_owner",
+    "prefetch_skip_image", "prefetch_skip_backing", "prefetch_skip_slot", "prefetch_overflow",
+    "prefetch_eager",      "prefetch_flushes",   "reads_cold",        "reads_joined",
+    "reads_new_queue",     "reads_new_gfx",      "reads_nothing",     "reads_sync",
+    "reads_blocked",       "guest_turn_ns",      "guest_wait_ns",     "sync_age_lt50us",
+    "sync_age_lt250us",    "sync_age_lt1ms",     "sync_age_ge1ms"};
 std::atomic<uint64_t> g_values[Count] {};
+// The command processor's last sync point (steady clock, ns), for sync_age.
+std::atomic<uint64_t> g_last_sync_ns {0};
+uint64_t NowNs() {
+	return static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+// GPU thread: BeginGuestReadback handed out a pending readback (reads_joined).
+thread_local bool t_joined = false;
+// GPU thread: a snapshot written back at a sync point (counted as eager), one replaced by a wider one (not stale).
+thread_local bool t_eager_pass = false;
+thread_local bool t_replacing  = false;
 void Add(Id id, uint64_t n = 1) {
 	g_values[id].fetch_add(n, std::memory_order_relaxed);
 	// desport: mirrored into LiveCounters for the DES_FRAME line (desport.cpp)
@@ -189,6 +219,21 @@ static bool GuestReadbacksEnabled() {
 	return kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed) != 0;
 }
 
+// desport: GPU thread: a pending guest readback could write back over [begin, end) later (a snapshot must not serve it
+// first). Its window, as before; with KYTY_READBACK_PREFETCH=2/3 only its pages: it copies, writes back and releases
+// those alone (CopyGuestReadback, FinishGuestReadback), and its 512 KiB window held every snapshot of a result ring off
+// while any read of the ring was pending.
+bool BufferCache::GuestReadbackPending(uint64_t begin, uint64_t end) const {
+	const bool by_pages = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) >= 2;
+	for (const auto& pending: m_guest_readbacks) {
+		if (!pending || pending->begin >= end || begin >= pending->begin + pending->size) continue;
+		if (!by_pages) return true;
+		for (const auto& page: pending->pages)
+			if (page.address < end && begin < page.End()) return true;
+	}
+	return false;
+}
+
 std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
     uint64_t address, uint64_t size, bool* completed) {
 	if (completed) *completed = false;
@@ -209,6 +254,7 @@ std::shared_ptr<BufferCache::GuestReadback> BufferCache::BeginGuestReadback(
 		if (std::ranges::any_of(pending->pages, [&](const GuestRange& page) {
 			return address >= page.address && address < page.End() && size <= page.End() - address;
 		})) {
+			PrefetchStats::t_joined = true; // desport: KYTY_READBACK_PREFETCH diagnostics (reads_joined)
 			return pending;
 		}
 	}
@@ -530,7 +576,11 @@ static void LogGpuWriteWatch(uint64_t vaddr, uint64_t size) {
 void BufferCache::NoteGpuWrite(uint64_t vaddr, uint64_t size) {
 	LogGpuWriteWatch(vaddr, size);
 	TraceGpuWrite(vaddr, size, m_scheduler.CurrentTick());
-	if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) != 0) NotePrefetchWrite(vaddr, size); // desport
+	// desport: KYTY_READBACK_PREFETCH (1: chunks, 2/3: ranges)
+	if (const auto prefetch = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed); prefetch == 1)
+		NotePrefetchWrite(vaddr, size);
+	else if (prefetch >= 2)
+		NotePrefetchWrite2(vaddr, size);
 	if (kyty_local_readback_queue_mode.load(std::memory_order_relaxed) == 0 || m_graphics.readback_queue == nullptr) {
 		if (m_gpu_writes_on) {
 			m_gpu_writes_on = false;
@@ -841,7 +891,8 @@ void BufferCache::InvalidateCopyFeedback(uint64_t vaddr, uint64_t size) {
 	auto last = it;
 	for (; last != feedback.index.end() && last->first < vaddr + size; ++last) {
 		auto& slot = feedback.slots[last->second];
-		if (slot.prefetch && !slot.used) PrefetchStats::Add(PrefetchStats::Stale); // desport: never read
+		// desport: never read (not when a wider snapshot of KYTY_READBACK_PREFETCH=2/3 replaces it)
+		if (slot.prefetch && !slot.used && !PrefetchStats::t_replacing) PrefetchStats::Add(PrefetchStats::Stale);
 		feedback.Count(slot, -1);
 		slot.address = 0;
 	}
@@ -986,7 +1037,9 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
 	if (!prefetch_slots.empty()) { // desport: KYTY_READBACK_PREFETCH
 		for (const auto index: prefetch_slots) feedback.slots[index].used = true;
-		PrefetchStats::Add(PrefetchStats::t_neighbor_pass ? PrefetchStats::Neighbors : PrefetchStats::Hits);
+		PrefetchStats::Add(PrefetchStats::t_eager_pass      ? PrefetchStats::Eager
+		                   : PrefetchStats::t_neighbor_pass ? PrefetchStats::Neighbors
+		                                                    : PrefetchStats::Hits);
 	}
 	return true;
 }
@@ -1009,8 +1062,12 @@ bool BufferCache::TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool i
 	}
 	const auto begin = first & ~(TRACKER_PAGE_SIZE - 1);
 	const auto end   = (last + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-	for (const auto& pending: m_guest_readbacks)
-		if (pending && pending->begin < end && begin < pending->begin + pending->size) return false;
+	// desport: GuestReadbackPending (KYTY_READBACK_PREFETCH=2/3: the pending readbacks' pages, not their windows)
+	if (GuestReadbackPending(begin, end)) {
+		if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) != 0)
+			PrefetchStats::Add(PrefetchStats::ReadsBlocked);
+		return false;
+	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	if (last - first == size || !buffer.IsInBounds(first, last - first) ||
 	    !TryReadCopyFeedback(buffer, first, last - first, pending_tick)) { // desport: pending_tick
@@ -1097,22 +1154,30 @@ void BufferCache::ServePrefetchNeighbors(uint64_t vaddr) {
 		if (slot.prefetch && !slot.used && slot.address != 0) candidates.push_back(it->second);
 	}
 	PrefetchStats::t_neighbor_pass = true;
-	for (const auto index: candidates) {
-		const auto slot = feedback.slots[index];
-		if (slot.address == 0 || slot.used || !m_scheduler.IsFree(slot.tick)) continue;
-		// (Not while a pending readback covers the pages: its copy would land later.)
-		bool pending = false;
-		for (const auto& request: m_guest_readbacks)
-			pending = pending || (request && request->begin < slot.address + slot.size && slot.address < request->begin + request->size);
-		if (pending) continue;
-		const auto* owner_id = m_page_table.Find(slot.address >> PageTable::kPageBits);
-		auto*       owner    = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
-		if (owner == nullptr || owner->is_deleted || owner->Handle() != slot.owner || !owner->IsInBounds(slot.address, slot.size))
-			continue;
-		// (Served chunks fault no more: they stay hot by this.)
-		if (TryReadCopyFeedback(*owner, slot.address, slot.size)) (void)NotePrefetchRead(slot.address, slot.size);
-	}
+	for (const auto index: candidates) (void)ServePrefetchSlot(index); // desport: (shared with ServeFinishedPrefetch)
 	PrefetchStats::t_neighbor_pass = false;
+}
+
+// desport: KYTY_READBACK_PREFETCH. GPU thread: an unused prefetch snapshot whose copy finished is written back, its
+// pages released (TryReadCopyFeedback: only when snapshots cover every GPU-owned byte of them). Not while a pending
+// readback covers the pages: its copy would land later.
+bool BufferCache::ServePrefetchSlot(size_t index) {
+	const auto slot = m_copy_feedback->slots[index];
+	if (slot.address == 0 || !slot.prefetch || slot.used || !m_scheduler.IsFree(slot.tick)) return false;
+	const uint64_t page_begin = slot.address & ~(TRACKER_PAGE_SIZE - 1);
+	const uint64_t page_end   = (slot.address + slot.size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	if (GuestReadbackPending(page_begin, page_end)) return false;
+	const auto* owner_id = m_page_table.Find(slot.address >> PageTable::kPageBits);
+	auto*       owner    = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
+	if (owner == nullptr || owner->is_deleted || owner->Handle() != slot.owner || !owner->IsInBounds(slot.address, slot.size))
+		return false;
+	if (!TryReadCopyFeedback(*owner, slot.address, slot.size)) return false;
+	// (Served chunks fault no more: they stay hot by this.)
+	if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) >= 2)
+		(void)NotePrefetchRead2(slot.address, slot.size, false);
+	else
+		(void)NotePrefetchRead(slot.address, slot.size);
+	return true;
 }
 
 // desport: KYTY_READBACK_PREFETCH. GPU thread, at a guest-visible sync point (the command processor's end-of-pipe and
@@ -1123,6 +1188,9 @@ void BufferCache::ServePrefetchNeighbors(uint64_t vaddr) {
 // only bytes still GPU-owned are written back (TryReadCopyFeedback, WriteBackGpuOwned). The extra bytes of a chunk
 // (not GPU-written) are copied but never written back.
 void BufferCache::FlushReadbackPrefetch() {
+	// desport: the time of the sync point (sync_age), and the range snapshots of KYTY_READBACK_PREFETCH=2/3.
+	PrefetchStats::g_last_sync_ns.store(PrefetchStats::NowNs(), std::memory_order_relaxed);
+	if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) >= 2) return FlushReadbackPrefetchRanges();
 	if (m_prefetch_pending.empty()) return;
 	if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) == 0) {
 		m_prefetch_pending.clear();
@@ -1212,9 +1280,314 @@ void BufferCache::FlushReadbackPrefetch() {
 	feedback.download.written_serial = m_scheduler.CommandSerial();
 }
 
+// desport: KYTY_READBACK_PREFETCH=2/3. GPU thread, at a guest read of GPU-written memory: as NotePrefetchRead, in the
+// direct-mapped table (a chunk 16 MiB away from another replaces it). `count`: a guest read (diagnostics), not a served
+// neighbor. True when the first chunk already was hot.
+bool BufferCache::NotePrefetchRead2(uint64_t vaddr, uint64_t size, bool count) {
+	const uint64_t tick  = m_scheduler.CurrentTick();
+	const uint64_t first = vaddr & ~(PrefetchChunk - 1);
+	const uint64_t last  = (vaddr + std::max<uint64_t>(size, 1) - 1) & ~(PrefetchChunk - 1);
+	bool           hot   = false;
+	for (uint64_t chunk = first; chunk <= last && chunk - first < 8 * PrefetchChunk; chunk += PrefetchChunk) {
+		auto&      entry   = m_prefetch_hot2[(chunk / PrefetchChunk) % PrefetchHot2Entries];
+		const bool was_hot = entry.tick != 0 && entry.chunk == chunk && tick - entry.tick < PrefetchHot2Ticks;
+		if (entry.tick == 0 || entry.chunk != chunk) {
+			entry       = PrefetchHot2 {};
+			entry.chunk = chunk;
+		}
+		entry.tick = std::max<uint64_t>(tick, 1);
+		if (chunk == first) {
+			hot = was_hot;
+			if (count) ++entry.reads;
+		}
+		m_prefetch_lo = std::min(m_prefetch_lo, chunk);
+		m_prefetch_hi = std::max(m_prefetch_hi, chunk + PrefetchChunk);
+	}
+	return hot;
+}
+
+// desport: KYTY_READBACK_PREFETCH=2/3. GPU thread, at every noted GPU write (before the work is recorded): its part over
+// each hot chunk waits for the next sync point, where its GPU-owned bytes get snapshots of their own. The game's result
+// ring (0x220a00000 on) holds a 16-byte result of each dispatch next to the inputs the guest writes for the next ones
+// (KYTY_GPU_WRITE_WATCH: 0x10-byte shader writes beside 4-16 KiB uploads): with whole-chunk snapshots the next
+// dispatch's upload or result dropped the snapshot of the result the guest was about to read (prefetch_stale 2947,
+// prefetch_misses 6006 a window at 120 Hz).
+void BufferCache::NotePrefetchWrite2(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || vaddr >= m_prefetch_hi || vaddr + size <= m_prefetch_lo) return;
+	const uint64_t tick  = m_scheduler.CurrentTick();
+	const uint64_t to    = std::min(vaddr + size, m_prefetch_hi);
+	bool           any   = false;
+	bool           owned = false;
+	uint64_t       n     = 0;
+	for (uint64_t chunk = std::max(vaddr, m_prefetch_lo) & ~(PrefetchChunk - 1); chunk < to && n < 64;
+	     chunk += PrefetchChunk, ++n) {
+		auto& entry = m_prefetch_hot2[(chunk / PrefetchChunk) % PrefetchHot2Entries];
+		if (entry.tick == 0 || entry.chunk != chunk || tick - entry.tick >= PrefetchHot2Ticks) continue;
+		// (Diagnostics: a shader write's range is GPU-owned by now, ObtainBuffer; an upload's is not.)
+		if (!any) owned = m_gpu_modified_ranges.Intersects(vaddr, size);
+		any = true;
+		++(owned ? entry.writes : entry.uploads);
+		const uint64_t begin  = std::max(vaddr, chunk);
+		const uint64_t end    = std::min(vaddr + size, chunk + PrefetchChunk);
+		auto&          ranges = m_prefetch_ranges;
+		if (!ranges.empty() && begin <= ranges.back().second && ranges.back().first <= end) {
+			ranges.back().first  = std::min(ranges.back().first, begin);
+			ranges.back().second = std::max(ranges.back().second, end);
+		} else if (ranges.size() < PrefetchMaxRanges) {
+			ranges.emplace_back(begin, end);
+		} else {
+			PrefetchStats::Add(PrefetchStats::Overflow);
+		}
+	}
+	// (Every write path drops the snapshots its range overlaps already; this covers any path that would not. Exact
+	// range: the snapshots of the chunk's other bytes stay.)
+	if (any) InvalidateCopyFeedback(vaddr, size);
+}
+
+// desport: KYTY_READBACK_PREFETCH=2/3. GPU thread, at a guest-visible sync point (see FlushReadbackPrefetch): the
+// GPU-owned bytes of the pending ranges are copied into copy-feedback slots right here, behind every write recorded so
+// far, one slot per range (at most 64 KiB; an older snapshot of the same buffer it overlaps is folded in, so its bytes
+// stay covered), in one batch behind one barrier. Mode 3 also writes back the snapshots of earlier sync points whose
+// copies finished (ServeFinishedPrefetch: the guest then reads them without a fault) and submits the command buffer
+// when this sync point made snapshots (the GPU starts on the writers and the copies while the guest wakes for its
+// label). Correctness as in FlushReadbackPrefetch: a later GPU write over a snapshot's bytes drops it before it is
+// recorded, a read uses it only once the copy finished, only bytes still GPU-owned are written back, and the bytes of an
+// older snapshot folded in are still the buffer's (a write, upload or unmap over them would have dropped it).
+void BufferCache::FlushReadbackPrefetchRanges() {
+	const bool eager = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) >= 3;
+	// (A speculative translation, a state pass or a thread recorder keeps them for the next sync point.)
+	if (!GuestGpu::IsGpuThread() || Spec::Current() != nullptr || Spec::t_record != nullptr ||
+	    CommandScheduler::ThreadRecorder() != nullptr || m_resources == nullptr || !m_scheduler.Active() ||
+	    m_scheduler.Current().IsInvalid())
+		return;
+	if (eager) ServeFinishedPrefetch();
+	if (m_prefetch_ranges.empty()) return;
+	if (!m_copy_feedback) m_copy_feedback = std::make_unique<CopyFeedback>(m_graphics, m_scheduler);
+	auto&          feedback      = *m_copy_feedback;
+	auto&          master        = m_scheduler.GetMasterSemaphore();
+	const auto     mapping_epoch = m_resources->MappingEpoch();
+	const uint64_t tick          = m_scheduler.CurrentTick();
+	// The GPU-owned bytes of the pending ranges, each byte once, cut at 64 KiB boundaries (a slot each at most).
+	thread_local std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	pieces.clear();
+	std::sort(m_prefetch_ranges.begin(), m_prefetch_ranges.end());
+	uint64_t covered = 0;
+	for (const auto& [range_begin, range_end]: m_prefetch_ranges) {
+		const uint64_t from = std::max(range_begin, covered);
+		if (from >= range_end) continue;
+		covered = range_end;
+		m_gpu_modified_ranges.ForEachIntersection(from, range_end - from, [&](RangeSet::Range range) {
+			for (uint64_t at = range.address; at < range.address + range.size;) {
+				const uint64_t next =
+				    std::min(range.address + range.size, (at / CopyFeedback::SlotSize + 1) * CopyFeedback::SlotSize);
+				pieces.emplace_back(at, next);
+				at = next;
+			}
+		});
+	}
+	m_prefetch_ranges.clear();
+	struct Copy {
+		vk::Buffer     source;
+		vk::BufferCopy region;
+	};
+	thread_local std::vector<Copy> copies;
+	copies.clear();
+	const auto skip = [](PrefetchStats::Id why) {
+		PrefetchStats::Add(PrefetchStats::Skips);
+		PrefetchStats::Add(why);
+	};
+	for (auto [begin, end]: pieces) {
+		// (At most 128 snapshots a sync point: a quarter of the slots, the rest left to the reads.)
+		if (copies.size() >= 128) {
+			PrefetchStats::Add(PrefetchStats::Overflow);
+			continue;
+		}
+		const auto* owner_id = m_page_table.Find(begin >> PageTable::kPageBits);
+		auto*       owner    = owner_id && *owner_id ? m_slot_buffers.try_get(*owner_id) : nullptr;
+		if (owner == nullptr || owner->is_deleted || begin < owner->CpuAddress() ||
+		    begin >= owner->CpuAddress() + owner->Size()) {
+			skip(PrefetchStats::SkipOwner);
+			continue;
+		}
+		end = std::min(end, owner->CpuAddress() + owner->Size());
+		// The older snapshots of the same buffer it overlaps, folded in while the whole fits a slot.
+		uint64_t first = begin, last = end;
+		for (unsigned round = 0; round < 4; ++round) {
+			bool grown = false;
+			auto it    = feedback.LowerBound(first);
+			if (it != feedback.index.begin()) {
+				const auto& prior = feedback.slots[std::prev(it)->second];
+				if (prior.address + prior.size > first) it = std::prev(it);
+			}
+			for (; it != feedback.index.end() && it->first < last; ++it) {
+				const auto&    other = feedback.slots[it->second];
+				const uint64_t from  = std::min(first, other.address);
+				const uint64_t to    = std::max(last, other.address + other.size);
+				if (other.owner != owner->Handle() || to - from > CopyFeedback::SlotSize || (from == first && to == last) ||
+				    m_resources->UnmappedSince(other.mapping_epoch, other.address, other.size))
+					continue;
+				first = from;
+				last  = to;
+				grown = true;
+			}
+			if (!grown) break;
+		}
+		const auto refusal = [&](uint64_t from, uint64_t to) {
+			if (m_texture_cache.HasTrackedDataOverlap(from, to - from)) return PrefetchStats::SkipImage;
+			if (!m_resources->IsMapped(from, to - from) || !LibKernel::Memory::IsUniqueGuestBackingRange(from, to - from))
+				return PrefetchStats::SkipBacking;
+			return PrefetchStats::Count;
+		};
+		auto why = refusal(first, last);
+		if (why != PrefetchStats::Count && (first != begin || last != end)) {
+			first = begin;
+			last  = end;
+			why   = refusal(first, last);
+		}
+		if (why != PrefetchStats::Count) {
+			skip(why);
+			continue;
+		}
+		// A free slot, else a finished one (ScheduleCopyFeedback's choice: never wait for storage).
+		size_t selected = CopyFeedback::SlotCount;
+		for (unsigned refresh = 0; refresh < 2 && selected == CopyFeedback::SlotCount; ++refresh) {
+			if (refresh) master.Refresh();
+			const auto completed = master.KnownGpuTick();
+			for (unsigned evict = 0; evict < 2 && selected == CopyFeedback::SlotCount; ++evict) {
+				for (size_t n = 0; n < CopyFeedback::SlotCount; ++n) {
+					const auto  i    = (feedback.cursor + n) % CopyFeedback::SlotCount;
+					const auto& slot = feedback.slots[i];
+					if (slot.tick <= completed && (evict || slot.address == 0)) {
+						selected = i;
+						break;
+					}
+				}
+			}
+		}
+		if (selected == CopyFeedback::SlotCount) {
+			skip(PrefetchStats::SkipSlot);
+			continue;
+		}
+		auto& slot = feedback.slots[selected];
+		if (slot.address && feedback.Erase(slot.address)) feedback.Count(slot, -1);
+		slot.address               = 0;
+		PrefetchStats::t_replacing = true;
+		InvalidateCopyFeedback(first, last - first); // (the older snapshots folded in, or overlapped)
+		PrefetchStats::t_replacing = false;
+		copies.push_back(
+		    {owner->Handle(), vk::BufferCopy {owner->Offset(first), selected * CopyFeedback::SlotSize, last - first}});
+		slot = {first, last - first, tick, mapping_epoch, owner->Handle(), true, false};
+		if (feedback.Insert(first, selected)) feedback.Count(slot, 1);
+		feedback.cursor = (selected + 1) % CopyFeedback::SlotCount;
+		PrefetchStats::Add(PrefetchStats::Snapshots);
+		PrefetchStats::Add(PrefetchStats::Bytes, last - first);
+		if (auto& entry = m_prefetch_hot2[(first / PrefetchChunk) % PrefetchHot2Entries];
+		    entry.tick != 0 && entry.chunk == (first & ~(PrefetchChunk - 1)))
+			++entry.snapshots;
+		if (eager && m_prefetch_unserved.size() < 1024) m_prefetch_unserved.push_back({selected, first, tick});
+	}
+	if (copies.empty()) return;
+	// One copy command per source buffer.
+	std::stable_sort(copies.begin(), copies.end(), [](const Copy& a, const Copy& b) {
+		return std::less<VkBuffer>()(static_cast<VkBuffer>(a.source), static_cast<VkBuffer>(b.source));
+	});
+	thread_local std::vector<vk::BufferCopy> regions;
+	auto&                                    command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// desport: vk-hpp here has no struct constructors; set the masks by field.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
+	                       nullptr, 0, nullptr);
+	for (size_t i = 0; i < copies.size();) {
+		regions.clear();
+		size_t j = i;
+		for (; j < copies.size() && copies[j].source == copies[i].source; ++j) regions.push_back(copies[j].region);
+		native.copyBuffer(copies[i].source, feedback.download.Handle(), static_cast<uint32_t>(regions.size()), regions.data());
+		i = j;
+	}
+	// The host reads the slots; later GPU writes of the sources wait for the copies.
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
+	                       nullptr, 0, nullptr);
+	feedback.download.written_serial = m_scheduler.CommandSerial();
+	if (eager) {
+		m_scheduler.Flush();
+		PrefetchStats::Add(PrefetchStats::Flushes);
+	}
+}
+
+// desport: KYTY_READBACK_PREFETCH=3. GPU thread, at a sync point: the unread snapshots of earlier sync points whose copies
+// finished are written back (ServePrefetchSlot), so the guest reads their bytes with no fault and no render-thread
+// turn. A snapshot refused here (a pending readback over its pages, GPU-owned bytes no snapshot covers) is left to a
+// read; one still in flight waits for a later sync point.
+void BufferCache::ServeFinishedPrefetch() {
+	if (m_prefetch_unserved.empty()) return;
+	if (!m_copy_feedback) {
+		m_prefetch_unserved.clear();
+		return;
+	}
+	auto& master = m_scheduler.GetMasterSemaphore();
+	master.Refresh();
+	const auto& feedback = *m_copy_feedback;
+	size_t      kept     = 0;
+	PrefetchStats::t_eager_pass = true;
+	for (size_t i = 0; i < m_prefetch_unserved.size(); ++i) {
+		const auto  entry = m_prefetch_unserved[i];
+		const auto& slot  = feedback.slots[entry.slot];
+		if (slot.address != entry.address || slot.tick != entry.tick || !slot.prefetch || slot.used) continue; // (gone, read)
+		if (!master.IsFree(entry.tick)) {
+			m_prefetch_unserved[kept++] = entry;
+			continue;
+		}
+		(void)ServePrefetchSlot(entry.slot);
+	}
+	m_prefetch_unserved.resize(kept);
+	PrefetchStats::t_eager_pass = false;
+}
+
+// desport: KYTY_READBACK_PREFETCH=2/3. GPU thread, with each DES_READBACK line: "DES_READBACK_CHUNKS t=<ms> read=<chunks
+// the guest read in the window> hot=<hot chunks>" and, for the (at most 8) chunks read most, "DES_READBACK_ADDR t=<ms>
+// chunk=0x<address> reads=<n> misses=<n> writes=<n> uploads=<n> snapshots=<n>" (writes: noted GPU writes over GPU-owned
+// bytes; uploads: the other noted writes, CPU data copied in). The window's counts then restart; the hot bounds shrink to
+// the chunks still hot.
+void BufferCache::ReportPrefetchChunks(uint64_t now) {
+	const uint64_t                                       tick = m_scheduler.CurrentTick();
+	std::array<const PrefetchHot2*, PrefetchHot2Entries> order {};
+	size_t                                               read = 0, hot = 0;
+	m_prefetch_lo = UINT64_MAX;
+	m_prefetch_hi = 0;
+	for (const auto& entry: m_prefetch_hot2) {
+		if (entry.tick == 0) continue;
+		if (tick - entry.tick < PrefetchHot2Ticks) {
+			++hot;
+			m_prefetch_lo = std::min(m_prefetch_lo, entry.chunk);
+			m_prefetch_hi = std::max(m_prefetch_hi, entry.chunk + PrefetchChunk);
+		}
+		if (entry.reads != 0) order[read++] = &entry;
+	}
+	std::sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(read),
+	          [](const PrefetchHot2* a, const PrefetchHot2* b) { return a->reads > b->reads; });
+	std::string out = fmt::format("DES_READBACK_CHUNKS t={} read={} hot={}\n", now, read, hot);
+	for (size_t i = 0; i < std::min<size_t>(read, 8); ++i) {
+		const auto& e = *order[i];
+		out += fmt::format("DES_READBACK_ADDR t={} chunk=0x{:x} reads={} misses={} writes={} uploads={} snapshots={}\n", now,
+		                   e.chunk, e.reads, e.misses, e.writes, e.uploads, e.snapshots);
+	}
+	Desport::EmitLine(out);
+	for (auto& entry: m_prefetch_hot2) entry.reads = entry.misses = entry.writes = entry.uploads = entry.snapshots = 0;
+}
+
 // desport: KYTY_READBACK_PREFETCH. GPU thread: every 5 s, "DES_READBACK t=<ms> window_ms=<ms> prefetch_...=<n> ...
 // guest_reads=<n> guest_read_ms=<total> guest_read_us=<mean> sync_reads_guest=<n> async_readbacks=<n> sync_downloads=<n>"
-// (the counts of the window).
+// (the counts of the window). desport: then the diagnostics after guest_read_ns in PrefetchStats (turn and wait as
+// guest_turn_us / guest_wait_us, means per guest read), and with KYTY_READBACK_PREFETCH=2/3 the chunk lines
+// (ReportPrefetchChunks).
 void BufferCache::ReportReadbackPrefetch() {
 	static uint64_t                last[PrefetchStats::Count] {};
 	static uint64_t                last_live[3] {};
@@ -1234,8 +1607,18 @@ void BufferCache::ReportReadbackPrefetch() {
 		out += fmt::format(" guest_read_ms={:.1f} guest_read_us={:.1f}", static_cast<double>(ns) / 1e6,
 		                   reads != 0 ? static_cast<double>(ns) / 1e3 / static_cast<double>(reads) : 0.0);
 		for (size_t i = 0; i < 3; ++i) out += fmt::format(" {}={}", LiveCounters::Names[live[i]], cur_live[i] - last_live[i]);
+		for (size_t i = PrefetchStats::SkipOwner; i < PrefetchStats::Count; ++i) { // desport: diagnostics
+			const auto value = cur[i] - last[i];
+			if (i == PrefetchStats::TurnNs || i == PrefetchStats::WaitNs) {
+				out += fmt::format(" {}={:.1f}", i == PrefetchStats::TurnNs ? "guest_turn_us" : "guest_wait_us",
+				                   reads != 0 ? static_cast<double>(value) / 1e3 / static_cast<double>(reads) : 0.0);
+				continue;
+			}
+			out += fmt::format(" {}={}", PrefetchStats::Names[i], value);
+		}
 		out += "\n";
 		Desport::EmitLine(out);
+		if (kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) >= 2) ReportPrefetchChunks(now); // desport
 	}
 	m_prefetch_report_ms = now;
 	std::copy(std::begin(cur), std::end(cur), std::begin(last));
@@ -1934,31 +2317,62 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		auto& gpu = m_scheduler.Context().GetGpu();
 		// desport: KYTY_READBACK_PREFETCH: a snapshot that covers the read but is still in flight is waited for here, off
 		// the render thread (no new copy, no wait behind the GPU work recorded since), and the read asked for once more.
-		const bool prefetch      = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) != 0;
-		const auto started       = prefetch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-		uint64_t   prefetch_tick = 0;
+		const uint32_t prefetch_mode = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed);
+		const bool     prefetch      = prefetch_mode != 0;
+		// desport: (diagnostics) the fault's time: the read's whole time, its first render-thread turn, its waits.
+		const uint64_t started       = prefetch ? PrefetchStats::NowNs() : 0;
+		uint64_t       prefetch_tick = 0;
+		uint64_t       wait_ns       = 0;
+		if (prefetch) { // desport: sync_age
+			const uint64_t sync = PrefetchStats::g_last_sync_ns.load(std::memory_order_relaxed);
+			const uint64_t age  = started > sync ? started - sync : 0;
+			PrefetchStats::Add(age < 50000     ? PrefetchStats::AgeLt50
+			                   : age < 250000  ? PrefetchStats::AgeLt250
+			                   : age < 1000000 ? PrefetchStats::AgeLt1000
+			                                   : PrefetchStats::AgeGe1000);
+		}
 		const auto begin_readback = [&] {
 			bool completed = false;
+			PrefetchStats::t_joined = false; // desport
 			request = BeginGuestReadback(vaddr, size, &completed);
+			if (prefetch) { // desport: what the read took (reads_*)
+				PrefetchStats::Add(request ? (PrefetchStats::t_joined         ? PrefetchStats::ReadsJoined
+				                              : request->queue_value != 0 ? PrefetchStats::ReadsNewQueue
+				                                                          : PrefetchStats::ReadsNewGfx)
+				                   : is_write || !completed ? PrefetchStats::ReadsSync
+				                                            : PrefetchStats::ReadsNothing);
+			}
 			if (!request && (is_write || !completed)) {
 				LiveCounters::Add(LiveCounters::SyncReadsGuest);
 				ReadMemoryOnGpu(vaddr, size, is_write);
 			}
 		};
 		gpu.SendCommandSync([&] {
-			const bool hot = prefetch && NotePrefetchRead(vaddr, size); // desport
-			if (prefetch) ReportReadbackPrefetch();                       // desport
+			if (prefetch) PrefetchStats::Add(PrefetchStats::TurnNs, PrefetchStats::NowNs() - started); // desport
+			// desport: KYTY_READBACK_PREFETCH (1: chunk table, 2/3: range table)
+			const bool hot = prefetch && (prefetch_mode == 1 ? NotePrefetchRead(vaddr, size) : NotePrefetchRead2(vaddr, size));
+			if (prefetch) ReportReadbackPrefetch(); // desport
 			if (TryGuestReadFromFeedback(vaddr, size, is_write, prefetch ? &prefetch_tick : nullptr)) return;
 			if (prefetch_tick != 0) { // desport: its copies are submitted (the open command buffer's, now) and awaited below
 				if (prefetch_tick >= m_scheduler.CurrentTick()) m_scheduler.Flush();
 				return;
 			}
-			if (hot) PrefetchStats::Add(PrefetchStats::Misses); // desport
+			if (hot) { // desport
+				PrefetchStats::Add(PrefetchStats::Misses);
+				const uint64_t chunk = vaddr & ~(PrefetchChunk - 1);
+				if (auto& entry = m_prefetch_hot2[(chunk / PrefetchChunk) % PrefetchHot2Entries];
+				    prefetch_mode >= 2 && entry.tick != 0 && entry.chunk == chunk)
+					++entry.misses;
+			} else if (prefetch) {
+				PrefetchStats::Add(PrefetchStats::ReadsCold);
+			}
 			begin_readback();
 		});
 		if (prefetch_tick != 0) { // desport
+			const uint64_t wait_start = PrefetchStats::NowNs();
 			m_scheduler.GetMasterSemaphore().Wait(prefetch_tick);
 			m_scheduler.WaitPriorityOperations(prefetch_tick);
+			wait_ns += PrefetchStats::NowNs() - wait_start;
 			PrefetchStats::Add(PrefetchStats::Waits);
 			gpu.SendCommandSync([&] {
 				if (TryGuestReadFromFeedback(vaddr, size, is_write)) return;
@@ -1967,7 +2381,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			});
 		}
 		if (request) {
+			const uint64_t wait_start = prefetch ? PrefetchStats::NowNs() : 0; // desport
 			CopyGuestReadback(request);
+			if (prefetch) wait_ns += PrefetchStats::NowNs() - wait_start; // desport
 			gpu.SendCommandSync([this, request, vaddr, size, is_write] {
 				// An overlapping access may already have retired this request.
 				if (m_guest_readbacks[request->slot] == request) FinishGuestReadback(request->slot);
@@ -1976,10 +2392,8 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		if (prefetch) { // desport
 			PrefetchStats::Add(PrefetchStats::GuestReads);
-			PrefetchStats::Add(PrefetchStats::GuestReadNs,
-			                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			                                             std::chrono::steady_clock::now() - started)
-			                                             .count()));
+			PrefetchStats::Add(PrefetchStats::GuestReadNs, PrefetchStats::NowNs() - started);
+			PrefetchStats::Add(PrefetchStats::WaitNs, wait_ns);
 		}
 		return;
 	}

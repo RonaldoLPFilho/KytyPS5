@@ -84,7 +84,9 @@ inline void InitializePerformanceSwitches() {
 	    Switch {"KYTY_WRITE_WINDOW_HANDOFF", &kyty_local_write_window_handoff_mode},
 	    Switch {"KYTY_READBACK_DETACH", &kyty_local_readback_detach_mode},
 	    Switch {"KYTY_ASYNC_WRITE_READBACK", &kyty_local_async_write_readback_mode},
-	    Switch {"KYTY_READBACK_PREFETCH", &kyty_local_readback_prefetch_mode}, // desport: readback prefetch
+	    // desport: readback prefetch (1: 64 KiB chunks; 2: the written ranges; 3: 2 + eager write-back and a submit at
+	    // the sync point)
+	    Switch {"KYTY_READBACK_PREFETCH", &kyty_local_readback_prefetch_mode, 0, 3},
 	    Switch {"KYTY_READBACK_SLOTS", &kyty_local_readback_slots_mode},
 	    // 1: buffer upload copies on the upload worker; 2: image staging copies as well.
 	    Switch {"KYTY_ASYNC_UPLOAD", &kyty_local_async_upload_mode, 0, 2},
@@ -160,16 +162,20 @@ inline void InitializePerformanceSwitches() {
 		enabled += std::string(enabled.empty() ? "" : " ") + setting.environment + "=" + text;
 	}
 	// desport: KYTY_READBACK_PREFETCH boot line (the guest path also needs the frame pipeline; copy feedback is not needed).
+	// desport: prefetch 2/3 (range snapshots) keep 256 hot chunks for 16384 ticks.
+	const uint32_t prefetch_mode = kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed);
 	std::printf("DES_READBACK prefetch=%u active=%u frame_pipeline=%u copy_feedback=%u readback_queue=%u chunk=65536 "
-	            "hot_chunks=32 hot_ticks=4096\n",
-	            kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed),
+	            "hot_chunks=%u hot_ticks=%u strategy=%s\n",
+	            prefetch_mode,
 	            kyty_local_readback_prefetch_mode.load(std::memory_order_relaxed) != 0 &&
 	                    kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed) != 0
 	                ? 1u
 	                : 0u,
 	            kyty_local_frame_pipeline_mode.load(std::memory_order_relaxed),
 	            kyty_local_copy_feedback_mode.load(std::memory_order_relaxed),
-	            kyty_local_readback_queue_mode.load(std::memory_order_relaxed));
+	            kyty_local_readback_queue_mode.load(std::memory_order_relaxed), prefetch_mode >= 2 ? 256u : 32u,
+	            prefetch_mode >= 2 ? 16384u : 4096u,
+	            prefetch_mode == 0 ? "off" : prefetch_mode == 1 ? "chunk" : prefetch_mode == 2 ? "range" : "range_eager");
 	std::fflush(stdout);
 	// External tools find the render thread by this name (for example to pin it).
 	LocalPlatform::SetThreadName("Kyty.Gpu");
