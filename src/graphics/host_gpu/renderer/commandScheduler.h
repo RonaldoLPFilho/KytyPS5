@@ -229,6 +229,12 @@ private:
 	uint32_t                     m_async_dispatches      = 0;
 	uint64_t                     m_gfx_async_waited      = 0;
 	std::atomic<uint64_t>        m_async_driver_tick {0};
+	// desport: KYTY_GPU_TIMESTAMPS / KYTY_SUBMIT_COALESCE: the renderer's own scheduler (not the presenter's), the
+	// writing commands this thread had recorded when the open buffer began, and those of the buffer being submitted
+	// (UINT32_MAX: unknown).
+	bool                         m_main                   = false;
+	uint64_t                     m_desport_writes_begin   = 0;
+	uint32_t                     m_desport_submit_writes  = UINT32_MAX;
 };
 
 } // namespace Libs::Graphics

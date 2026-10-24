@@ -46,6 +46,10 @@ public:
 	};
 	template <typename Dispatch>
 	static void Submit(const SubmitPacket& packet, const Dispatch& dispatch) {
+#ifdef KYTY_LOCAL_VULKAN_RECORDING
+		// desport: KYTY_SUBMIT_COALESCE: the graphics submissions a worker holds first (this copy may wait for one).
+		LocalVulkanRecording::BeforeOtherSubmit();
+#endif
 		VkTimelineSemaphoreSubmitInfo values {};
 		values.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
 		values.waitSemaphoreValueCount   = 1;

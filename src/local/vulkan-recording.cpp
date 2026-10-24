@@ -170,6 +170,8 @@ struct RecordWait {
 
 class Stream;
 thread_local Stream* executing = nullptr;
+// desport: KYTY_SUBMIT_COALESCE: the worker's poll while it holds submissions (SetIdlePoll).
+thread_local IdlePoll t_idle_poll = nullptr;
 class Stream {
 public:
     Stream() : worker([this] { Run(); }) {}
@@ -266,6 +268,12 @@ private:
             if ((current & 4095u) == 0) KeepAffinity();
             for (auto ready = published.load(std::memory_order_acquire); current == ready;
                  ready = published.load(std::memory_order_acquire)) {
+                // desport: KYTY_SUBMIT_COALESCE: never block while submissions are held (the poll hands them over).
+                if (t_idle_poll != nullptr && t_idle_poll(false)) {
+                    _mm_pause();
+                    if (stopping.load(std::memory_order_acquire)) break;
+                    continue;
+                }
                 const uint32_t spins = kyty_local_recording_spin.load(std::memory_order_relaxed);
                 for (uint32_t spin = 0; spin < spins && ready == current; ++spin) {
                     _mm_pause();
@@ -277,7 +285,10 @@ private:
                     published.wait(current, std::memory_order_seq_cst);
                 sleeping.store(false, std::memory_order_relaxed);
             }
-            if (stopping.load(std::memory_order_acquire)) return;
+            if (stopping.load(std::memory_order_acquire)) {
+                if (t_idle_poll != nullptr) t_idle_poll(true); // desport: KYTY_SUBMIT_COALESCE
+                return;
+            }
             auto& chunk = chunks[current % ChunkCount];
             // desport: KYTY_READBACK_LATENCY: the worker's busy time (worker_busy_pct).
             const uint64_t busy_from = ReadbackLatency::Stats() ? ReadbackLatency::NowNs() : 0;
@@ -293,6 +304,8 @@ private:
             chunk.first = chunk.last = End;
             completed.store(++current, std::memory_order_release);
             completed.notify_one();
+            // desport: KYTY_SUBMIT_COALESCE: a worker busy with chunk after chunk checks its held submissions too.
+            if (t_idle_poll != nullptr) (void)t_idle_poll(false);
         }
     }
 };
@@ -386,7 +399,26 @@ void NoteDeferredSubmitDone() {
     g_deferred_done.fetch_add(1, std::memory_order_release);
     g_deferred_done.notify_all();
 }
+// desport: begin KYTY_SUBMIT_COALESCE
+void SetIdlePoll(IdlePoll poll) { t_idle_poll = poll; }
+bool OnWorker() { return executing != nullptr; }
+void BeforeOtherSubmit() {
+    if (executing != nullptr) {
+        if (t_idle_poll != nullptr) t_idle_poll(true);
+        return;
+    }
+    // Another thread (a direct submission): the worker hands over everything queued so far before this one is made
+    // (a wait-before-signal stalls the Windows driver's device lock, and the worker's submission behind it). The worker
+    // polls while it holds anything, so this ends; nothing to wait for when coalescing is off (handed == queued then).
+    if (!g_coalesce_on.load(std::memory_order_relaxed)) return;
+    const uint64_t target = g_main_queued.load(std::memory_order_seq_cst);
+    RaiseWantQ(target);
+    while (g_main_handed.load(std::memory_order_acquire) < target) std::this_thread::yield();
+}
+// desport: end KYTY_SUBMIT_COALESCE
 void WaitDeferredSubmits() {
+    // desport: KYTY_SUBMIT_COALESCE: what the worker holds is handed over too (else this waits for it).
+    RaiseWantQ(g_main_queued.load(std::memory_order_seq_cst));
     const auto target = g_deferred_queued.load(std::memory_order_acquire);
     for (auto done = g_deferred_done.load(std::memory_order_acquire); done < target;
          done = g_deferred_done.load(std::memory_order_acquire)) g_deferred_done.wait(done, std::memory_order_acquire);

@@ -91,6 +91,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
 	}
+	NoteWant(tick); // desport: KYTY_SUBMIT_COALESCE (a held submission of the tick is handed over now)
 	// desport: KYTY_ASYNC_COMPUTE: and the last async epoch up to the tick still pending.
 	uint64_t async_epoch = 0;
 	if (m_async_semaphore != nullptr) {

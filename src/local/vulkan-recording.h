@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic> // desport: KYTY_SUBMIT_COALESCE
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -50,6 +51,26 @@ void WaitDeferredSubmits();
 // Deferred submissions queued and handed to the driver so far (diagnostics).
 uint64_t DeferredSubmitsQueued();
 uint64_t DeferredSubmitsDone();
+// desport: begin KYTY_SUBMIT_COALESCE (commandScheduler.cpp). A recording worker may hold graphics submissions to hand
+// several to the driver as one. While it holds some, its wait for work calls `poll(false)` instead of blocking, which
+// returns true while submissions are still held; `poll(true)` hands them all over at once.
+using IdlePoll = bool (*)(bool force);
+void SetIdlePoll(IdlePoll poll); // the calling worker's (thread-local)
+bool OnWorker();                 // the calling thread is a recording worker
+// This thread is about to make a queue submission that is not a held graphics one (the readback queue's copy, an
+// async-compute submission): on a worker, the held submissions go first (one of them may be what it waits for).
+void BeforeOtherSubmit();
+// Producer side: the main scheduler's deferred submissions queued so far and handed to the driver so far (the worker's
+// q numbers), and the q every held submission up to must be handed over (raised by waiters).
+inline std::atomic<bool>     g_coalesce_on {false};
+inline std::atomic<uint64_t> g_main_queued {0};
+inline std::atomic<uint64_t> g_main_handed {0};
+inline std::atomic<uint64_t> g_want_q {0};
+inline void RaiseWantQ(uint64_t q) {
+    auto known = g_want_q.load(std::memory_order_relaxed);
+    while (known < q && !g_want_q.compare_exchange_weak(known, q, std::memory_order_seq_cst)) {}
+}
+// desport: end KYTY_SUBMIT_COALESCE
 uint64_t StateEpoch();
 // Commands the calling thread recorded that do GPU work or synchronize (draws, dispatches,
 // copies, clears, rendering scopes, barriers): unchanged between two barriers = no work in between.

@@ -32,6 +32,14 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// desport: KYTY_SUBMIT_COALESCE: the highest tick a thread waits for (Wait), which a recording worker holding
+	// submissions hands over at once (commandScheduler.cpp).
+	void NoteWant(uint64_t tick) noexcept {
+		auto known = m_want_tick.load(std::memory_order_relaxed);
+		while (known < tick && !m_want_tick.compare_exchange_weak(known, tick, std::memory_order_seq_cst)) {
+		}
+	}
+	[[nodiscard]] uint64_t WantTick() const noexcept { return m_want_tick.load(std::memory_order_seq_cst); }
 
 	// desport: begin KYTY_ASYNC_COMPUTE (src/local/async-compute.h). A tick is an epoch: the graphics submission of X
 	// signals Handle() with X, the async submission recorded during X (at most one) signals AsyncHandle() with X.
@@ -56,6 +64,7 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+	std::atomic<uint64_t> m_want_tick {0}; // desport: KYTY_SUBMIT_COALESCE
 	// desport: KYTY_ASYNC_COMPUTE: the async timeline, the async epochs issued and not known complete (oldest first),
 	// the last one issued, the graphics and async timelines as last read.
 	vk::Semaphore         m_async_semaphore = nullptr;
