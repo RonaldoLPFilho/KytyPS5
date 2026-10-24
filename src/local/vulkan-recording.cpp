@@ -339,6 +339,7 @@ thread_local uint64_t g_packets       = 0;
 
 void Install() { InstallDispatch(); }
 const vk::detail::DispatchLoaderDynamic& DirectDispatch() { return original; }
+vk::detail::DispatchLoaderDynamic& HookDispatch() { return original; } // desport: KYTY_GPU_PROFILE
 void* ReplaceBindPipeline(void* entry) {
     auto* replaced = reinterpret_cast<void*>(original.vkCmdBindPipeline);
     original.vkCmdBindPipeline = reinterpret_cast<PFN_vkCmdBindPipeline>(entry);

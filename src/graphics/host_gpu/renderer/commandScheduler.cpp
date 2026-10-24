@@ -13,6 +13,7 @@
 #include "live-trace-gpu.h"
 #include "readback-latency.h" // desport: KYTY_READBACK_LATENCY
 #include "async-compute.h"    // desport: KYTY_ASYNC_COMPUTE
+#include "gpu-profile.h"      // desport: KYTY_GPU_PROFILE
 #include "loader/desport.h"   // desport: KYTY_ASYNC_COMPUTE (DES_ASYNC_COMPUTE line)
 #include "local-platform.h"
 #include "live-control.h" // desport: KYTY_GPU_TIMESTAMPS (flips)
@@ -322,6 +323,7 @@ void CommandScheduler::Shutdown() {
 		m_operation_state = OperationState::Draining;
 	}
 	GpuTs::Stop(); // desport: KYTY_GPU_TIMESTAMPS (the first scheduler to shut down stops the reader)
+	GpuProfile::Stop(); // desport: KYTY_GPU_PROFILE (likewise)
 	SubmitAsync(); // desport: KYTY_ASYNC_COMPUTE
 	if (!m_command.IsInvalid()) {
 		Submit();

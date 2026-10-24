@@ -21,6 +21,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "device-fault.h"
+#include "gpu-profile.h" // desport: KYTY_GPU_PROFILE
 #include "live-counters.h" // desport: DES_FRAME pipeline cache hit/miss counters
 #include "local-platform.h"
 
@@ -1179,6 +1180,13 @@ void CreatePipelineInternal(
 		                                      vs_input_info.stage.program->shader_hash,
 		                                      ps_active ? ps_input_info->stage.program->shader_hash : 0));
 	}
+	// desport: KYTY_GPU_PROFILE: what a bind of this pipeline runs (its draws' key).
+	GpuProfile::NotePipeline(pipeline.pipeline,
+	                         vs_input_info.stage.program->table_mode ? GpuProfile::PipeGfxTable
+	                         : native_bindings                       ? GpuProfile::PipeGfxNative
+	                                                                 : GpuProfile::PipeGfxNormal,
+	                         vs_input_info.stage.program->shader_hash,
+	                         ps_active ? ps_input_info->stage.program->shader_hash : 0);
 	// KYTY_PIPELINE_SOURCE_LOG (diagnostic): each pipeline's kind, identity (the precompile's), whether the static cache
 	// gave it, how it was built (0 full, 1 fast, 2 optimize) and the time it took.
 	if (PipelineSourceLog()) {
@@ -1271,6 +1279,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		DeviceFault::NotePipeline(pipeline.pipeline, fmt::format("{} cs {:016x}", native_bindings ? "cs-table" : "cs-normal",
 		                                                         input_info.stage.program->shader_hash));
 	}
+	// desport: KYTY_GPU_PROFILE: what a bind of this pipeline runs (its dispatches' key; wave64 emulated on 32 lanes).
+	GpuProfile::NotePipeline(pipeline.pipeline, native_bindings ? GpuProfile::PipeCsTable : GpuProfile::PipeCsNormal, 0,
+	                         input_info.stage.program->shader_hash, wave_size, wave_size == 64u && subgroup == 32u);
 	if (PipelineSourceLog()) {
 		std::printf("PIPESRC %s key=%016llx static=%d build=%d unoptimized=%d ms=%.1f blob=%zu read_us=%.0f cache_us=%.0f "
 		            "create_us=%.0f\n",

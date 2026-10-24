@@ -45,6 +45,8 @@
 #include "vulkan-recording.h"
 #endif
 #include "device-fault.h"
+#include "gpu-profile.h"  // desport: KYTY_GPU_PROFILE
+#include "live-control.h" // desport: KYTY_GPU_PROFILE (flips)
 
 #include <algorithm>
 #include <array>
@@ -1491,8 +1493,13 @@ void WindowContext::CreateVulkan() {
 		DeviceFault::InstallBindHook(&bind);
 		(void)LocalVulkanRecording::ReplaceBindPipeline(reinterpret_cast<void*>(bind));
 	}
+	// desport: KYTY_GPU_PROFILE: GPU time per draw/dispatch in sampled frames (gpu-profile.h), after the bind hook.
+	GpuProfile::Install(LocalVulkanRecording::HookDispatch(), graphic_ctx.physical_device,
+	                    static_cast<VkDevice>(graphic_ctx.device), queue_family, &LiveControl::g_flips);
 #else
 	DeviceFault::InstallBindHook(&VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdBindPipeline);
+	GpuProfile::Install(VULKAN_HPP_DEFAULT_DISPATCHER, graphic_ctx.physical_device, // desport: KYTY_GPU_PROFILE
+	                    static_cast<VkDevice>(graphic_ctx.device), queue_family, &LiveControl::g_flips);
 #endif
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);

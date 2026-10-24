@@ -15,6 +15,9 @@ namespace LocalVulkanRecording {
 void Install();
 // The Vulkan entry points without recording: for a queue the recording worker does not own.
 const vk::detail::DispatchLoaderDynamic& DirectDispatch();
+// desport: KYTY_GPU_PROFILE: the same table, to hook entries every command ends in (recorded, packet or direct).
+// After Install, before any command is recorded.
+vk::detail::DispatchLoaderDynamic& HookDispatch();
 // Replaces the vkCmdBindPipeline every bind ends in (recorded, packet or direct: the device-loss breadcrumbs of
 // device-fault.h) and returns the one replaced. After Install, before any command is recorded.
 void* ReplaceBindPipeline(void* entry);
