@@ -21,6 +21,7 @@
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "device-fault.h"
+#include "live-counters.h" // desport: DES_FRAME pipeline cache hit/miss counters
 #include "local-platform.h"
 
 #include <algorithm>
@@ -717,6 +718,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				if (create(nullptr, with) == vk::Result::eSuccess) {
 					if (writer != nullptr) writer->Copy(key, *store);
 					t_static_hit = true;
+					LiveCounters::Add(LiveCounters::PipelineStaticHits); // desport: DES_FRAME
 					return vk::Result::eSuccess;
 				}
 				pipeline.pipeline = nullptr;
@@ -754,6 +756,7 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 				if (result == vk::Result::eSuccess) {
 					if (blob_writer != nullptr) blob_writer->Copy(identity, *blobs);
 					t_static_hit = true;
+					LiveCounters::Add(LiveCounters::PipelineStaticHits); // desport: DES_FRAME
 					return result;
 				}
 				pipeline.pipeline = nullptr;
@@ -786,10 +789,17 @@ static vk::Result CreatePipelineHandle(GraphicContext& graphics, PipelineCache::
 	}
 	if (build != PipelineBuild::Optimize && store == nullptr && cached(graphics.static_pipeline_cache)) {
 		t_static_hit = true;
+		LiveCounters::Add(LiveCounters::PipelineStaticHits); // desport: DES_FRAME
 		return vk::Result::eSuccess;
 	}
+	// desport: DES_FRAME: no static hit from here on (pipeline_static_misses); a driver cache hit is only visible for Fast builds
+	// (the others create without eFailOnPipelineCompileRequired).
+	if (build != PipelineBuild::Optimize) LiveCounters::Add(LiveCounters::PipelineStaticMisses);
 	if (build != PipelineBuild::Fast) return create(driver_cache, info);
-	if (cached(driver_cache)) return vk::Result::eSuccess;
+	if (cached(driver_cache)) {
+		LiveCounters::Add(LiveCounters::PipelineDriverHits); // desport: DES_FRAME
+		return vk::Result::eSuccess;
+	}
 	// In no cache: NVIDIA compiles this ~100x faster, so the draw or dispatch does not stall.
 	info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
 	pipeline.unoptimized = true;
