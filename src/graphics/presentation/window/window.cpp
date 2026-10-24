@@ -368,8 +368,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
 		if (pad == nullptr) { // desport: port of upstream e6cb880a (a gamepad that cannot be opened no longer aborts the emulator)
-			LOGF("Controller: ignoring gamepad %d that could not be opened: %s
-", f.id, SDL_GetError());
+			LOGF("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id, SDL_GetError());
 			return;
 		}
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
