@@ -52,8 +52,7 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_SIMD
+// desport: the stb_image implementation moved to libJpegDec.cpp (upstream ba0e93da)
 #include "stb_image.h"
 
 // IWYU pragma: no_include <intrin.h>
