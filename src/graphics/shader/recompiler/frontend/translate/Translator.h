@@ -16,8 +16,11 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
+	// desport: a workgroup barrier of the lockstep halves (IR::Program::wave_uniform).
+	void EmitWaveBarrier();
 
 private:
+	IR::U1 AnyLaneOfWave(IR::U1 value); // desport
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);

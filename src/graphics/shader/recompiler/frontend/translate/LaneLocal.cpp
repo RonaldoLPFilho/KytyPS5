@@ -231,8 +231,36 @@ bool SaveExec(Opcode opcode) {
 	}
 }
 
-// Instructions that read or write other lanes, or depend on the wave's layout: never lane-local here.
-const char* RefusedOpcode(const Instruction& inst) {
+// desport: the LDS accesses the lockstep halves keep (WaveLaneLocalOptions): plain reads, writes and atomics of the
+// workgroup's LDS; not GDS, nor the DS operations that move data between lanes or count them.
+bool LockstepLds(const Instruction& inst) {
+	if (inst.family != Family::DS || inst.gds) return false;
+	switch (inst.opcode) {
+		case Opcode::DS_SWIZZLE_B32:
+		case Opcode::DS_BPERMUTE_B32:
+		case Opcode::DS_CONSUME:
+		case Opcode::DS_APPEND: return false;
+		default: return true;
+	}
+}
+
+// desport: what an LDS access does for the barriers between the lockstep halves: 1 reads, 2 writes, 3 both (atomics);
+// 0 lane-private (mode 2: DS_*_ADDTID, each lane its own dword at the same base).
+uint32_t LdsAccess(const Instruction& inst, uint32_t mode) {
+	if (inst.opcode == Opcode::DS_READ_ADDTID_B32 || inst.opcode == Opcode::DS_WRITE_ADDTID_B32)
+		return mode >= 2 ? 0u : inst.opcode == Opcode::DS_READ_ADDTID_B32 ? 1u : 2u;
+	const auto name = magic_enum::enum_name(inst.opcode);
+	if (name.starts_with("DS_READ")) return 1u;
+	if (name.starts_with("DS_WRITE")) return 2u;
+	return 3u;
+}
+
+// Instructions that read or write other lanes, or depend on the wave's layout: never lane-local here (desport: with
+// the lockstep halves, `lockstep`, V_READLANE goes through workgroup memory, V_WRITELANE compares the wave's lane, and
+// the plain LDS accesses are ordered by barriers).
+const char* RefusedOpcode(const Instruction& inst, bool lockstep = false) {
+	if (lockstep && (inst.opcode == Opcode::V_READLANE_B32 || inst.opcode == Opcode::V_WRITELANE_B32 || LockstepLds(inst)))
+		return nullptr;
 	switch (inst.opcode) {
 		case Opcode::V_READLANE_B32: return "V_READLANE";
 		case Opcode::V_WRITELANE_B32: return "V_WRITELANE";
@@ -312,9 +340,26 @@ using Syms = std::array<Sym, 128>;
 class Analysis {
 public:
 	Analysis(const Decoder::Program& program, const CFG::Graph& cfg): m_program(program), m_cfg(cfg) {}
+	// desport: the lockstep halves of a one-wave group (KYTY_WAVE64_MODE=`mode`, WaveLaneLocalOptions).
+	Analysis(const Decoder::Program& program, const CFG::Graph& cfg, uint32_t mode)
+	    : m_program(program), m_cfg(cfg), m_lockstep(true), m_mode(mode) {}
+
+	// desport: what the lockstep halves need (after a Run that returned true).
+	void Plan(WaveLaneLocalPlan& plan) const {
+		plan.wave_uniform = m_lockstep;
+		plan.barrier_pcs.clear();
+		plan.exchange_pcs.clear();
+		for (size_t i = 0; i < m_sync.size(); ++i)
+			if (m_sync[i]) plan.barrier_pcs.push_back(m_program.instructions[i].pc);
+		for (size_t i = 0; i < m_exchange.size(); ++i)
+			if (m_exchange[i]) plan.exchange_pcs.push_back(m_program.instructions[i].pc);
+		std::ranges::sort(plan.barrier_pcs);
+		std::ranges::sort(plan.exchange_pcs);
+	}
 
 	bool Run(std::string* reason) {
 		const auto& blocks = m_cfg.blocks;
+		m_exchange.assign(m_program.instructions.size(), false); // desport
 		if (blocks.empty() || m_cfg.irreducible) return Refuse(reason, "control flow");
 		for (size_t i = 0; i < blocks.size(); ++i) m_index_of[blocks[i].id] = i;
 		std::vector<State> in(blocks.size());
@@ -339,7 +384,8 @@ public:
 				const auto found = m_index_of.find(successor_id);
 				if (found == m_index_of.end()) continue;
 				const auto successor = found->second;
-				State      edge      = OnEdge(blocks[block].terminator, successor_id, state);
+				// desport: (the lockstep halves branch together: a half may go on without an active lane.)
+				State      edge      = m_lockstep ? state : OnEdge(blocks[block].terminator, successor_id, state);
 				if (reached[successor]) {
 					State merged = in[successor];
 					merged.Join(edge);
@@ -368,6 +414,9 @@ public:
 			}
 			out[block] = state;
 		}
+		// desport: the lockstep halves branch together (every branch on EXEC or VCC a vote of both): only the LDS
+		// barriers to place.
+		if (m_lockstep) return PlanSync(reached, reason);
 		return WaveBranches(out, reached, reason);
 	}
 
@@ -623,8 +672,10 @@ private:
 					SetPair(state.lanes, ScalarIndex(inst.dst2), true);
 				}
 				if (inst.dst.kind == OperandKind::Vgpr) {
+					// (desport: V_WRITELANE writes one lane.)
 					const bool uniform = LaneSelectSource(inst) < 0 && inst.opcode != Opcode::V_PERMLANE16_B32 &&
-					                     inst.opcode != Opcode::V_PERMLANEX16_B32 && UniformSources(inst, before);
+					                     inst.opcode != Opcode::V_PERMLANEX16_B32 && inst.opcode != Opcode::V_WRITELANE_B32 &&
+					                     UniformSources(inst, before);
 					// (A write of part of the register keeps the rest: an SDWA selection, a 16-bit result (names with
 					// 16, but packed ones).)
 					const auto     name    = magic_enum::enum_name(inst.opcode);
@@ -684,9 +735,9 @@ private:
 	}
 
 	// The reason the instruction is not lane-local in this state, or null.
-	const char* Check(size_t block, uint32_t index, const State& state) const {
+	const char* Check(size_t block, uint32_t index, const State& state) {
 		const auto& inst = m_program.instructions[index];
-		if (const char* refused = RefusedOpcode(inst)) return refused;
+		if (const char* refused = RefusedOpcode(inst, m_lockstep)) return refused;
 		{
 			// EXEC is set by compares and by 64-bit mask operations (their sources checked below).
 			Scalars written;
@@ -730,9 +781,18 @@ private:
 			case Family::SOPP:
 				// A branch on VCC goes another way for a half than for the wave only when the half has no active lane:
 				// VCC must hold EXEC's lanes (or be zero in the whole wave).
+				// (desport: the lockstep halves vote, each with its lanes' bits: VCC must be a mask per lane.)
 				if ((inst.opcode == Opcode::S_CBRANCH_VCCZ || inst.opcode == Opcode::S_CBRANCH_VCCNZ) &&
-				    (!PairFacts(VccLo, state).covers || !state.lanes.test(VccLo) || !state.lanes.test(VccHi)))
+				    ((!m_lockstep && !PairFacts(VccLo, state).covers) || !state.lanes.test(VccLo) || !state.lanes.test(VccHi)))
 					return "a branch on VCC without EXEC's lanes";
+				break;
+			case Family::DS:
+				// desport: (the lockstep halves' LDS accesses: RefusedOpcode let only those through.) DS_*_ADDTID's
+				// base is M0.
+				for (uint32_t s = 0; s < 4; ++s)
+					if (MaskIn(*Source(inst, s), 1, state)) return "a lane mask used as an address or resource";
+				if ((inst.opcode == Opcode::DS_READ_ADDTID_B32 || inst.opcode == Opcode::DS_WRITE_ADDTID_B32) && state.mask.test(M0))
+					return "a lane mask used as an address or resource";
 				break;
 			case Family::SMEM:
 			case Family::MUBUF:
@@ -758,11 +818,17 @@ private:
 					if (!LaneMask(selector, state)) return "a lane select from the wave's layout";
 				}
 				if (inst.opcode == Opcode::V_READFIRSTLANE_B32) {
-					// (A half without an active lane would read none of the wave's.)
-					if (!state.active) return "V_READFIRSTLANE where a half may have no active lane";
 					const auto& source = inst.src0;
 					const bool  uniform =
 					    source.kind == OperandKind::Vgpr ? source.reg < 256 && state.uniform.test(source.reg) : !is_mask(source);
+					// desport: the lockstep halves read the wave's first active lane through workgroup memory, unless
+					// both halves have an active lane and the value is the same in all of them (or a scalar's).
+					if (m_lockstep) {
+						if (source.kind == OperandKind::Vgpr && (!state.active || !uniform)) m_exchange[index] = true;
+						break;
+					}
+					// (A half without an active lane would read none of the wave's.)
+					if (!state.active) return "V_READFIRSTLANE where a half may have no active lane";
 					if (!uniform && !Waterfall(block, index)) return "V_READFIRSTLANE of a lane value outside a waterfall loop";
 				}
 				break;
@@ -1079,9 +1145,66 @@ private:
 		return false;
 	}
 
+	// desport: the workgroup barriers the lockstep halves need before LDS accesses (m_sync, by instruction). Since the
+	// last barrier, on some path: an LDS write (bit 2), an LDS read (bit 1) by either half. A read after a write, a write
+	// after a read, an atomic after either and (mode 1) a write after a write may meet the other half's access, which
+	// the wave's lockstep ordered: a barrier first. A forward dataflow (union at joins); an access once given a barrier
+	// keeps it, so the set only grows and the dataflow is monotone for each set: to a fixpoint of both.
+	uint32_t SyncTransfer(size_t index, uint32_t bits, bool* marked) {
+		const auto& inst = m_program.instructions[index];
+		if (inst.opcode == Opcode::S_BARRIER) return 0u;
+		if (!LockstepLds(inst)) return bits;
+		const uint32_t access = LdsAccess(inst, m_mode);
+		if (access == 0u) return bits;
+		const bool need = ((access & 1u) != 0u && (bits & 2u) != 0u) || ((access & 2u) != 0u && (bits & 1u) != 0u) ||
+		                  (access == 3u && bits != 0u) || ((access & 2u) != 0u && (bits & 2u) != 0u && m_mode < 2u);
+		if (need && marked != nullptr && !m_sync[index]) {
+			m_sync[index] = true;
+			*marked       = true;
+		}
+		return (m_sync[index] ? 0u : bits) | access;
+	}
+
+	bool PlanSync(const std::vector<bool>& reached, std::string* reason) {
+		const auto& blocks = m_cfg.blocks;
+		m_sync.assign(m_program.instructions.size(), false);
+		std::vector<std::vector<size_t>> successors(blocks.size());
+		for (size_t b = 0; b < blocks.size(); ++b)
+			for (const auto id: blocks[b].successors)
+				if (const auto found = m_index_of.find(id); found != m_index_of.end()) successors[b].push_back(found->second);
+		for (uint32_t round = 0; round < 1024; ++round) {
+			std::vector<uint32_t> in(blocks.size(), 0u);
+			for (bool changed = true; changed;) {
+				changed = false;
+				for (size_t b = 0; b < blocks.size(); ++b) {
+					if (!reached[b]) continue;
+					uint32_t bits = in[b];
+					for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) bits = SyncTransfer(i, bits, nullptr);
+					for (const auto s: successors[b])
+						if ((in[s] | bits) != in[s]) {
+							in[s] |= bits;
+							changed = true;
+						}
+				}
+			}
+			bool marked = false;
+			for (size_t b = 0; b < blocks.size(); ++b) {
+				if (!reached[b]) continue;
+				uint32_t bits = in[b];
+				for (auto i = blocks[b].inst_begin; i < blocks[b].inst_end; ++i) bits = SyncTransfer(i, bits, &marked);
+			}
+			if (!marked) return true;
+		}
+		return Refuse(reason, "LDS barriers did not converge");
+	}
+
 	const Decoder::Program&              m_program;
 	const CFG::Graph&                    m_cfg;
 	std::unordered_map<uint32_t, size_t> m_index_of;
+	bool                                 m_lockstep = false; // desport: the lockstep halves (KYTY_WAVE64_MODE)
+	uint32_t                             m_mode     = 0;
+	std::vector<bool>                    m_sync;     // desport: a workgroup barrier before the instruction
+	std::vector<bool>                    m_exchange; // desport: V_READFIRSTLANE through workgroup memory
 };
 
 } // namespace
@@ -1090,6 +1213,28 @@ bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason) {
 	// (On the program's own branches: the structured graph routes some through variables, scalar state of its own.)
 	const auto cfg = CFG::BuildGraph(program);
 	return Analysis(program, cfg).Run(reason);
+}
+
+// desport: KYTY_WAVE64_MODE. The proof above first (halves on their own: no barrier); then, for a one-wave group, the
+// lockstep halves.
+bool IsWaveLaneLocal(const Decoder::Program& program, const WaveLaneLocalOptions& options, std::string* reason,
+                     WaveLaneLocalPlan* plan) {
+	if (plan != nullptr) *plan = {};
+	const auto  cfg = CFG::BuildGraph(program);
+	std::string refused;
+	if (Analysis(program, cfg).Run(&refused)) return true;
+	if (options.mode == 0 || options.group_threads != 64u || plan == nullptr) {
+		if (reason != nullptr) *reason = std::move(refused);
+		return false;
+	}
+	Analysis    lockstep(program, cfg, options.mode);
+	std::string lockstep_refused;
+	if (lockstep.Run(&lockstep_refused)) {
+		lockstep.Plan(*plan);
+		return true;
+	}
+	if (reason != nullptr) *reason = refused + "; lockstep: " + lockstep_refused;
+	return false;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

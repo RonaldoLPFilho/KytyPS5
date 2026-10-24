@@ -47,4 +47,22 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 // with 32-wide subgroups it runs one GCN lane per invocation. `reason`: why not.
 bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr);
 
+// desport: KYTY_WAVE64_MODE. A wave64 compute program whose workgroup is one wave (64 threads) the proof above refuses
+// may still run one GCN lane per invocation with the wave's two halves (its two subgroups, the whole workgroup) in
+// lockstep: every branch on EXEC or VCC a vote of both halves, V_READLANE and (where a half may have no active lane)
+// V_READFIRSTLANE through workgroup memory between barriers, and a workgroup barrier where an LDS access may meet
+// another half's (the wave's lanes exchange data there without one).
+struct WaveLaneLocalOptions {
+	uint32_t mode          = 0; // 0: off; 1: lockstep halves, LDS ordered strictly; 2: also writes after writes
+	                            // unordered and DS_*_ADDTID lane-private
+	uint32_t group_threads = 0; // threads in the workgroup
+};
+struct WaveLaneLocalPlan {
+	bool                  wave_uniform = false; // the lockstep halves (only with WaveLaneLocalOptions::mode)
+	std::vector<uint32_t> barrier_pcs;          // a workgroup barrier before these LDS accesses (sorted)
+	std::vector<uint32_t> exchange_pcs;         // V_READFIRSTLANE through workgroup memory (sorted)
+};
+bool IsWaveLaneLocal(const Decoder::Program& program, const WaveLaneLocalOptions& options, std::string* reason,
+                     WaveLaneLocalPlan* plan);
+
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

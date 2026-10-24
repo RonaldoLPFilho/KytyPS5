@@ -518,6 +518,104 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
+// desport: the lockstep halves (IR::Program::wave_uniform, KYTY_WAVE64_MODE): a lane-local program of a one-wave
+// group (64 invocations, two subgroups) exchanges the wave's values through workgroup memory, each invocation in its
+// own dwords (the wave's lane: its index in the group), between workgroup barriers both halves reach (every branch on
+// EXEC or VCC a vote of both).
+bool LockstepHalves(const EmitterState& state) {
+	return state.lane_count == 1 && state.program.lane_local && state.program.wave_uniform;
+}
+
+void EmitLockstepBarrier(EmitterState& state) {
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup), ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+}
+
+uint32_t LockstepSlot(EmitterState& state, uint32_t index) {
+	if (state.wave_exchange_variable == 0) {
+		state.wave_exchange_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, 128), StorageClassWorkgroup);
+		state.builder.AddName(state.wave_exchange_variable, "wave_exchange");
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassWorkgroup, TypeU32(state)), pointer,
+	                           state.wave_exchange_variable, index});
+	return pointer;
+}
+
+uint32_t LockstepLoad(EmitterState& state, uint32_t index) {
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, LockstepSlot(state, index)});
+	return value;
+}
+
+// Every invocation's `value` (and `flag`, unless 0) in its dwords: then each lane's are readable until the next.
+void LockstepPublish(EmitterState& state, uint32_t value, uint32_t flag) {
+	const auto lane = EmitBinaryU32(state, OpBitwiseAnd, EmitLocalInvocationIndex(state), ConstantU32(state, 63));
+	EmitLockstepBarrier(state); // (the other half's reads of the last exchange done)
+	state.builder.AddFunction({OpStore, LockstepSlot(state, lane), value});
+	if (flag != 0) {
+		state.builder.AddFunction({OpStore, LockstepSlot(state, EmitAddU32(state, lane, ConstantU32(state, 64))), flag});
+	}
+	EmitLockstepBarrier(state);
+	state.wave_exchange_value = 0;
+	state.wave_exchange_label = 0;
+}
+
+// V_READLANE: the lane's value, in whichever half (again from the same exchange for the same value in a block).
+uint32_t EmitLockstepReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (inst.Arg(0).GetType() != IR::Type::U32) {
+		ctx.Fail(inst, "lockstep read lane of a value that is not 32-bit");
+	}
+	const auto value = ctx.Arg(inst, 0);
+	if (state.wave_exchange_value != value || state.wave_exchange_label != state.current_label) {
+		LockstepPublish(state, value, 0);
+		state.wave_exchange_value = value;
+		state.wave_exchange_label = state.current_label;
+	}
+	return LockstepLoad(state, EmitBinaryU32(state, OpBitwiseAnd, ctx.Arg(inst, 1), ConstantU32(state, 63)));
+}
+
+// A branch on EXEC or VCC: whether a lane of either half is active (`half_any`: of this one).
+uint32_t EmitLockstepAnyLane(EmitterState& state, uint32_t half_any) {
+	LockstepPublish(state, Select(state, TypeU32(state), half_any, ConstantU32(state, 1), ConstantU32(state, 0)), 0);
+	const auto both = EmitBinaryU32(state, OpBitwiseOr, LockstepLoad(state, ConstantU32(state, 0)),
+	                                LockstepLoad(state, ConstantU32(state, 32)));
+	return Binary(state, OpINotEqual, TypeBool(state), both, ConstantU32(state, 0));
+}
+
+// V_READFIRSTLANE: the first active lane of the wave (lanes 0-31 first; none active: lane 0, as the hardware).
+uint32_t EmitLockstepReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	if (inst.Arg(0).GetType() != IR::Type::U32) {
+		ctx.Fail(inst, "lockstep read first lane of a value that is not 32-bit");
+	}
+	const auto ballot = ctx.Ballot(inst.Arg(1));
+	const auto bits   = state.builder.AllocateId();
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), bits, ballot, 0});
+	const auto any   = Binary(state, OpINotEqual, TypeBool(state), bits, ConstantU32(state, 0));
+	const auto lane  = Select(state, TypeU32(state), any, ctx.FirstLane(ballot), ConstantU32(state, 0));
+	const auto value = ctx.Shuffle(inst, 0, lane);
+	LockstepPublish(state, value, Select(state, TypeU32(state), any, ConstantU32(state, 1), ConstantU32(state, 0)));
+	const auto low_any  = Binary(state, OpINotEqual, TypeBool(state), LockstepLoad(state, ConstantU32(state, 64)),
+	                             ConstantU32(state, 0));
+	const auto high_any = Binary(state, OpINotEqual, TypeBool(state), LockstepLoad(state, ConstantU32(state, 96)),
+	                             ConstantU32(state, 0));
+	const auto low      = Binary(state, OpLogicalOr, TypeBool(state), low_any,
+	                             Unary(state, OpLogicalNot, TypeBool(state), high_any));
+	return Select(state, TypeU32(state), low, LockstepLoad(state, ConstantU32(state, 0)),
+	              LockstepLoad(state, ConstantU32(state, 32)));
+}
+
+// The wave's lane of the invocation (a lane-local program's subgroup is half a wave).
+uint32_t EmitWaveLaneId(EmitterState& state) {
+	if (state.lane_count == 1 && state.program.lane_local) {
+		return EmitBinaryU32(state, OpBitwiseAnd, EmitLocalInvocationIndex(state), ConstantU32(state, 63));
+	}
+	return EmitSubgroupLocalInvocationId(state);
+}
+
 } // namespace
 
 bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -608,23 +706,40 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto high   = state.builder.AllocateId();
 			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
 			state.builder.AddFunction({OpCompositeExtract, TypeU32(state), high, ballot, 1});
+			// desport: the lockstep halves' vote (IR::WaveExchangeFlag).
+			if (LockstepHalves(state) && (inst.Flags<uint64_t>() & IR::WaveExchangeFlag) != 0u) {
+				const auto half_any = Binary(state, OpINotEqual, TypeBool(state),
+				                             EmitBinaryU32(state, OpBitwiseOr, low, high), ConstantU32(state, 0));
+				ctx.Define(inst, EmitLockstepAnyLane(state, half_any));
+				return true;
+			}
 			ctx.Emit(inst, OpINotEqual, IR::Type::U1,
 			         {EmitBinaryU32(state, OpBitwiseOr, low, high), ConstantU32(state, 0)});
 			return true;
 		}
 		case IR::ValueOpcode::ReadFirstLane: {
+			// desport: the lockstep halves' wave first lane (IR::WaveExchangeFlag).
+			if (LockstepHalves(state) && (inst.Flags<uint64_t>() & IR::WaveExchangeFlag) != 0u) {
+				ctx.Define(inst, EmitLockstepReadFirstLane(ctx, inst));
+				return true;
+			}
 			const auto ballot = ctx.Ballot(inst.Arg(1));
 			const auto lane   = ctx.FirstLane(ballot);
 			ctx.Define(inst, ctx.Shuffle(inst, 0, lane));
 			return true;
 		}
 		case IR::ValueOpcode::ReadLane:
+			// desport: a lane-local program reads lanes only with the lockstep halves (LaneLocal.cpp): any half's.
+			if (LockstepHalves(state)) {
+				ctx.Define(inst, EmitLockstepReadLane(ctx, inst));
+				return true;
+			}
 			ctx.Define(inst, ctx.Shuffle(inst, 0, ctx.Arg(inst, 1)));
 			return true;
 		case IR::ValueOpcode::WriteLane: {
+			// desport: the wave's lane (EmitWaveLaneId: a lane-local program's subgroup is half a wave).
 			const auto hit = state.builder.AllocateId();
-			state.builder.AddFunction({OpIEqual, TypeBool(state), hit,
-			                           EmitSubgroupLocalInvocationId(state), ctx.Arg(inst, 2)});
+			state.builder.AddFunction({OpIEqual, TypeBool(state), hit, EmitWaveLaneId(state), ctx.Arg(inst, 2)});
 			ctx.Emit(inst, OpSelect, IR::Type::U32, {hit, ctx.Arg(inst, 1), ctx.Arg(inst, 0)});
 			return true;
 		}

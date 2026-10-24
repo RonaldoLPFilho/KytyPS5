@@ -2,6 +2,8 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/shader.h"
 
+#include <fmt/format.h> // desport: (KYTY_WAVE64_REPORT)
+
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -739,6 +741,20 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
+// desport: whether a lane is active in the wave: in the lockstep halves (IR::Program::wave_uniform), a vote of both
+// (the backend's AnyLane with IR::WaveExchangeFlag), so that they go the same way.
+IR::U1 Translator::AnyLaneOfWave(IR::U1 value) {
+	if (!program.wave_uniform) {
+		return ir.AnyLane(value);
+	}
+	return IR::U1(ir.Emit(IR::ValueOpcode::AnyLane, {value}, IR::WaveExchangeFlag));
+}
+
+// desport: a workgroup barrier of the lockstep halves (an LDS access that may meet the other half's).
+void Translator::EmitWaveBarrier() {
+	ir.Emit(IR::ValueOpcode::Barrier);
+}
+
 void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
 	if (source.terminator.goto_value >= 0) {
 		if (source.terminator.goto_variable == UINT32_MAX) {
@@ -767,10 +783,11 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetVcc())); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.AnyLane(ir.GetVcc()); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.AnyLane(ir.GetExec())); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.AnyLane(ir.GetExec()); break;
+		// (desport: AnyLaneOfWave, a vote of both halves in lockstep.)
+		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(AnyLaneOfWave(ir.GetVcc())); break;
+		case CFG::BranchCondition::VccNonZero: condition = AnyLaneOfWave(ir.GetVcc()); break;
+		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(AnyLaneOfWave(ir.GetExec())); break;
+		case CFG::BranchCondition::ExecNonZero: condition = AnyLaneOfWave(ir.GetExec()); break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;
@@ -952,12 +969,45 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			const char* value = std::getenv("KYTY_LANE_LOCAL");
 			return value == nullptr || std::string_view(value) != "0";
 		}();
-		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr;
-		std::string reason;
-		result.lane_local = enabled && IsWaveLaneLocal(decoded, log ? &reason : nullptr);
+		static const bool log = std::getenv("KYTY_LANE_LOCAL_LOG") != nullptr ||
+		                        std::getenv("KYTY_WAVE64_REPORT") != nullptr; // desport: (either one)
+		// desport: KYTY_WAVE64_MODE=1|2: a one-wave group (64 threads) the proof refuses may run with its two halves in
+		// lockstep (IsWaveLaneLocal with WaveLaneLocalOptions); 2 also leaves writes after writes in LDS unordered and
+		// DS_*_ADDTID lane-private. Absent or 0: as before.
+		static const uint32_t wave64_mode = [] {
+			const char* value   = std::getenv("KYTY_WAVE64_MODE");
+			const auto  mode    = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
+			const auto  clamped = static_cast<uint32_t>(mode <= 2ul ? mode : 0ul);
+			std::printf("DES_WAVE64 mode=%u lane_local=%d report=%d\n", clamped, enabled ? 1 : 0, log ? 1 : 0);
+			return clamped;
+		}();
+		std::string          reason;
+		WaveLaneLocalPlan    plan;
+		WaveLaneLocalOptions wave64;
+		wave64.mode = wave64_mode;
+		if (options.compute != nullptr) {
+			wave64.group_threads = std::max(options.compute->threads_num[0], 1u) *
+			                       std::max(options.compute->threads_num[1], 1u) *
+			                       std::max(options.compute->threads_num[2], 1u);
+			// (The exchange takes 128 dwords of workgroup memory beside the LDS: within the 48 KiB every Vulkan GPU
+			// here gives, or not at all. A host with 64-wide subgroups runs a wave in one: nothing to gain.)
+			if (options.compute->lds_size_dwords + 128u > 12288u || options.compute->host_subgroup_size != 32u) {
+				wave64.mode = 0;
+			}
+		}
+		result.lane_local = enabled && IsWaveLaneLocal(decoded, wave64, log ? &reason : nullptr, &plan);
+		if (result.lane_local && plan.wave_uniform) {
+			result.wave_uniform      = true;
+			result.wave_barrier_pcs  = std::move(plan.barrier_pcs);
+			result.wave_exchange_pcs = std::move(plan.exchange_pcs);
+			reason = fmt::format("yes (lockstep, mode {}, group {}: {} LDS barriers, {} first-lane exchanges)", wave64.mode,
+			                     wave64.group_threads, result.wave_barrier_pcs.size(), result.wave_exchange_pcs.size());
+		} else if (result.lane_local) {
+			reason = "yes";
+		}
 		if (log)
 			std::printf("LaneLocal CS %016llx: %s\n", static_cast<unsigned long long>(options.shader_hash),
-			            result.lane_local ? "yes" : reason.c_str());
+			            reason.c_str());
 	}
 	result.shader_hash         = options.shader_hash;
 	result.user_data_base      = options.user_data_base;
@@ -1260,6 +1310,10 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  embedded->components,
 				                                  options.vertex->resources[resource]);
 				continue;
+			}
+			// desport: the lockstep halves' barrier before an LDS access that may meet the other half's.
+			if (result.wave_uniform && std::ranges::binary_search(result.wave_barrier_pcs, instruction.pc)) {
+				translator.EmitWaveBarrier();
 			}
 			translator.TranslateInstruction(instruction);
 		}

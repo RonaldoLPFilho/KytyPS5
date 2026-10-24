@@ -414,6 +414,11 @@ struct EmitterState {
 	uint32_t                                         shader_data_storage_variable = 0;
 	uint32_t                                         flattened_srt_variable  = 0;
 	uint32_t                                         lds_variable            = 0;
+	// desport: the lockstep halves' exchange (IR::Program::wave_uniform): 64 dwords of values, 64 of flags, by the wave's
+	// lane; the value whose 64 lanes it holds since the last barrier in the block of `wave_exchange_label` (0: none).
+	uint32_t                                         wave_exchange_variable  = 0;
+	uint32_t                                         wave_exchange_value     = 0;
+	uint32_t                                         wave_exchange_label     = 0;
 	uint32_t                                         compact_lds_dwords      = 0;
 	std::unordered_map<const IR::Inst*, uint32_t>      function_lds_slots;
 	std::unordered_map<uint32_t, uint32_t>             function_lds_index_slots;

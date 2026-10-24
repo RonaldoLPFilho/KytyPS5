@@ -858,7 +858,14 @@ bool Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto base =
 	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
-	const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	// desport: the wave's lane (a lane-local program's LaneId is its subgroup's, a half wave's: the halves would share
+	// the dwords of lanes 0-31).
+	const auto lane    = program.lane_local
+	                         ? ir.BitwiseAnd(IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+	                                                         {IR::Value(static_cast<uint32_t>(IR::StageInputKind::LocalInvocationIndex)),
+	                                                          IR::Value(0u)})),
+	                                         IR::U32(IR::Value(63u)))
+	                         : IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
 	const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
 	if (write) {
 		ir.Emit(IR::ValueOpcode::WriteSharedU32,

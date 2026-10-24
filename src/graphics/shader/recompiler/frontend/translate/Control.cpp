@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+#include <algorithm> // desport: (std::ranges::binary_search)
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
@@ -366,7 +368,10 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_READFIRSTLANE_B32(const Decoder::Instruction& inst) {
-	const auto result = ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), ir.GetExec()});
+	// desport: the lockstep halves read the wave's first active lane (IR::WaveExchangeFlag) where a half may have none.
+	const bool exchange = program.wave_uniform && std::ranges::binary_search(program.wave_exchange_pcs, inst.pc);
+	const auto result   = ir.Emit(IR::ValueOpcode::ReadFirstLane, {ReadU32(inst.src0), ir.GetExec()},
+	                              exchange ? IR::WaveExchangeFlag : uint64_t {0});
 	WriteOperand(DestinationOperand(inst), result);
 }
 

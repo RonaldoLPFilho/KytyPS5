@@ -680,6 +680,10 @@ struct ResourcePlan {
 	UniformFillPlan                     uniform_fill;
 };
 
+// desport: on AnyLane and ReadFirstLane in a lane-local program with lockstep halves (Program::wave_uniform): the
+// value of the whole wave, its two halves (subgroups) exchanging theirs through workgroup memory between barriers.
+constexpr uint64_t WaveExchangeFlag = 1u;
+
 struct Program: ResourcePlan {
 	Program() = default;
 	~Program();
@@ -696,6 +700,12 @@ struct Program: ResourcePlan {
 	// A wave64 compute program whose lanes' results depend on no lane outside their 32-lane half
 	// (Frontend::IsWaveLaneLocal): a host with 32-wide subgroups runs it one GCN lane per invocation.
 	bool                          lane_local     = false;
+	// desport: KYTY_WAVE64_MODE (Frontend::WaveLaneLocalPlan): a lane-local program of a one-wave group whose two halves
+	// run in lockstep: every branch on EXEC or VCC a vote of both (WaveExchangeFlag), V_READLANE and the V_READFIRSTLANE at
+	// wave_exchange_pcs through workgroup memory, a workgroup barrier before the LDS accesses at wave_barrier_pcs.
+	bool                          wave_uniform   = false;
+	std::vector<uint32_t>         wave_barrier_pcs;
+	std::vector<uint32_t>         wave_exchange_pcs;
 	uint32_t                      scratch_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;

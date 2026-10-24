@@ -310,6 +310,13 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 			}
 		}
 	}
+	// desport: the lockstep halves (IR::Program::wave_uniform) find the wave's lane and half by the invocation's index in
+	// the group (declared for a lane-local program with this requirement) and vote with ballots.
+	if (program.lane_local && program.wave_uniform) {
+		MarkBallot();
+		requirements.subgroup_shuffle             = true;
+		requirements.subgroup_local_invocation_id = true;
+	}
 	program.spirv_requirements.emplace(requirements);
 }
 
