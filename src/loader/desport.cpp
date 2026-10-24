@@ -49,6 +49,7 @@ std::set<std::string> g_milestones;
 
 // desport: movie pacing (see desport.h). Number of .bk2 files open.
 std::atomic_int g_movie_files {0};
+std::atomic_int g_movies_open {0}; // desport: ultrawide movie pillarbox (counted whatever the pacing setting)
 
 bool MoviePacingEnabled() {
 	static const bool enabled = [] {
@@ -76,6 +77,10 @@ uint64_t ElapsedMilliseconds() { // desport: crash record
 	return ElapsedMs();
 }
 
+bool MoviePlaying() { // desport: ultrawide movie pillarbox
+	return g_movies_open.load(std::memory_order_relaxed) > 0; // desport
+}
+
 int MovieFlipFloor() {
 	if (g_movie_files.load(std::memory_order_relaxed) <= 0) {
 		return 0;
@@ -88,6 +93,7 @@ int MovieFlipFloor() {
 }
 
 void MovieFileOpened(const char* guest_path) {
+	if (IsMoviePath(guest_path)) g_movies_open.fetch_add(1); // desport: MoviePlaying()
 	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
 		return;
 	}
@@ -98,6 +104,7 @@ void MovieFileOpened(const char* guest_path) {
 }
 
 void MovieFileClosed(const char* guest_path) {
+	if (IsMoviePath(guest_path) && g_movies_open.fetch_sub(1) <= 0) g_movies_open.store(0); // desport: MoviePlaying()
 	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
 		return;
 	}

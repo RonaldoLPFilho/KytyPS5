@@ -30,6 +30,10 @@
 #include "loader/runtimeLinker.h"
 #include "common/logging/log.h"
 
+#if defined(_WIN32)
+#include <xbyak/xbyak.h> // desport: hud layout wrapper
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -38,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <string_view> // desport: hud layout
 #include <string>
 #include <vector>
 
@@ -325,7 +330,155 @@ void InstallHud(const Loader::Program& program, const char* setting, uint32_t wi
 	       (render ? "" : " - without KYTY_ULTRAWIDE_RENDER the UI target stays 3840x2160")); // desport
 }
 
+// desport: KYTY_ULTRAWIDE_HUD_LAYOUT=16x9 - the UI's layout rectangle (0xdda150 in 01.007.000: the screen object's
+// safe or full rectangle, in virtual units = pixels * reference height / screen height; HUD and menus place their
+// elements in it) at most <height>*16/9 wide, centred: HUD and menus in a 16:9 middle of the ultrawide picture. Its
+// first instruction (vmovsd xmm1, [rdi+4]: the screen size) becomes a jump to a wrapper near the program that runs
+// the function on a copy of the screen object with the width clamped, then moves both corners right by half the
+// clamped-off width. The 3D picture and the UI target stay full width.
+constexpr std::string_view LayoutRectSignature = "c5 fb 10 4f 04 c5 fa 10 57 14 8b 07 c5 fa 16 c1"; // desport
+
+#if defined(_WIN32)
+struct LayoutWrapper : Xbyak::CodeGenerator {
+	LayoutWrapper(void* memory, size_t size, const void* body_continue)
+	    : Xbyak::CodeGenerator(size, memory) {
+		using namespace Xbyak::util;                     // desport
+		Xbyak::Label body, narrow;                       // desport
+		const float sixteen_ninths = 16.0f / 9.0f;       // desport
+		const float half           = 0.5f;               // desport
+		uint32_t    aspect_bits = 0, half_bits = 0;      // desport
+		std::memcpy(&aspect_bits, &sixteen_ninths, 4);   // desport
+		std::memcpy(&half_bits, &half, 4);               // desport
+		// rdi = screen object, rsi = &min, rdx = &max, ecx = flags (kept for the body).
+		push(rbx);                                       // desport
+		push(r12);                                       // desport
+		push(r13);                                       // desport
+		push(r14);                                       // desport
+		sub(rsp, 0x38);                                  // desport: 16-byte aligned for the call below
+		mov(rbx, rsi);                                   // desport
+		mov(r12, rdx);                                   // desport
+		mov(r13, rdi);                                   // desport
+		vmovups(xmm0, ptr[rdi]);                         // desport: copy the screen object's first 0x20 bytes
+		vmovups(ptr[rsp], xmm0);                         // desport
+		vmovups(xmm0, ptr[rdi + 0x10]);                  // desport
+		vmovups(ptr[rsp + 0x10], xmm0);                  // desport
+		vmovss(xmm0, ptr[rsp + 8]);                      // desport: H
+		mov(eax, aspect_bits);                           // desport
+		vmovd(xmm1, eax);                                // desport
+		vmulss(xmm1, xmm0, xmm1);                        // desport: H*16/9
+		vmovss(xmm2, ptr[rsp + 4]);                      // desport: W
+		vxorps(xmm3, xmm3, xmm3);                        // desport: shift = 0
+		vucomiss(xmm2, xmm1);                            // desport
+		jbe(narrow);                                     // desport: not wider than 16:9: as it is
+		vsubss(xmm3, xmm2, xmm1);                        // desport
+		mov(eax, half_bits);                             // desport
+		vmovd(xmm4, eax);                                // desport
+		vmulss(xmm3, xmm3, xmm4);                        // desport: (W - H*16/9) / 2 pixels
+		vroundss(xmm3, xmm3, xmm3, 9);                   // desport: floor
+		vmovss(ptr[rsp + 4], xmm1);                      // desport: the copy's width
+		L(narrow);                                       // desport
+		mov(eax, ptr[rsp]);                              // desport: reference height (u32)
+		vcvtsi2ss(xmm4, xmm4, rax);                      // desport
+		vmulss(xmm3, xmm3, xmm4);                        // desport
+		vdivss(xmm3, xmm3, xmm0);                        // desport: shift in virtual units
+		vmovss(ptr[rsp + 0x20], xmm3);                   // desport
+		mov(rdi, rsp);                                   // desport
+		mov(rsi, rbx);                                   // desport
+		mov(rdx, r12);                                   // desport
+		call(body);                                      // desport: the game's function on the copy
+		vmovss(xmm0, ptr[rsp + 0x20]);                   // desport
+		vaddss(xmm1, xmm0, ptr[rbx]);                    // desport: min.x += shift
+		vmovss(ptr[rbx], xmm1);                          // desport
+		vaddss(xmm1, xmm0, ptr[r12]);                    // desport: max.x += shift
+		vmovss(ptr[r12], xmm1);                          // desport
+		add(rsp, 0x38);                                  // desport
+		pop(r14);                                        // desport
+		pop(r13);                                        // desport
+		pop(r12);                                        // desport
+		pop(rbx);                                        // desport
+		ret();                                           // desport
+		L(body);                                         // desport
+		vmovsd(xmm1, ptr[rdi + 4]);                      // desport: the instruction the jump replaced
+		jmp(body_continue, Xbyak::CodeGenerator::T_NEAR); // desport: the rest of the game's function (ends in ret)
+	}
+};
+#endif
+
+// desport: KYTY_ULTRAWIDE_HUD_LAYOUT.
+void InstallHudLayout(const Loader::Program& program, const char* setting) {
+	if (std::string_view(setting) != "16x9") {
+		Report(std::string("DES_ULTRAWIDE hud_layout skipped: KYTY_ULTRAWIDE_HUD_LAYOUT=") + setting + " is not 16x9"); // desport
+		return;                                                                                                        // desport
+	}
+#if defined(_WIN32)
+	const auto site = Loader::GuestCode::FindUnique(program, Loader::GuestCode::Pattern(LayoutRectSignature)); // desport
+	if (!site) {
+		Report("DES_ULTRAWIDE hud_layout skipped: the UI layout rectangle function not found"); // desport
+		return;                                                                                 // desport
+	}
+	constexpr uint64_t WrapperOffset = 0x8101000; // desport: next to the HUD size copy (0x8100000)
+	constexpr uint64_t WrapperSize   = 0x1000;    // desport
+	if (program.mapped_size >= WrapperOffset || program.base_vaddr > UINT64_MAX - WrapperOffset - WrapperSize) {
+		Report("DES_ULTRAWIDE hud_layout skipped: no room for the wrapper"); // desport
+		return;                                                              // desport
+	}
+	const auto requested = program.base_vaddr + WrapperOffset; // desport
+	const auto memory    = Libs::LibKernel::Memory::AllocateRuntimeMemory(requested, WrapperSize, Common::VirtualMemory::Mode::ReadWrite,
+	                                                                      "desport_ultrawide_layout", true); // desport
+	if (memory != requested) {
+		if (memory != 0) Libs::LibKernel::Memory::FreeGuestMemory(memory, WrapperSize);                       // desport
+		Report("DES_ULTRAWIDE hud_layout skipped: could not allocate the wrapper near the program");            // desport
+		return;                                                                                                 // desport
+	}
+	try {
+		LayoutWrapper wrapper(reinterpret_cast<void*>(memory), WrapperSize, reinterpret_cast<const void*>(*site + 5)); // desport
+	} catch (const Xbyak::Error& error) {
+		Libs::LibKernel::Memory::FreeGuestMemory(memory, WrapperSize);                                           // desport
+		Report(std::string("DES_ULTRAWIDE hud_layout skipped: wrapper not generated (") + std::to_string(static_cast<int>(error)) + ")"); // desport
+		return;                                                                                                  // desport
+	}
+	if (!Libs::LibKernel::Memory::ProtectGuestMemory(memory, WrapperSize, Common::VirtualMemory::Mode::ExecuteRead, nullptr) ||
+	    !Common::VirtualMemory::FlushInstructionCache(memory, WrapperSize)) {
+		Libs::LibKernel::Memory::FreeGuestMemory(memory, WrapperSize);                // desport
+		Report("DES_ULTRAWIDE hud_layout skipped: could not make the wrapper executable"); // desport
+		return;                                                                       // desport
+	}
+	const int64_t displacement = static_cast<int64_t>(memory) - static_cast<int64_t>(*site + 5); // desport
+	if (displacement < INT32_MIN || displacement > INT32_MAX) {
+		Report("DES_ULTRAWIDE hud_layout skipped: the wrapper is out of reach"); // desport
+		return;                                                                  // desport
+	}
+	uint8_t jump[5] {0xe9};                                                      // desport: jmp rel32
+	const auto rel = static_cast<int32_t>(displacement);                         // desport
+	std::memcpy(jump + 1, &rel, sizeof(rel));                                    // desport
+	std::memcpy(reinterpret_cast<void*>(*site), jump, sizeof(jump));             // desport
+	if (!Common::VirtualMemory::FlushInstructionCache(*site, sizeof(jump))) {
+		Report("DES_ULTRAWIDE hud_layout skipped: could not finalize the jump"); // desport
+		return;                                                                  // desport
+	}
+	Report("DES_ULTRAWIDE hud_layout applied: UI layout rectangle at most 16:9, centred"); // desport
+#else
+	(void)program;                                                                         // desport
+	Report("DES_ULTRAWIDE hud_layout skipped: Windows only");                              // desport
+#endif
+}
+
 } // namespace
+
+// desport: see desport.h.
+float UltrawideMovieScale(uint32_t target_width, uint32_t target_height) {
+	static const bool pillarbox = [] {
+		const char* aspect = std::getenv("KYTY_ULTRAWIDE");                                    // desport
+		if (aspect == nullptr || *aspect == '\0') return false;                                // desport
+		const char* mode   = std::getenv("KYTY_ULTRAWIDE_MOVIES");                             // desport
+		if (mode != nullptr && *mode != '\0') return std::string_view(mode) == "pillarbox";    // desport
+		const char* render = std::getenv("KYTY_ULTRAWIDE_RENDER");                             // desport
+		return render != nullptr && std::strcmp(render, "1") == 0;                             // desport: default with RENDER
+	}();
+	if (!pillarbox || target_height == 0) return 0.0f;                                         // desport
+	const float aspect = static_cast<float>(target_width) / static_cast<float>(target_height);  // desport
+	return aspect > 16.0f / 9.0f + 0.01f ? (16.0f / 9.0f) / aspect : 0.0f;                     // desport
+}
 
 void InstallUltrawide(Loader::Program* program) {
 	const char* setting = std::getenv("KYTY_ULTRAWIDE");
@@ -368,6 +521,9 @@ void InstallUltrawide(Loader::Program* program) {
 	} else if (render) {
 		Report("DES_ULTRAWIDE hud skipped: KYTY_ULTRAWIDE_HUD not set (the UI lays out for 3840x2160 into the " +
 		       SizeText(width, height) + " UI target; try KYTY_ULTRAWIDE_HUD=native)"); // desport
+	}
+	if (const char* layout = std::getenv("KYTY_ULTRAWIDE_HUD_LAYOUT"); layout != nullptr && *layout != '\0' && std::strcmp(layout, "0") != 0) {
+		InstallHudLayout(*program, layout); // desport
 	}
 }
 

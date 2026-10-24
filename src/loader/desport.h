@@ -66,6 +66,11 @@ void MovieFileOpened(const char* guest_path);
 void MovieFileClosed(const char* guest_path);
 // Vblanks to leave between two flips while a movie plays (0: none, not playing, 60 Hz or less, or turned off).
 int MovieFlipFloor();
+// desport: a .bk2 file is open (a Bink movie plays), whatever KYTY_MOVIE_PACING says (ultrawide movie pillarbox).
+bool MoviePlaying();
+// desport: KYTY_ULTRAWIDE_MOVIES (desportUltrawide.cpp): the horizontal scale (< 1) that keeps a 16:9 movie at 16:9 in a
+// wider target (`target_width` x `target_height`), or 0 when movies are left to stretch (or not ultrawide).
+float UltrawideMovieScale(uint32_t target_width, uint32_t target_height);
 
 namespace Stats {
 
