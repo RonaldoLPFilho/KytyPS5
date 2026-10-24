@@ -868,6 +868,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			LiveTrace::Event(LiveTrace::FaultCaller, *reinterpret_cast<const uint64_t*>(info->rsp),
 			                 info->exception_address);
 		}
+		// desport: KYTY_REDZONE_FAULT_AUDIT=1: a handled guest fault that could have overwritten live red-zone data.
+		if (Loader::RedZoneFaultAuditEnabled()) {
+			Loader::RedZoneFaultAuditReport(info->exception_address); // desport
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			LiveTrace::Event(LiveTrace::FaultDone, access == GpuAccess::Write ? 1 : 0, info->access_violation_vaddr);
 			return true;
@@ -2339,7 +2343,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			     result.unrelocatable_memory_instruction_count);
 			std::printf("Red-zone patching %s: functions=%" PRIu64 " red_zone=%" PRIu64 " memory=%" PRIu64
 			            " patched=%" PRIu64 " stack=%" PRIu64 " control=%" PRIu64 " unrelocatable=%" PRIu64
-			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 "\n",
+			            " indirect=%" PRIu64 " swept=%" PRIu64 " calls=%" PRIu64 " gap_swept=%" PRIu64 "\n", // desport: gap_swept
 			            Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
 			            result.red_zone_function_count, result.memory_instruction_count,
 			            result.patched_memory_instruction_count,
@@ -2347,7 +2351,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			            result.control_flow_memory_instruction_count,
 			            result.unrelocatable_memory_instruction_count,
 			            result.indirect_red_zone_function_count, result.swept_instruction_count,
-			            result.live_call_count);
+			            result.live_call_count, result.gap_swept_function_count); // desport: gap_swept
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 		}
 		Common::VirtualMemory::FlushInstructionCache(program->red_zone_trampoline_vaddr,

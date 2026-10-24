@@ -22,6 +22,8 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <atomic>       // desport: red-zone fault audit
+#include <shared_mutex> // desport: red-zone fault audit
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
@@ -142,6 +144,7 @@ struct DecodedFunction {
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
 	size_t                                      swept_instructions {}; // see SweepUndecodedCode
+	bool                                        gap_swept {}; // desport: unreached code swept (gap mode)
 };
 
 struct InstructionRewrite {
@@ -676,9 +679,31 @@ ResolveScannedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 // agrees with every instruction the walk found and no RIP-relative operand points into the
 // range outside an instruction start (inline data). Swept instructions are recorded as branch
 // targets, so relocation never spans across one of them.
+// desport: an instruction compilers do not emit in user code: when a linear sweep meets one, the bytes are
+// data (ASCII text decodes into the IN/OUT string instructions, for one), not code.
+bool IsImplausibleCompiledInstruction(const ZydisDecodedInstruction& instruction) {
+	switch (instruction.meta.category) {
+		case ZYDIS_CATEGORY_SYSTEM:
+		case ZYDIS_CATEGORY_IO:
+		case ZYDIS_CATEGORY_IOSTRINGOP: return true;                                      // desport
+		case ZYDIS_CATEGORY_INTERRUPT:                                                     // desport
+			return instruction.mnemonic != ZYDIS_MNEMONIC_INT3 && instruction.mnemonic != ZYDIS_MNEMONIC_INT; // desport
+		default: return false;                                                             // desport
+	}
+}
+
+// desport: gap_mode (KYTY_REDZONE_SWEEP_GAPS, default on): code in a function's range that its control-flow
+// walk never reaches although every branch was resolved - typically a function without an .eh_frame record
+// placed after one that has it (hand-written code, a helper without CFI), which so far was never analyzed and
+// whose red-zone instructions stayed unprotected. Kept only when it looks like compiled code (no implausible
+// instruction, at most GapSweepMaxBytes, each swept run ending in a terminator or falling into walked code) and
+// when it uses the red zone at all; otherwise the function is left exactly as before.
+constexpr uintptr_t GapSweepMaxBytes = 16 * 1024; // desport
+
 void SweepUndecodedCode(DecodedFunction& function, uintptr_t function_start,
-                        uintptr_t function_end) {
+                        uintptr_t function_end, bool gap_mode = false) { // desport: gap_mode
 	std::vector<DecodedCodeInstruction> swept;
+	uintptr_t                           swept_bytes = 0; // desport: gap mode limit
 	for (uintptr_t address = function_start; address < function_end;) {
 		if (const auto known = function.instructions.find(address);
 		    known != function.instructions.end()) {
@@ -692,8 +717,40 @@ void SweepUndecodedCode(DecodedFunction& function, uintptr_t function_start,
 		     next_known->first < address + decoded.instruction.length)) {
 			return;
 		}
+		if (gap_mode) { // desport: data, not code, or too much of it: leave the function as it was
+			swept_bytes += decoded.instruction.length;                                      // desport
+			if (swept_bytes > GapSweepMaxBytes || IsImplausibleCompiledInstruction(decoded.instruction)) { // desport
+				return;                                                                     // desport
+			}
+		}
 		address += decoded.instruction.length;
 		swept.push_back(std::move(decoded));
+	}
+	if (gap_mode) {
+		// desport: each run of swept instructions ends (before int3/nop padding) in a terminator, or runs into
+		// an instruction the walk decoded; and some swept instruction uses the red zone (else nothing to do).
+		bool uses_red_zone = false;                                                          // desport
+		for (size_t i = 0; i < swept.size(); ++i) {                                          // desport
+			uses_red_zone |= swept[i].has_red_zone_operand;                                  // desport
+			const uintptr_t next = swept[i].address + swept[i].instruction.length;           // desport
+			const bool run_ends = i + 1 == swept.size() || swept[i + 1].address != next;     // desport
+			if (!run_ends) continue;                                                         // desport
+			if (function.instructions.contains(next)) continue; // falls into walked code     // desport
+			size_t last = i;                                                                 // desport
+			while (last > 0 && swept[last - 1].address + swept[last - 1].instruction.length == swept[last].address && // desport
+			       (swept[last].instruction.mnemonic == ZYDIS_MNEMONIC_INT3 ||               // desport
+			        swept[last].instruction.mnemonic == ZYDIS_MNEMONIC_NOP)) {               // desport
+				--last;                                                                      // desport
+			}
+			const auto& tail = swept[last].instruction;                                      // desport
+			if (!IsControlFlowTerminator(tail) && tail.mnemonic != ZYDIS_MNEMONIC_INT3 &&    // desport
+			    tail.mnemonic != ZYDIS_MNEMONIC_NOP) {                                       // desport
+				return;                                                                      // desport
+			}
+		}
+		if (!uses_red_zone) {                                                                // desport
+			return;                                                                          // desport
+		}
 	}
 	std::set<uintptr_t> starts;
 	for (const auto& [address, _]: function.instructions) starts.insert(address);
@@ -732,6 +789,16 @@ void SweepUndecodedCode(DecodedFunction& function, uintptr_t function_start,
 		function.instructions.emplace(decoded.address, std::move(decoded));
 	}
 	function.swept_instructions = swept.size();
+	function.gap_swept          = gap_mode && !swept.empty(); // desport
+}
+
+// desport: KYTY_REDZONE_SWEEP_GAPS=0 turns the gap sweep off (the patcher as ceremony88 left it).
+bool RedZoneGapSweepEnabled() {
+	static const bool enabled = [] {                    // desport
+		const char* text = std::getenv("KYTY_REDZONE_SWEEP_GAPS"); // desport
+		return text == nullptr || std::strcmp(text, "0") != 0;     // desport
+	}();
+	return enabled; // desport
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
@@ -822,6 +889,9 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 		}
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
+	if (!function.has_indirect_branch && RedZoneGapSweepEnabled()) {
+		SweepUndecodedCode(function, function_start, function_end, true); // desport: unreached code (gap mode)
+	}
 	if (function.has_indirect_branch) {
 		SweepUndecodedCode(function, function_start, function_end);
 		// KYTY_REDZONE_DUMP_INDIRECT: print each unresolved indirect branch with the code before it
@@ -1064,13 +1134,29 @@ static void PrintRedZoneProbe(const PatchModule& module, u64 probe, uintptr_t fu
 	std::fflush(stdout);
 }
 
+// desport: KYTY_REDZONE_FAULT_AUDIT data per module: the code ranges the patcher analyzed and the memory
+// instructions it left unprotected while the red zone is live. Written at load, read by the exception handler.
+struct RedZoneAuditModule {
+	uintptr_t                                    start = 0, end = 0;   // desport
+	uintptr_t                                    module_base = 0;      // desport: KYTY_REDZONE_PROBE offsets
+	std::vector<std::pair<uintptr_t, uintptr_t>> analyzed;             // desport: sorted [begin, end)
+	std::vector<uintptr_t>                       unprotected;          // desport: sorted
+};
+static std::shared_mutex                g_audit_mutex;   // desport
+static std::vector<RedZoneAuditModule> g_audit_modules; // desport
+
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
 	RedZonePatchResult result {};
+	const bool         audit = RedZoneFaultAuditEnabled(); // desport
+	RedZoneAuditModule audit_module;                       // desport
+	audit_module.start = segment_addr;                     // desport
+	audit_module.end   = segment_addr + segment_size;      // desport
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
 	if (module == nullptr || function_starts.empty()) {
 		return result;
 	}
+	audit_module.module_base = reinterpret_cast<uintptr_t>(module->start); // desport
 	static const auto probes = RedZoneProbes();
 
 	const uintptr_t        segment_end = segment_addr + segment_size;
@@ -1101,6 +1187,17 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 		result.swept_instruction_count += function.swept_instructions;
+		result.gap_swept_function_count += function.gap_swept ? 1u : 0u; // desport
+		if (audit) { // desport: the analyzed runs of instructions
+			for (const auto& [address, decoded]: function.instructions) {                                 // desport
+				const uintptr_t end = address + decoded.instruction.length;                               // desport
+				if (!audit_module.analyzed.empty() && audit_module.analyzed.back().second == address) {   // desport
+					audit_module.analyzed.back().second = end;                                            // desport
+				} else {                                                                                  // desport
+					audit_module.analyzed.emplace_back(address, end);                                     // desport
+				}
+			}
+		}
 
 		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 
@@ -1139,11 +1236,13 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 				}
 				if (decoded.uses_stack_pointer && !decoded.replaces_stack_pointer) {
 					++result.stack_dependent_memory_instruction_count;
+					if (audit) audit_module.unprotected.push_back(address); // desport
 					continue;
 				}
 				if (decoded.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
 				    IsControlFlowTerminator(decoded.instruction)) {
 					++result.control_flow_memory_instruction_count;
+					if (audit) audit_module.unprotected.push_back(address); // desport
 					continue;
 				}
 				rewrite_sites[address].protect_red_zone = true;
@@ -1334,6 +1433,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			const auto& rewrite = rewrite_sites.at(site);
 			if (rewrite.protect_red_zone) {
 				++result.unrelocatable_memory_instruction_count;
+				if (audit) audit_module.unprotected.push_back(site); // desport
 				LOGF("Windows guest red-zone: unprotected memory instruction at +0x%" PRIx64
 				     " in function +0x%" PRIx64 "\n",
 				     static_cast<u64>(site - reinterpret_cast<uintptr_t>(module->start)),
@@ -1602,7 +1702,59 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 			std::fflush(stdout);
 		}
 	}
+	if (audit) { // desport: publish this segment's audit data
+		std::ranges::sort(audit_module.analyzed);      // desport
+		std::ranges::sort(audit_module.unprotected);   // desport
+		std::unique_lock audit_lock(g_audit_mutex);    // desport
+		std::erase_if(g_audit_modules, [&](const RedZoneAuditModule& m) { return m.start == audit_module.start; }); // desport
+		g_audit_modules.push_back(std::move(audit_module)); // desport
+	}
 	return result;
+}
+
+// desport: see redZonePatcher.h.
+bool RedZoneFaultAuditEnabled() {
+	static const bool enabled = [] {                                // desport
+		const char* text = std::getenv("KYTY_REDZONE_FAULT_AUDIT"); // desport
+		return text != nullptr && std::strcmp(text, "0") != 0 && *text != '\0'; // desport
+	}();
+	return enabled; // desport
+}
+
+void RedZoneFaultAuditReport(uint64_t rip) {
+	const char* kind = nullptr;       // desport
+	uintptr_t   module_start = 0;     // desport
+	{
+		std::shared_lock audit_lock(g_audit_mutex); // desport
+		for (const auto& module: g_audit_modules) {  // desport
+			if (rip < module.start || rip >= module.end) continue; // desport
+			module_start = module.module_base;                     // desport
+			if (std::ranges::binary_search(module.unprotected, rip)) { // desport
+				kind = "unprotected-site";                             // desport
+			} else {
+				auto it = std::upper_bound(module.analyzed.begin(), module.analyzed.end(), // desport
+				                           std::pair<uintptr_t, uintptr_t> {rip, UINTPTR_MAX}); // desport
+				if (it == module.analyzed.begin() || std::prev(it)->second <= rip) {        // desport
+					kind = "unanalyzed-code";                                                // desport
+				}
+			}
+			break; // desport
+		}
+	}
+	if (kind == nullptr) {
+		return; // desport
+	}
+	static std::mutex                   report_mutex; // desport
+	static std::unordered_set<uint64_t> reported;     // desport
+	static std::atomic<uint64_t>        faults {0};   // desport
+	const auto                          count = faults.fetch_add(1, std::memory_order_relaxed) + 1; // desport
+	std::lock_guard                     report_lock(report_mutex); // desport
+	if (reported.size() >= 256 || !reported.insert(rip).second) {
+		return; // desport
+	}
+	std::printf("RED_ZONE_AUDIT %s rip=0x%016" PRIx64 " module+0x%" PRIx64 " (fault %" PRIu64 " of this kind so far)%s", // desport
+	            kind, rip, rip - module_start, count, "\n");                                                     // desport
+	std::fflush(stdout); // desport
 }
 
 #else
@@ -1610,6 +1762,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
 	return {};
 }
+
+bool RedZoneFaultAuditEnabled() { // desport
+	return false;                 // desport
+}
+
+void RedZoneFaultAuditReport(uint64_t) {} // desport
 
 #endif
 
