@@ -1618,8 +1618,10 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			desport_viewport_restore.context = &regs;
 			desport_viewport_restore.saved   = regs.GetScreenViewport();
 			if (covers) {
-				regs.SetViewportScaleOffset(0, guest.xscale * scale, guest.xoffset, guest.yscale, guest.yoffset, guest.zscale,
-				                            guest.zoffset);
+				// desport: the full-target draw carries the UI movie layer, whose movie already sits 16:9 at the left
+				// edge of the UI space (3440x1440: x 0..2560): move the whole layer right so the movie is centred.
+				regs.SetViewportScaleOffset(0, guest.xscale, guest.xoffset + (static_cast<float>(target.width) - width16x9) * 0.5f,
+				                            guest.yscale, guest.yoffset, guest.zscale, guest.zoffset);
 			} else { // desport: left-aligned 16:9 movie: centre it
 				regs.SetViewportScaleOffset(0, guest.xscale, guest.xoffset + (static_cast<float>(target.width) - width16x9) * 0.5f,
 				                            guest.yscale, guest.yoffset, guest.zscale, guest.zoffset);
@@ -1636,7 +1638,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				              "viewport_width=%.0f->%.0f %s\n",
 				              ps, extent.width, extent.height, movie_slot, target.width, target.height,
 				              covers ? guest.xscale * 2.0f / scale : guest.xscale * 2.0f, guest.xscale * 2.0f,
-				              covers ? "narrowed" : "centred");
+				              covers ? "layer shifted" : "centred");
 				Desport::EmitLine(line);
 			}
 		}
