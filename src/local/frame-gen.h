@@ -161,10 +161,11 @@ struct SrSlot {
 // their binding layouts): records DLSS SR into `command`, writing the TAA's output image. False: nothing recorded,
 // the caller runs the game's dispatch.
 // desport: upscale = KYTY_DLSS_UPSCALE (SrUpscale()): called after the game's TAA dispatch ran instead, DLSS writes
-// an image of the output size (SrUpscaledView) and the TAA's own output is left as the dispatch wrote it.
+// an image of the output size (SrPlanDraw) and the TAA's own output is left as the dispatch wrote it.
 [[nodiscard]] bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs_hash,
                               std::span<const SrSlot> slots, bool upscale = false);
-// desport: KYTY_DLSS_UPSCALE=1 (with KYTY_DLSS; default off): real upscaling. The game renders its scene at the render
+// desport: KYTY_DLSS_UPSCALE=1|2 (with KYTY_DLSS; default off): real upscaling (mode 1 here, mode 2 at
+// SrUpscaleMode). The game renders its scene at the render
 // size (the mode's share of the output: DemonsSoulsRenderSize, or KYTY_ULTRAWIDE_RENDER's RenderHeightFor) and its
 // TAA still runs at that size (its output feeds the bloom chain); DLSS then reconstructs from the TAA's inputs into an
 // image of the output size, which the draw that scales the TAA output up to the output size (01.007.000: the scene
@@ -172,11 +173,42 @@ struct SrSlot {
 // KYTY_DLSS_UPSCALE_PS=<hex>) samples instead: that draw then runs 1:1. The output size is learned from that draw
 // (the first frame keeps the game's own upscale).
 [[nodiscard]] bool SrUpscale();
-// desport: renderer thread, a draw's texture: the DLSS output's view (layout General) to sample in place of the guest
-// image at `address` (guest size `extent`) for a draw with pixel shader `ps_hash` into a color target of `target`
-// size; nullptr: the texture as it is.
-[[nodiscard]] vk::ImageView SrUpscaledView(uint64_t ps_hash, uint64_t address, vk::Extent2D extent,
-                                           vk::Extent2D target);
+// desport: KYTY_DLSS_UPSCALE=2: in 01.007.000 the composite (ps 0x95318d27a44b0dd5) writes a target of the render
+// size and the final pass (ps 0x37db6bd367380e9c: scene and UI into the output buffer) scales it up with normalized
+// UVs. Mode 2 records the composite a second time into an image of the output size, sampling the DLSS image in place
+// of the TAA output (viewport and scissor scaled), and the final pass samples that image in place of the composite's
+// target: DLSS reconstructs up to the output size and the composite (tonemap, bloom) runs there.
+// 0: off; 1 or 2 with the DLSS SR active.
+[[nodiscard]] uint32_t SrUpscaleMode();
+// desport: a draw's pixel texture as SrPlanDraw sees it: its guest address (0: not to be considered) and guest size.
+struct SrDrawTexture {
+	uint64_t     address = 0;
+	vk::Extent2D extent {};
+};
+// desport: what a draw does for KYTY_DLSS_UPSCALE: sample swap_view (layout General) at pixel texture swap_slot; and,
+// with replay, once recorded, record the draw again into replay_view (layout General, replay_extent; viewport and
+// scissor scaled from the draw's target) sampling replay_texture (layout General) at replay_slot.
+struct SrDrawPlan {
+	int           swap_slot = -1;
+	vk::ImageView swap_view = nullptr;
+	bool          replay      = false;
+	int           replay_slot = -1;
+	vk::ImageView replay_texture = nullptr;
+	vk::ImageView replay_view    = nullptr;
+	vk::Extent2D  replay_extent {};
+	// The draw is part of the chain (reads the TAA output or the composite, or is the 01.007.000 composite or final
+	// pass by its pixel shader): never stored as a table or native XPR draw, which would replay it without this plan.
+	bool          involved = false;
+};
+// desport: renderer thread, before a draw's bindings are committed: its pixel shader, color target 0 (guest address,
+// size, view format), whether it can be recorded again (one color target, no depth, a plain draw, clipping on) and
+// its pixel textures. Learns the chain (the TAA output's readers, the composite, the final pass) and logs it.
+[[nodiscard]] SrDrawPlan SrPlanDraw(GraphicContext& graphics, uint64_t ps_hash, uint64_t target_address,
+                                    vk::Extent2D target, vk::Format target_format, bool replayable,
+                                    std::span<const SrDrawTexture> textures);
+// desport: around the composite's second recording, outside any rendering: barriers and layout of its image.
+void SrCompositeBegin(vk::CommandBuffer command);
+void SrCompositeEnd(vk::CommandBuffer command);
 // desport: at the guest flip when the DLSS-G capture does not run (PrepareInputs): ends the frame's camera.
 void EndSrFrame();
 // desport: phase B: DLSS SR and DLSS-G both ready (the SR shares DLSS-G's viewport and frame indices).

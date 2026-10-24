@@ -1245,7 +1245,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	// desport: begin KYTY_DLSS_UPSCALE: the game's TAA ran (its render-size output feeds the bloom chain); DLSS reads
 	// the same inputs (still in their binding layouts) and writes its output-size image, which the draw that scales the
-	// TAA output up samples instead (FrameGen::SrUpscaledView). If DLSS records nothing, that draw keeps the TAA output.
+	// TAA output up samples instead (FrameGen::SrPlanDraw). If DLSS records nothing, that draw keeps the TAA output.
 	if (sr_upscale) {
 		// Handle() records a chain's pending barrier (the TAA's writes first); the previous frame's reads of the DLSS
 		// image finish before DLSS writes it again.
