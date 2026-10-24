@@ -65,6 +65,33 @@ void MovieFileClosed(const char* guest_path);
 // Vblanks to leave between two flips while a movie plays (0: none, not playing, 60 Hz or less, or turned off).
 int MovieFlipFloor();
 
+// desport: KYTY_FAULT_CLASSIFY=1 (PA: where do the guest faults come from?): atomic counters in GpuResourceManager::HandleFault, by
+// access, mapping kind, outcome and thread, reported every 5 s as one line:
+// "DES_FAULTS t=<ms> write_direct=<n> write_flexible=<n> write_pooled=<n> write_other=<n> read=<n> other=<n> window=<n>
+// restore=<n> invalidate=<n> readback=<n> guest=<n> gpu_thread=<n>" (the counts of the interval, not totals).
+namespace Faults {
+
+enum Kind : uint32_t {
+	WriteDirect,   // write fault, page in direct memory (a view of the backing section)
+	WriteFlexible, // ... in flexible memory (private commit)
+	WritePooled,   // ... in pooled memory
+	WriteOther,    // ... in none of those (unmapped by now)
+	Read,          // read fault (PAGE_NOACCESS page the GPU wrote)
+	Other,         // execute or unknown access
+	Window,        // outcome: served by the CPU write window
+	Restore,       // outcome: protection nothing watched, given back (RestoreIfUnwatched)
+	Invalidate,    // outcome: buffer and texture caches invalidated
+	Readback,      // outcome: GPU-written bytes read back
+	Guest,         // the faulting thread is not the emulator's GPU thread
+	GpuThread,     // the faulting thread is the emulator's GPU thread
+	KindCount
+};
+
+bool Enabled();
+void Add(Kind kind) noexcept; // starts the reporter on the first call; no-op when disabled
+
+} // namespace Faults
+
 namespace Stats {
 
 // DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as

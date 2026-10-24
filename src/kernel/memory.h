@@ -176,6 +176,9 @@ void                   InstallGpuResources(Graphics::GpuResourceManager* resourc
 // Whether a guest mapping holds vaddr once a mapping change under way is done (it waits for one).
 [[nodiscard]] bool     IsGuestMappedAfterChanges(uint64_t vaddr);
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// desport: KYTY_FAULT_CLASSIFY: the kind of guest memory the address is in: 0 direct (a view of the backing section), 1 flexible
+// (private commit), 2 pooled, 3 none. A shared lock on the address space and, for views, the pooled memory's mutex.
+[[nodiscard]] int ClassifyFaultMemory(uint64_t vaddr) noexcept;
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);

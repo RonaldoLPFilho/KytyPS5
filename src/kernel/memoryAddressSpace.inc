@@ -1330,6 +1330,14 @@ public:
 		return it != m_mapped.end();
 	}
 
+	// desport: KYTY_FAULT_CLASSIFY: 0 backing (a view of the section), 1 private (flexible commit), -1 not mapped.
+	[[nodiscard]] int MappingKindOf(uint64_t vaddr) {
+		std::shared_lock lock(m_mutex);
+		const auto       it = FindMappedContainingUnlocked(vaddr);
+		if (it == m_mapped.end()) return -1;
+		return it->second.type == MappingType::Backing ? 0 : 1;
+	}
+
 	[[nodiscard]] bool OverlapsOwned(uint64_t vaddr, uint64_t size) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
