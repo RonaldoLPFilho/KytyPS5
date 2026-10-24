@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
@@ -26,6 +27,14 @@ namespace Desport {
 namespace {
 
 const auto g_process_start = std::chrono::steady_clock::now();
+
+// desport lines go to the log and to stdout: with --printf-direction Silent (long soak runs, where
+// the full log grows ~80 MB/min) stdout still carries them, like the engine's SLOW Frame lines.
+void Emit(const std::string& text) {
+	Log::Write(text);
+	std::fputs(text.c_str(), stdout);
+	std::fflush(stdout);
+}
 
 uint64_t ElapsedMs() {
 	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -45,7 +54,7 @@ void Milestone(std::string_view name, std::string_view detail) {
 			return;
 		}
 	}
-	Log::Write(
+	Emit(
 	    detail.empty() ? fmt::format("DES_MILESTONE {} t={}\n", name, ElapsedMs())
 	                   : fmt::format("DES_MILESTONE {} t={} {}\n", name, ElapsedMs(), detail));
 }
@@ -67,7 +76,7 @@ void FlipMilestone(bool from_gpu) {
 		window_start_flips.store(n);
 	} else if (now - start >= 5000 && window_start_ms.compare_exchange_strong(start, now)) {
 		const auto frames = n - window_start_flips.exchange(n);
-		Log::Write(
+		Emit(
 		    fmt::format("DES_FPS t={} fps={:.1f}\n", now, 1000.0 * static_cast<double>(frames) /
 		                                                     static_cast<double>(now - start)));
 	}
@@ -153,7 +162,7 @@ void Add(const char* name, uint64_t ns, uint64_t bytes, uint64_t vaddr) {
 		state.totals.clear();
 		state.regions.clear();
 	}
-	Log::Write(out);
+	Emit(out);
 }
 
 Scope::Scope(const char* name, uint64_t bytes, uint64_t vaddr)
@@ -303,7 +312,7 @@ void StartSampler() {
 			}
 		}
 	}).detach();
-	Log::Write(
+	Emit(
 	    fmt::format("DES_TRACE: counting PLT calls -> {}\n", g_output.string()));
 }
 
