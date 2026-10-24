@@ -52,8 +52,7 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STBI_NO_SIMD
+// desport: the stb_image implementation moved to libJpegDec.cpp (upstream ba0e93da)
 #include "stb_image.h"
 
 // IWYU pragma: no_include <intrin.h>
@@ -368,7 +367,11 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
+		if (pad == nullptr) { // desport: port of upstream e6cb880a (a gamepad that cannot be opened no longer aborts the emulator)
+			LOGF("Controller: ignoring gamepad %d that could not be opened: %s
+", f.id, SDL_GetError());
+			return;
+		}
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
 		Controller::Connect(id);
 	}

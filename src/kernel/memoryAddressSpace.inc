@@ -1166,7 +1166,7 @@ private:
 			return nullptr;
 		}
 
-		if (!ApplyProtection(ptr, size, mode)) {
+		if (mode == VirtualMemory::Mode::NoAccess && !ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
 			return nullptr;
