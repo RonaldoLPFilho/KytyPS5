@@ -590,12 +590,12 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 // its two queries) and one at its end (all commands), in a ring of 4096 query pairs. A reader thread takes them once the
 // submission's timeline tick is reached (never a wait on the queries) and every 5 s writes "DES_GPU_TS t=<ms>
 // window_ms= subs= ticks= frames= subs_per_frame= ticks_per_frame= busy_us= busy_p50_us= busy_p95_us= busy_max_us=
-// small= small_pct= nowrite= nowrite_busy_us= gaps= gap_us= gap_p50_us= gap_p95_us= gap_max_us= overlaps= busy_ms=
+// small_subs= small_pct= nowrite= nowrite_busy_us= gaps= gap_us= gap_p50_us= gap_p95_us= gap_max_us= overlaps= busy_ms=
 // span_ms= util_pct= dropped=": per vkQueueSubmit of ours (subs; ticks = the timeline ticks they signalled, more than
 // subs when KYTY_SUBMIT_COALESCE merges), its GPU time from start to end (busy), the gap from the end of one to the start
 // of the next one of ours (gaps; a negative one is an overlap: the next started before the previous ended), the union
 // of the busy intervals against the GPU clock between the first start and the last end (util_pct), the submissions
-// under 50 us (small) and those whose command buffers recorded no draw/dispatch/copy/clear (nowrite). Submissions of
+// under 50 us (small_subs) and those whose command buffers recorded no draw/dispatch/copy/clear (nowrite). Submissions of
 // others on the queue (Streamline's, frame generation's) are not wrapped: they fall into the gaps. Never touches the
 // async-compute or the readback queue.
 namespace {
@@ -610,7 +610,7 @@ struct Entry {
 	uint32_t              writes = UINT32_MAX;
 };
 struct Window {
-	uint64_t n = 0, busy_sum = 0, busy_max = 0, small = 0, nowrite = 0, nowrite_busy = 0, ticks = 0;
+	uint64_t n = 0, busy_sum = 0, busy_max = 0, small_subs = 0, nowrite = 0, nowrite_busy = 0, ticks = 0;
 	uint64_t gaps = 0, gap_sum = 0, gap_max = 0, overlaps = 0;
 	uint64_t union_ns = 0, first = 0, last_end = 0, prev_end = 0, prev_seq = UINT64_MAX;
 	std::array<uint32_t, Buckets> busy_hist {}, gap_hist {};
@@ -636,7 +636,7 @@ struct Window {
 		busy_sum += busy;
 		busy_max = std::max(busy_max, busy);
 		++busy_hist[Bucket(busy)];
-		if (busy < 50000) ++small;
+		if (busy < 50000) ++small_subs;
 		if (writes == 0) {
 			++nowrite;
 			nowrite_busy += busy;
@@ -729,12 +729,12 @@ void ReaderLoop(const std::stop_token& stop, State& s) {
 		};
 		Desport::EmitLine(fmt::format(
 		    "DES_GPU_TS t={} window_ms={} subs={} ticks={} frames={} subs_per_frame={:.1f} ticks_per_frame={:.1f} "
-		    "busy_us={:.1f} busy_p50_us={:.0f} busy_p95_us={:.0f} busy_max_us={:.1f} small={} small_pct={:.1f} nowrite={} "
+		    "busy_us={:.1f} busy_p50_us={:.0f} busy_p95_us={:.0f} busy_max_us={:.1f} small_subs={} small_pct={:.1f} nowrite={} "
 		    "nowrite_busy_us={:.1f} gaps={} gap_us={:.1f} gap_p50_us={:.0f} gap_p95_us={:.0f} gap_max_us={:.1f} overlaps={} "
 		    "busy_ms={:.1f} span_ms={:.1f} util_pct={:.1f} dropped={}\n",
 		    now, now - window_start, w.n, w.ticks, frames, per(w.n, frames, 1.0), per(w.ticks, frames, 1.0),
 		    per(w.busy_sum, w.n, 1e3), Window::Percentile(w.busy_hist, w.n, 0.5), Window::Percentile(w.busy_hist, w.n, 0.95),
-		    static_cast<double>(w.busy_max) / 1e3, w.small, w.n != 0 ? 100.0 * static_cast<double>(w.small) / static_cast<double>(w.n) : 0.0,
+		    static_cast<double>(w.busy_max) / 1e3, w.small_subs, w.n != 0 ? 100.0 * static_cast<double>(w.small_subs) / static_cast<double>(w.n) : 0.0,
 		    w.nowrite, per(w.nowrite_busy, w.nowrite, 1e3), w.gaps, per(w.gap_sum, w.gaps, 1e3),
 		    Window::Percentile(w.gap_hist, w.gaps, 0.5), Window::Percentile(w.gap_hist, w.gaps, 0.95),
 		    static_cast<double>(w.gap_max) / 1e3, w.overlaps, static_cast<double>(w.union_ns) / 1e6,
