@@ -10,7 +10,15 @@
 #include <string>
 #include <string_view>
 
+namespace Loader {
+struct Program;
+} // namespace Loader // desport: ultrawide
+
 namespace Desport {
+
+// desport: KYTY_ULTRAWIDE=<width>x<height>|<aspect> (desportUltrawide.cpp): the render setup's 16:9 constant of the main
+// program becomes the given aspect ratio (found by its bytes; logs "DES_ULTRAWIDE aspect=<x> applied|skipped <reason>").
+void InstallUltrawide(Loader::Program* program);
 
 // Writes "DES_MILESTONE <name> t=<ms> [detail]" to the console and the log once per name.
 void Milestone(std::string_view name, std::string_view detail = {});
