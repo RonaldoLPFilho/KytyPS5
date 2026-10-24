@@ -80,12 +80,29 @@ uint64_t ElapsedMilliseconds() { // desport: crash record
 	return ElapsedMs();
 }
 
+// desport: the game can leave a .bk2 handle open after the movie ends (attract_movie interrupted by input), which kept
+// the movie hold on through gameplay. A movie counts as playing only while its file is still being read; until the first
+// read is seen (reads through another API) the open count alone decides.
+std::atomic_uint64_t g_movie_last_read_ms {0};
+constexpr uint64_t   MOVIE_IDLE_MS = 3000;
+
+bool MovieReadRecently() {
+	const uint64_t last = g_movie_last_read_ms.load(std::memory_order_relaxed);
+	return last == 0 || ElapsedMs() - last < MOVIE_IDLE_MS;
+}
+
+void MovieFileRead(const char* guest_path) { // desport: movie idle detection
+	if (g_movies_open.load(std::memory_order_relaxed) > 0 && IsMoviePath(guest_path)) {
+		g_movie_last_read_ms.store(std::max<uint64_t>(ElapsedMs(), 1), std::memory_order_relaxed);
+	}
+}
+
 bool MoviePlaying() { // desport: ultrawide movie pillarbox
-	return g_movies_open.load(std::memory_order_relaxed) > 0; // desport
+	return g_movies_open.load(std::memory_order_relaxed) > 0 && MovieReadRecently(); // desport
 }
 
 int MovieFlipFloor() {
-	if (g_movie_files.load(std::memory_order_relaxed) <= 0) {
+	if (g_movie_files.load(std::memory_order_relaxed) <= 0 || !MovieReadRecently()) { // desport: idle handle = no movie
 		return 0;
 	}
 	// 120 Hz -> 1 (flip every 2nd vblank at the soonest), 180 -> 2, 240 -> 3; below 100 Hz: left alone.
@@ -96,7 +113,10 @@ int MovieFlipFloor() {
 }
 
 void MovieFileOpened(const char* guest_path) {
-	if (IsMoviePath(guest_path)) g_movies_open.fetch_add(1); // desport: MoviePlaying()
+	if (IsMoviePath(guest_path)) {
+		g_movies_open.fetch_add(1);                                // desport: MoviePlaying()
+		g_movie_last_read_ms.store(0, std::memory_order_relaxed); // desport: new movie: unknown until its first read
+	}
 	if (!MoviePacingEnabled() || !IsMoviePath(guest_path)) {
 		return;
 	}

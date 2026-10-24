@@ -64,6 +64,7 @@ void Unregister(Provider provider); // waits for a report in progress
 // every MovieFlipFloor()+1 vblanks (~60 flips a second). KYTY_MOVIE_PACING=0 turns it off.
 void MovieFileOpened(const char* guest_path);
 void MovieFileClosed(const char* guest_path);
+void MovieFileRead(const char* guest_path); // desport: a .bk2 no longer read for 3 s no longer counts as playing
 // Vblanks to leave between two flips while a movie plays (0: none, not playing, 60 Hz or less, or turned off).
 int MovieFlipFloor();
 // desport: a .bk2 file is open (a Bink movie plays), whatever KYTY_MOVIE_PACING says (ultrawide movie pillarbox).

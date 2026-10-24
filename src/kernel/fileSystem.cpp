@@ -650,6 +650,7 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	EXIT_IF(!file->opened);
+	Desport::MovieFileRead(file->name.c_str()); // desport: movie idle detection
 
 	if (nbytes > INT_MAX) {
 		return KERNEL_ERROR_EINVAL;
@@ -777,6 +778,7 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	EXIT_NOT_IMPLEMENTED(file->directory);
 
 	EXIT_IF(!file->opened);
+	Desport::MovieFileRead(file->name.c_str()); // desport: movie idle detection
 
 	EXIT_NOT_IMPLEMENTED(nbytes > UINT_MAX);
 
