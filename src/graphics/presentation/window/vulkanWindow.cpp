@@ -1466,6 +1466,16 @@ void WindowContext::CreateVulkan() {
 		}
 		AddPipelineBinaryExtensions(available_extensions, device_extensions);
 		AddCopyMemoryIndirectExtension(available_extensions, device_extensions);
+		// desport: KYTY_GPU_TIMESTAMPS=2: host<->GPU clock calibration (submission-to-start latency, commandScheduler.cpp).
+		if (const char* gts = std::getenv("KYTY_GPU_TIMESTAMPS"); gts != nullptr && std::strcmp(gts, "2") == 0) {
+			if (HasExtension(available_extensions, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+				graphic_ctx.desport_calibrated_timestamps = 1;
+			} else if (HasExtension(available_extensions, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+				device_extensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+				graphic_ctx.desport_calibrated_timestamps = 2;
+			}
+		}
 	}
 
 	VulkanInitSubgroupSizeControl(graphic_ctx.physical_device, graphic_ctx);

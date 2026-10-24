@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/timer.h" // desport: KYTY_GPU_TIMESTAMPS=2 (host counter)
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -600,16 +601,45 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 // under 50 us (small_subs) and those whose command buffers recorded no draw/dispatch/copy/clear (nowrite). Submissions of
 // others on the queue (Streamline's, frame generation's) are not wrapped: they fall into the gaps. Never touches the
 // async-compute or the readback queue.
+//
+// desport: KYTY_GPU_TIMESTAMPS=2 adds, per wrapped submission: a "pre" timestamp (all commands, in a batch of its own
+// without waits, put ahead of a submission that waits on semaphores: when the work before it on the queue was done),
+// so head - pre is the time the queue sat in the submission's semaphore waits (the head is a top-of-pipe timestamp in
+// the waiting batch itself: after the waits), a "tail-top" one (top of pipe at the start of the tail buffer: the front
+// end issued all of the submission's commands; busy = issue + drain), the host time of the vkQueueSubmit, and, with
+// VK_KHR/EXT_calibrated_timestamps (enabled at device creation for mode 2), the host<->GPU clock offset (recalibrated
+// every second). Every 5 s "DES_GPU_WAIT t=<ms> window_ms= subs= cbs= cbs_per_frame= present_subs= waited=
+// waited_pct= wait_us= wait_p95_us= wait_max_us= wait_ms= w_async= w_async_us= w_gfx= w_gfx_us= w_present=
+// w_present_us= w_other= w_other_us= issue_us= drain_us= calibrated= cal_dev_us= qlat_n= qlat_us= qlat_p50_us=
+// qlat_p95_us= qlat_max_us= idle_submits= idle_pct= launch_us= launch_p50_us= launch_p95_us= launch_max_us=":
+// waited = submissions with semaphore waits (w_*: by the semaphore waited for: the async-compute timeline, a graphics
+// timeline, a presenter submission's swapchain acquire, other = a sparse binding's timeline or unknown; a submission
+// waiting on several counts in each, its wait once in each); qlat = vkQueueSubmit on the host to the submission
+// reaching the GPU (pre, else head), queue backlog included; launch = the same for submissions handed over while the
+// GPU had finished the previous wrapped one (idle_submits): the driver's and the OS's latency alone.
 namespace {
 namespace GpuTs {
 constexpr uint32_t Slots   = 4096;
 constexpr uint32_t Buckets = 2048; // 2 us each (the last: 4.094 ms and up)
+constexpr uint32_t Queries = 4;    // desport: per slot: head, tail, pre, tail-top
+enum Kind : uint8_t { KindAsync = 1, KindGfx = 2, KindPresent = 4, KindOther = 8 }; // desport: KYTY_GPU_TIMESTAMPS=2
+// desport: KYTY_GPU_TIMESTAMPS=2: the host counter at the hand-over, semaphore waits (count, Kind bits), whether a pre
+// buffer was put ahead, a renderer's submission (not the presenter's), its command buffers.
+struct Extra {
+	uint64_t host  = 0;
+	uint32_t waits = 0;
+	uint8_t  kinds = 0;
+	bool     pre   = false;
+	bool     main  = true;
+	uint32_t cbs   = 0;
+};
 struct Entry {
 	std::atomic<uint64_t> published {0}; // seq + 1 once filled (under the queue lock)
 	MasterSemaphore*      master = nullptr;
 	uint64_t              tick   = 0;
 	uint32_t              ticks  = 1;
 	uint32_t              writes = UINT32_MAX;
+	Extra                 extra; // desport: KYTY_GPU_TIMESTAMPS=2
 };
 struct Window {
 	uint64_t n = 0, busy_sum = 0, busy_max = 0, small_subs = 0, nowrite = 0, nowrite_busy = 0, ticks = 0;
@@ -661,6 +691,56 @@ struct Window {
 		prev_end = end;
 		prev_seq = seq;
 	}
+	// desport: begin KYTY_GPU_TIMESTAMPS=2 (DES_GPU_WAIT)
+	struct KindStats {
+		uint64_t subs = 0, ns = 0;
+	};
+	std::array<KindStats, 4>      by_kind {}; // async, gfx, present, other
+	uint64_t                      x_subs = 0, cbs = 0, present_subs = 0, waited = 0, wait_ns = 0, wait_max = 0;
+	uint64_t                      split_n = 0, issue_ns = 0, drain_ns = 0;
+	uint64_t                      qlat_n = 0, qlat_ns = 0, qlat_max = 0, idle_submits = 0, launch_ns = 0, launch_max = 0;
+	std::array<uint32_t, Buckets> wait_hist {}, qlat_hist {}, launch_hist {};
+	// Before Add (prev_end/prev_seq are the previous submission's). pre/top: 0 when not read. host_gpu: the hand-over
+	// on the GPU clock (0: no calibration).
+	void AddExtra(uint64_t seq, uint64_t head, uint64_t end, uint64_t pre, uint64_t top, uint64_t host_gpu,
+	              const Extra& e) {
+		if (end < head) return;
+		++x_subs;
+		cbs += e.cbs;
+		if (!e.main) ++present_subs;
+		if (e.waits != 0 && pre != 0) {
+			const uint64_t wait = head > pre ? head - pre : 0;
+			++waited;
+			wait_ns += wait;
+			wait_max = std::max(wait_max, wait);
+			++wait_hist[Bucket(wait)];
+			for (uint32_t k = 0; k < 4; ++k) {
+				if ((e.kinds & (1u << k)) == 0) continue;
+				++by_kind[k].subs;
+				by_kind[k].ns += wait;
+			}
+		}
+		if (top != 0 && top >= head && end >= top) {
+			++split_n;
+			issue_ns += top - head;
+			drain_ns += end - top;
+		}
+		if (host_gpu != 0) {
+			const uint64_t start = pre != 0 ? std::min(pre, head) : head;
+			const uint64_t qlat  = start > host_gpu ? start - host_gpu : 0;
+			++qlat_n;
+			qlat_ns += qlat;
+			qlat_max = std::max(qlat_max, qlat);
+			++qlat_hist[Bucket(qlat)];
+			if (prev_seq != UINT64_MAX && prev_seq + 1 == seq && prev_end < host_gpu) {
+				++idle_submits;
+				launch_ns += qlat;
+				launch_max = std::max(launch_max, qlat);
+				++launch_hist[Bucket(qlat)];
+			}
+		}
+	}
+	// desport: end KYTY_GPU_TIMESTAMPS=2
 };
 struct State {
 	VkDevice                                 device   = VK_NULL_HANDLE;
@@ -676,15 +756,58 @@ struct State {
 	std::atomic<uint64_t>                    dropped {0};
 	std::atomic<bool>                        stopped {false};
 	std::jthread                             reader;
+	// desport: KYTY_GPU_TIMESTAMPS=2: mode (1, 2), the pre buffers, the calibration call (null: none) and the host
+	// counter's frequency.
+	uint32_t                                 mode = 1;
+	std::array<VkCommandBuffer, Slots>       pres {};
+	PFN_vkGetCalibratedTimestampsKHR         calibrate = nullptr;
+	uint64_t                                 host_frequency = 1;
 };
 std::atomic<State*> g_state {nullptr};
 
-bool Requested() {
-	static const bool on = [] {
+// desport: KYTY_GPU_TIMESTAMPS: 0 off, 1 on, 2 on with the wait/launch split (DES_GPU_WAIT).
+uint32_t Mode() {
+	static const uint32_t mode = [] {
 		const char* value = std::getenv("KYTY_GPU_TIMESTAMPS");
-		return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+		if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return 0u;
+		return std::strcmp(value, "2") == 0 ? 2u : 1u;
 	}();
-	return on;
+	return mode;
+}
+bool Requested() {
+	return Mode() != 0;
+}
+
+// desport: KYTY_GPU_TIMESTAMPS=2: a host counter value in ns.
+uint64_t HostNs(const State& s, uint64_t counter) {
+	const uint64_t f = s.host_frequency;
+	return counter / f * 1000000000ull + counter % f * 1000000000ull / f;
+}
+
+// desport: KYTY_GPU_TIMESTAMPS=2: the GPU clock (ns) minus the host counter (ns), from the best of 3 calibrated reads;
+// false when the call failed. `deviation`: its maximum deviation (ns).
+bool Calibrate(const State& s, int64_t& offset, uint64_t& deviation) {
+	if (s.calibrate == nullptr) return false;
+	VkCalibratedTimestampInfoKHR infos[2] {};
+	for (auto& info: infos) info.sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+	infos[0].timeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+#if defined(_WIN32)
+	infos[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+	infos[1].timeDomain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+	bool ok = false;
+	for (int attempt = 0; attempt < 3; ++attempt) {
+		uint64_t values[2] {};
+		uint64_t dev = 0;
+		if (s.calibrate(s.device, 2, infos, values, &dev) != VK_SUCCESS) continue;
+		if (ok && dev >= deviation) continue;
+		const auto gpu = static_cast<int64_t>(static_cast<double>(values[0] & s.mask) * s.period);
+		offset         = gpu - static_cast<int64_t>(HostNs(s, values[1]));
+		deviation      = dev;
+		ok             = true;
+	}
+	return ok;
 }
 
 void ReaderLoop(const std::stop_token& stop, State& s) {
@@ -693,8 +816,19 @@ void ReaderLoop(const std::stop_token& stop, State& s) {
 	uint64_t window_start = Desport::ElapsedMilliseconds();
 	uint64_t flips_start  = LiveControl::g_flips.load(std::memory_order_relaxed);
 	uint64_t dropped_seen = 0;
+	// desport: KYTY_GPU_TIMESTAMPS=2: the clock offset (recalibrated every second).
+	int64_t  cal_offset = 0;
+	uint64_t cal_dev = 0, cal_ms = 0, cal_dev_max = 0;
+	bool     calibrated = false;
 	while (!stop.stop_requested()) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		if (s.mode == 2 && s.calibrate != nullptr && (cal_ms == 0 || Desport::ElapsedMilliseconds() - cal_ms >= 1000)) {
+			cal_ms = Desport::ElapsedMilliseconds();
+			if (Calibrate(s, cal_offset, cal_dev)) {
+				calibrated  = true;
+				cal_dev_max = std::max(cal_dev_max, cal_dev);
+			}
+		}
 		for (;;) {
 			const uint64_t seq   = s.read.load(std::memory_order_relaxed);
 			auto&          entry = s.entries[seq % Slots];
@@ -705,10 +839,26 @@ void ReaderLoop(const std::stop_token& stop, State& s) {
 			}
 			uint64_t       times[2] {};
 			const uint32_t slot   = static_cast<uint32_t>(seq % Slots);
-			const VkResult result = s.d->vkGetQueryPoolResults(s.device, s.pool, slot * 2u, 2u, sizeof(times), times,
+			const VkResult result = s.d->vkGetQueryPoolResults(s.device, s.pool, slot * Queries, 2u, sizeof(times), times,
 			                                                   sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
 			if (result == VK_NOT_READY) break;
+			// desport: KYTY_GPU_TIMESTAMPS=2: the pre (when put ahead) and tail-top timestamps.
+			uint64_t pre_raw = 0, top_raw = 0;
+			bool     have_pre = false, have_top = false;
+			if (s.mode == 2 && result == VK_SUCCESS) {
+				if (entry.extra.pre) {
+					const VkResult r = s.d->vkGetQueryPoolResults(s.device, s.pool, slot * Queries + 2u, 1u, sizeof(pre_raw),
+					                                              &pre_raw, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+					if (r == VK_NOT_READY) break;
+					have_pre = r == VK_SUCCESS;
+				}
+				const VkResult r = s.d->vkGetQueryPoolResults(s.device, s.pool, slot * Queries + 3u, 1u, sizeof(top_raw),
+				                                              &top_raw, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+				if (r == VK_NOT_READY) break;
+				have_top = r == VK_SUCCESS;
+			}
 			const uint32_t entry_ticks = entry.ticks, writes = entry.writes;
+			const Extra    extra       = entry.extra; // desport: KYTY_GPU_TIMESTAMPS=2 (before the slot may be reused)
 			s.read.store(seq + 1, std::memory_order_release); // (the slot may be reused from here on)
 			if (result != VK_SUCCESS) {
 				window->prev_seq = UINT64_MAX;
@@ -717,6 +867,15 @@ void ReaderLoop(const std::stop_token& stop, State& s) {
 			const auto ns = [&](uint64_t value) {
 				return static_cast<uint64_t>(static_cast<double>(value & s.mask) * s.period);
 			};
+			if (s.mode == 2) {
+				uint64_t host_gpu = 0;
+				if (calibrated) {
+					const int64_t value = static_cast<int64_t>(HostNs(s, extra.host)) + cal_offset;
+					host_gpu            = value > 0 ? static_cast<uint64_t>(value) : 0;
+				}
+				window->AddExtra(seq, ns(times[0]), ns(times[1]), have_pre ? ns(pre_raw) : 0, have_top ? ns(top_raw) : 0,
+				                 host_gpu, extra);
+			}
 			window->Add(seq, ns(times[0]), ns(times[1]), entry_ticks, writes);
 		}
 		const uint64_t now = Desport::ElapsedMilliseconds();
@@ -742,6 +901,29 @@ void ReaderLoop(const std::stop_token& stop, State& s) {
 		    static_cast<double>(w.gap_max) / 1e3, w.overlaps, static_cast<double>(w.union_ns) / 1e6,
 		    static_cast<double>(span) / 1e6, span != 0 ? 100.0 * static_cast<double>(w.union_ns) / static_cast<double>(span) : 0.0,
 		    dropped - dropped_seen));
+		if (s.mode == 2) { // desport: KYTY_GPU_TIMESTAMPS=2
+			const auto pct = [](uint64_t part, uint64_t whole) {
+				return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+			};
+			const auto& k = w.by_kind;
+			Desport::EmitLine(fmt::format(
+			    "DES_GPU_WAIT t={} window_ms={} subs={} cbs={} cbs_per_frame={:.1f} present_subs={} waited={} waited_pct={:.2f} "
+			    "wait_us={:.1f} wait_p95_us={:.0f} wait_max_us={:.1f} wait_ms={:.2f} w_async={} w_async_us={:.1f} w_gfx={} "
+			    "w_gfx_us={:.1f} w_present={} w_present_us={:.1f} w_other={} w_other_us={:.1f} issue_us={:.1f} drain_us={:.1f} "
+			    "calibrated={} cal_dev_us={:.1f} qlat_n={} qlat_us={:.1f} qlat_p50_us={:.0f} qlat_p95_us={:.0f} qlat_max_us={:.1f} "
+			    "idle_submits={} idle_pct={:.1f} launch_us={:.1f} launch_p50_us={:.0f} launch_p95_us={:.0f} launch_max_us={:.1f}\n",
+			    now, now - window_start, w.x_subs, w.cbs, per(w.cbs, frames, 1.0), w.present_subs, w.waited,
+			    pct(w.waited, w.x_subs), per(w.wait_ns, w.waited, 1e3), Window::Percentile(w.wait_hist, w.waited, 0.95),
+			    static_cast<double>(w.wait_max) / 1e3, static_cast<double>(w.wait_ns) / 1e6, k[0].subs,
+			    per(k[0].ns, k[0].subs, 1e3), k[1].subs, per(k[1].ns, k[1].subs, 1e3), k[2].subs, per(k[2].ns, k[2].subs, 1e3),
+			    k[3].subs, per(k[3].ns, k[3].subs, 1e3), per(w.issue_ns, w.split_n, 1e3), per(w.drain_ns, w.split_n, 1e3),
+			    calibrated ? 1 : 0, static_cast<double>(cal_dev_max) / 1e3, w.qlat_n, per(w.qlat_ns, w.qlat_n, 1e3),
+			    Window::Percentile(w.qlat_hist, w.qlat_n, 0.5), Window::Percentile(w.qlat_hist, w.qlat_n, 0.95),
+			    static_cast<double>(w.qlat_max) / 1e3, w.idle_submits, pct(w.idle_submits, w.qlat_n),
+			    per(w.launch_ns, w.idle_submits, 1e3), Window::Percentile(w.launch_hist, w.idle_submits, 0.5),
+			    Window::Percentile(w.launch_hist, w.idle_submits, 0.95), static_cast<double>(w.launch_max) / 1e3));
+			cal_dev_max = 0;
+		}
 		window       = std::make_unique<Window>();
 		window_start = now;
 		flips_start  = flips;
@@ -765,6 +947,7 @@ void Init(GraphicContext& graphics) {
 		return;
 	}
 	auto* s = new State();
+	s->mode = Mode(); // desport: KYTY_GPU_TIMESTAMPS=2
 #ifdef KYTY_LOCAL_VULKAN_RECORDING
 	s->d = &LocalVulkanRecording::DirectDispatch(); // (never recorded: these buffers are filled once, here)
 	if (s->d->vkCmdWriteTimestamp == nullptr) s->d = &VULKAN_HPP_DEFAULT_DISPATCHER;
@@ -778,7 +961,7 @@ void Init(GraphicContext& graphics) {
 	VkQueryPoolCreateInfo query {};
 	query.sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 	query.queryType  = VK_QUERY_TYPE_TIMESTAMP;
-	query.queryCount = Slots * 2u;
+	query.queryCount = Slots * Queries; // desport: KYTY_GPU_TIMESTAMPS=2 (head, tail, pre, tail-top per slot)
 	VkCommandPoolCreateInfo pool {};
 	pool.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 	pool.queueFamilyIndex = graphics.queue_family;
@@ -788,7 +971,7 @@ void Init(GraphicContext& graphics) {
 		std::fflush(stdout);
 		return; // (leaked: a diagnostic that failed to start)
 	}
-	if (d.vkResetQueryPool != nullptr) d.vkResetQueryPool(s->device, s->pool, 0, Slots * 2u);
+	if (d.vkResetQueryPool != nullptr) d.vkResetQueryPool(s->device, s->pool, 0, Slots * Queries);
 	VkCommandBufferAllocateInfo allocate {};
 	allocate.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	allocate.commandPool        = s->commands;
@@ -796,30 +979,90 @@ void Init(GraphicContext& graphics) {
 	allocate.commandBufferCount = Slots;
 	EXIT_NOT_IMPLEMENTED(d.vkAllocateCommandBuffers(s->device, &allocate, s->heads.data()) != VK_SUCCESS ||
 	                     d.vkAllocateCommandBuffers(s->device, &allocate, s->tails.data()) != VK_SUCCESS);
+	if (s->mode == 2) EXIT_NOT_IMPLEMENTED(d.vkAllocateCommandBuffers(s->device, &allocate, s->pres.data()) != VK_SUCCESS);
 	const bool ts2 = d.vkCmdWriteTimestamp2 != nullptr;
+	const auto stamp = [&](VkCommandBuffer command, bool top, uint32_t query_index) {
+		if (ts2)
+			d.vkCmdWriteTimestamp2(command, top ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			                       s->pool, query_index);
+		else
+			d.vkCmdWriteTimestamp(command, top ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			                      s->pool, query_index);
+	};
 	// Resubmitted once the reader took the slot's last use (its tick was reached): no simultaneous use, no reset.
 	VkCommandBufferBeginInfo begin {};
 	begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 	for (uint32_t slot = 0; slot < Slots; ++slot) {
+		const uint32_t q = slot * Queries; // desport: KYTY_GPU_TIMESTAMPS=2
 		EXIT_NOT_IMPLEMENTED(d.vkBeginCommandBuffer(s->heads[slot], &begin) != VK_SUCCESS);
-		d.vkCmdResetQueryPool(s->heads[slot], s->pool, slot * 2u, 2u);
-		if (ts2) d.vkCmdWriteTimestamp2(s->heads[slot], VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, s->pool, slot * 2u);
-		else d.vkCmdWriteTimestamp(s->heads[slot], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s->pool, slot * 2u);
+		d.vkCmdResetQueryPool(s->heads[slot], s->pool, q, 2u);
+		stamp(s->heads[slot], true, q);
 		EXIT_NOT_IMPLEMENTED(d.vkEndCommandBuffer(s->heads[slot]) != VK_SUCCESS);
 		EXIT_NOT_IMPLEMENTED(d.vkBeginCommandBuffer(s->tails[slot], &begin) != VK_SUCCESS);
-		if (ts2) d.vkCmdWriteTimestamp2(s->tails[slot], VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, s->pool, slot * 2u + 1u);
-		else d.vkCmdWriteTimestamp(s->tails[slot], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s->pool, slot * 2u + 1u);
+		if (s->mode == 2) { // desport: the front end reached the tail (issued the submission's commands)
+			d.vkCmdResetQueryPool(s->tails[slot], s->pool, q + 3u, 1u);
+			stamp(s->tails[slot], true, q + 3u);
+		}
+		stamp(s->tails[slot], false, q + 1u);
 		EXIT_NOT_IMPLEMENTED(d.vkEndCommandBuffer(s->tails[slot]) != VK_SUCCESS);
+		if (s->mode == 2) { // desport: the work before it on the queue done (in a batch of its own, ahead of the waits)
+			EXIT_NOT_IMPLEMENTED(d.vkBeginCommandBuffer(s->pres[slot], &begin) != VK_SUCCESS);
+			d.vkCmdResetQueryPool(s->pres[slot], s->pool, q + 2u, 1u);
+			stamp(s->pres[slot], false, q + 2u);
+			EXIT_NOT_IMPLEMENTED(d.vkEndCommandBuffer(s->pres[slot]) != VK_SUCCESS);
+		}
 	}
+	// desport: begin KYTY_GPU_TIMESTAMPS=2. The calibration (VK_KHR/EXT_calibrated_timestamps, enabled at device creation
+	// for mode 2 when the device has it) and the host counter's frequency (Common::Timer: QPC on Windows).
+	const char* calibration = "off";
+	if (s->mode == 2) {
+		s->host_frequency = std::max<uint64_t>(Common::Timer::QueryPerformanceFrequency(), 1);
+		calibration       = "no_extension";
+		if (graphics.desport_calibrated_timestamps != 0 && d.vkGetDeviceProcAddr != nullptr) {
+			const bool khr = graphics.desport_calibrated_timestamps == 1;
+			s->calibrate   = reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+                d.vkGetDeviceProcAddr(s->device, khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT"));
+			calibration    = s->calibrate == nullptr ? "no_entry_point" : (khr ? "khr" : "ext");
+			// (The host domain must be one the device calibrates against.)
+			const auto domains_call = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR != nullptr
+			                              ? VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+			                              : VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
+			if (s->calibrate != nullptr && domains_call != nullptr) {
+				const auto physical = static_cast<VkPhysicalDevice>(graphics.physical_device);
+				uint32_t   count    = 0;
+				std::vector<VkTimeDomainKHR> domains;
+				if (domains_call(physical, &count, nullptr) == VK_SUCCESS && count != 0) {
+					domains.resize(count);
+					if (domains_call(physical, &count, domains.data()) != VK_SUCCESS) count = 0;
+					domains.resize(count);
+				}
+#if defined(_WIN32)
+				const VkTimeDomainKHR host_domain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+				const VkTimeDomainKHR host_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+				const bool device_ok = std::find(domains.begin(), domains.end(), VK_TIME_DOMAIN_DEVICE_KHR) != domains.end();
+				const bool host_ok   = std::find(domains.begin(), domains.end(), host_domain) != domains.end();
+				if (!device_ok || !host_ok) {
+					s->calibrate = nullptr;
+					calibration  = "no_host_domain";
+				}
+			}
+		}
+	}
+	// desport: end KYTY_GPU_TIMESTAMPS=2
 	s->reader = std::jthread([s](const std::stop_token& stop) { ReaderLoop(stop, *s); });
 	g_state.store(s, std::memory_order_release);
-	std::printf("DES_GPU_TS on=1 slots=%u period_ns=%.3f valid_bits=%u ts2=%u\n", Slots, s->period, bits, ts2 ? 1u : 0u);
+	std::printf("DES_GPU_TS on=1 mode=%u slots=%u period_ns=%.3f valid_bits=%u ts2=%u calibration=%s\n", s->mode, Slots,
+	            s->period, bits, ts2 ? 1u : 0u, calibration);
 	std::fflush(stdout);
 }
 
 // Under the graphics queue's lock, right before its vkQueueSubmit: the ring slot whose head/tail buffers wrap the
 // submission (signalling `tick` of `master`, `ticks` timeline ticks merged, `writes` writing commands), or UINT32_MAX.
-uint32_t Begin(MasterSemaphore* master, uint64_t tick, uint32_t ticks, uint32_t writes) {
+// desport: KYTY_GPU_TIMESTAMPS=2: `extra` (waits, their kinds, main, cbs; the host time and `pre` are set here). With
+// extra.pre set on return the caller puts Pre(slot) in a batch of its own ahead of the waiting one.
+uint32_t Begin(MasterSemaphore* master, uint64_t tick, uint32_t ticks, uint32_t writes, Extra extra = {}) {
 	auto* s = g_state.load(std::memory_order_acquire);
 	if (s == nullptr || s->stopped.load(std::memory_order_acquire)) return UINT32_MAX;
 	const uint64_t seq = s->next;
@@ -832,12 +1075,34 @@ uint32_t Begin(MasterSemaphore* master, uint64_t tick, uint32_t ticks, uint32_t 
 	entry.tick   = tick;
 	entry.ticks  = ticks;
 	entry.writes = writes;
+	// desport: KYTY_GPU_TIMESTAMPS=2
+	extra.pre   = s->mode == 2 && extra.waits != 0;
+	extra.host  = s->mode == 2 ? Common::Timer::QueryPerformanceCounter() : 0;
+	entry.extra = extra;
 	entry.published.store(seq + 1, std::memory_order_release);
 	s->next = seq + 1;
 	return static_cast<uint32_t>(seq % Slots);
 }
 VkCommandBuffer Head(uint32_t slot) { return g_state.load(std::memory_order_relaxed)->heads[slot]; }
 VkCommandBuffer Tail(uint32_t slot) { return g_state.load(std::memory_order_relaxed)->tails[slot]; }
+// desport: KYTY_GPU_TIMESTAMPS=2: the slot's pre buffer (put ahead, in a batch of its own, when Begin set extra.pre).
+VkCommandBuffer Pre(uint32_t slot) { return g_state.load(std::memory_order_relaxed)->pres[slot]; }
+bool            PreWanted(uint32_t slot) {
+    return slot != UINT32_MAX && g_state.load(std::memory_order_relaxed)->entries[slot].extra.pre;
+}
+// desport: KYTY_GPU_TIMESTAMPS=2: the Kind bits of `count` semaphores a submission of `master` waits for (`main`: the
+// renderer's scheduler; the presenter's waits for the swapchain image).
+uint8_t WaitKinds(const MasterSemaphore* master, bool main, const VkSemaphore* semaphores, uint32_t count) {
+	uint8_t kinds = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto semaphore = vk::Semaphore(semaphores[i]);
+		if (master != nullptr && master->AsyncHandle() && semaphore == master->AsyncHandle()) kinds |= KindAsync;
+		else if (master != nullptr && semaphore == master->Handle()) kinds |= KindGfx;
+		else if (!main) kinds |= KindPresent;
+		else kinds |= KindOther;
+	}
+	return kinds;
+}
 // A scheduler shuts down: the reader stops before the timelines it reads go away (no more slots are given out).
 void Stop() {
 	auto* s = g_state.load(std::memory_order_acquire);
@@ -873,6 +1138,7 @@ struct DeferredSubmit {
 	bool                   async;         // desport: KYTY_ASYNC_COMPUTE (an async-queue submission: tick = its epoch)
 	uint64_t               q;             // desport: KYTY_SUBMIT_COALESCE (the main scheduler's number; 0: other)
 	uint32_t               writes;        // desport: KYTY_GPU_TIMESTAMPS (writing commands; UINT32_MAX: unknown)
+	bool                   main;          // desport: KYTY_GPU_TIMESTAMPS=2 (the renderer's scheduler, not the presenter's)
 };
 
 // desport: begin KYTY_SUBMIT_COALESCE. KYTY_SUBMIT_COALESCE=<n> (0/absent: off; 1: 16; 2-64: n): the recording worker
@@ -1014,7 +1280,13 @@ void HandOver(const DeferredSubmit* subs, uint32_t n, const vk::detail::Dispatch
 	{
 		Common::LockGuard lock(*first.queue_mutex);
 		// (The timestamp ring's order is the queue's: its slot is taken under the queue's lock.)
-		const uint32_t slot = first.async ? UINT32_MAX : GpuTs::Begin(last.master, last.tick, n, writes);
+		// desport: KYTY_GPU_TIMESTAMPS=2: the waits (the first's: held ones have none), their kinds, the buffers.
+		GpuTs::Extra extra;
+		extra.waits = first.waits;
+		extra.kinds = GpuTs::WaitKinds(first.master, first.main, first.wait_semaphores, first.waits);
+		extra.main  = first.main;
+		for (uint32_t i = 0; i < n; ++i) extra.cbs += subs[i].count;
+		const uint32_t slot = first.async ? UINT32_MAX : GpuTs::Begin(last.master, last.tick, n, writes, extra);
 		commands.clear();
 		infos.assign(each ? n : 1u, VkSubmitInfo {});
 		timelines.assign(each ? n : 1u, VkTimelineSemaphoreSubmitInfo {});
@@ -1046,6 +1318,17 @@ void HandOver(const DeferredSubmit* subs, uint32_t n, const vk::detail::Dispatch
 			info.pCommandBuffers      = commands.data() + starts[b];
 			info.signalSemaphoreCount = signal.signals;
 			info.pSignalSemaphores    = signal.signal_semaphores;
+		}
+		// desport: KYTY_GPU_TIMESTAMPS=2: the pre timestamp in a batch of its own (no waits, no signals) ahead of the
+		// waiting one: head - pre is the time the queue sat in the waits.
+		VkCommandBuffer pre = VK_NULL_HANDLE;
+		if (GpuTs::PreWanted(slot)) {
+			pre = GpuTs::Pre(slot);
+			VkSubmitInfo info {};
+			info.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			info.commandBufferCount = 1;
+			info.pCommandBuffers    = &pre;
+			infos.insert(infos.begin(), info);
 		}
 		result = dispatch.vkQueueSubmit(first.queue, static_cast<uint32_t>(infos.size()), infos.data(), VK_NULL_HANDLE);
 	}
@@ -1352,6 +1635,7 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		deferred.master = &m_master;                 // desport
 		deferred.async  = false;                     // desport: KYTY_ASYNC_COMPUTE
 		deferred.writes = desport_writes;            // desport: KYTY_GPU_TIMESTAMPS
+		deferred.main   = m_main;                    // desport: KYTY_GPU_TIMESTAMPS=2
 		// desport: KYTY_SUBMIT_COALESCE: the renderer's submissions are numbered in queue order (the worker may hold them).
 		deferred.q = m_main && Coalesce::On()
 		                 ? LocalVulkanRecording::g_main_queued.fetch_add(1, std::memory_order_seq_cst) + 1
@@ -1407,7 +1691,13 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		ReadbackLatency::NoteEnqueue(tick); // desport: KYTY_READBACK_LATENCY
 		submit.AddSignal(m_master.Handle(), tick);
 		// desport: KYTY_GPU_TIMESTAMPS (the slot is taken under the queue's lock: the ring's order is the queue's).
-		const uint32_t ts_slot  = GpuTs::Begin(&m_master, tick, 1, desport_writes);
+		GpuTs::Extra ts_extra; // desport: KYTY_GPU_TIMESTAMPS=2
+		ts_extra.waits = submit.num_wait_semaphores;
+		ts_extra.kinds = GpuTs::WaitKinds(&m_master, m_main, reinterpret_cast<const VkSemaphore*>(submit.wait_semaphores.data()),
+		                                  submit.num_wait_semaphores);
+		ts_extra.main  = m_main;
+		ts_extra.cbs   = static_cast<uint32_t>(entries.size());
+		const uint32_t ts_slot  = GpuTs::Begin(&m_master, tick, 1, desport_writes, ts_extra);
 		uint32_t       ts_first = 1, ts_count = static_cast<uint32_t>(entries.size());
 		if (ts_slot != UINT32_MAX) {
 			buffers[0]            = vk::CommandBuffer(GpuTs::Head(ts_slot));
@@ -1440,7 +1730,17 @@ uint64_t CommandScheduler::SubmitBuffers(std::span<const SubmitEntry> entries, S
 		                        submit.num_wait_semaphores);
 #endif
 
-		result = graphics.queue.submit(1, &submit_info, nullptr);
+		// desport: KYTY_GPU_TIMESTAMPS=2: the pre timestamp in a batch of its own ahead of the waiting one.
+		std::array<vk::SubmitInfo, 2> ts_infos {vk::SubmitInfo {}, submit_info};
+		vk::CommandBuffer             ts_pre {};
+		uint32_t                      ts_first_info = 1;
+		if (GpuTs::PreWanted(ts_slot)) {
+			ts_pre                         = vk::CommandBuffer(GpuTs::Pre(ts_slot));
+			ts_infos[0].commandBufferCount = 1;
+			ts_infos[0].pCommandBuffers    = &ts_pre;
+			ts_first_info                  = 0;
+		}
+		result = graphics.queue.submit(2u - ts_first_info, ts_infos.data() + ts_first_info, nullptr);
 		m_driver_tick.store(tick, std::memory_order_release);
 	}
 	if (ReadbackLatency::Stats() && result == vk::Result::eSuccess) { // desport: KYTY_READBACK_LATENCY
@@ -1653,6 +1953,7 @@ void CommandScheduler::SubmitAsync() {
 		deferred.async           = true;
 		deferred.q               = 0;          // desport: KYTY_SUBMIT_COALESCE
 		deferred.writes          = UINT32_MAX; // desport: KYTY_GPU_TIMESTAMPS
+		deferred.main            = m_main;     // desport: KYTY_GPU_TIMESTAMPS=2
 		deferred.count           = 1;
 		deferred.commands[0]     = buffer;
 		deferred.ended[0]        = false;

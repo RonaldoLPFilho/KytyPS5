@@ -33,6 +33,8 @@ struct GraphicContext {
 	bool                               memory_budget_ext_enabled             = false;
 	// VK_EXT_memory_priority, enabled only for KYTY_SIMULATE_VRAM_MB (vma.cpp).
 	bool                               memory_priority_enabled               = false;
+	// desport: KYTY_GPU_TIMESTAMPS=2: VK_KHR_calibrated_timestamps (1) or VK_EXT_calibrated_timestamps (2) enabled, 0: none.
+	uint32_t                           desport_calibrated_timestamps         = 0;
 	bool                               rt_extensions_enabled                 = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	// With subgroup size control: wave64 compute programs run on 64-lane subgroups (else emulated on 32-lane ones, two
