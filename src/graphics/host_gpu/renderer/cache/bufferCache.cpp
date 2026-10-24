@@ -1986,6 +1986,24 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	}
 }
 
+// desport: KYTY_LOD_STATS_MIP_BIAS=<0..4> (desport-tex; default 0): the texture-streaming feedback (IT_GET_LOD_STATS)
+// reports each counter's finest sampled level that many levels finer. The levels come from OpImageQueryLod of the
+// implicit-LOD pixel samples at the host's render size; with a lower render size (DLSS upscale) or a query that does not
+// count anisotropy as the PS5's counters may, the game streams coarser levels than on the console. A test lever: a
+// sharper floor at 1-2 says the feedback is the cause.
+static uint32_t LodStatsMipBias() {
+	static const uint32_t bias = [] {
+		const char* text  = std::getenv("KYTY_LOD_STATS_MIP_BIAS");
+		const int   value = text != nullptr ? std::atoi(text) : 0;
+		const auto  clamped = static_cast<uint32_t>(std::clamp(value, 0, 4));
+		char        line[96];
+		std::snprintf(line, sizeof(line), "DES_TEX lod_stats_mip_bias=%u\n", clamped);
+		Desport::EmitLine(line);
+		return clamped;
+	}();
+	return bias;
+}
+
 bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
     constexpr uint64_t ReportSize = 0x840;
     if (address % 4 || !m_resources || !m_resources->IsMapped(address, ReportSize) ||
@@ -2000,7 +2018,7 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
         descriptors.bindingCount = bindings.size(); descriptors.pBindings = bindings.data();
         RequireVulkanSuccess(m_graphics.device.createDescriptorSetLayout(&descriptors, nullptr, &m_lod_pack_descriptors),
                              "create LOD report descriptors");
-        vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 8};
+        vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0, 12}; // desport: + mip_bias
         vk::PipelineLayoutCreateInfo layout {};
         layout.setLayoutCount = 1; layout.pSetLayouts = &m_lod_pack_descriptors;
         layout.pushConstantRangeCount = 1; layout.pPushConstantRanges = &push;
@@ -2024,7 +2042,7 @@ bool BufferCache::TryReportLodStatsOnGpu(uint64_t address, bool reset) {
     const auto [output, offset] = ObtainBuffer(address, ReportSize, true);
     const auto alignment = m_graphics.GetPhysicalDeviceProperties().limits.minStorageBufferOffsetAlignment;
     const auto base = offset & ~(alignment - 1);
-    const uint32_t constants[] {uint32_t((offset - base) / 4), reset ? 1u : 0u};
+    const uint32_t constants[] {uint32_t((offset - base) / 4), reset ? 1u : 0u, LodStatsMipBias()}; // desport
     const vk::DescriptorBufferInfo buffers[] {{m_lod_stats_buffer.Handle(), 0, 256 * 16},
                                              {output->Handle(), base, offset - base + ReportSize}};
     std::array<vk::WriteDescriptorSet, 2> writes {};
@@ -2073,8 +2091,14 @@ void BufferCache::ReportLodStats(void* dst, uint32_t size, bool reset) {
 	std::memset(dst, 0, size);
 	const uint32_t ready = 1;
 	std::memcpy(dst, &ready, sizeof(ready));
+	const uint32_t mip_bias = LodStatsMipBias(); // desport: KYTY_LOD_STATS_MIP_BIAS
 	for (uint32_t i = 0; i < 256; ++i) {
-		const uint64_t entry = (uint64_t(words[i * 4] & 15u) << 56u) |
+		const uint32_t finest = words[i * 4 + 1] != 0
+		                            ? static_cast<uint32_t>(std::max(static_cast<int>(words[i * 4] & 15u) -
+		                                                                 static_cast<int>(mip_bias),
+		                                                             0))
+		                            : (words[i * 4] & 15u); // desport
+		const uint64_t entry = (uint64_t(finest) << 56u) | // desport: finest (was words[i * 4] & 15)
 		    (uint64_t(std::min(words[i * 4 + 1], 0xffffffu)) << 32u) | words[i * 4 + 1];
 		std::memcpy(static_cast<uint8_t*>(dst) + 64 + i * 8, &entry, sizeof(entry));
 		if (reset) {

@@ -24,10 +24,17 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r);
+	// desport: scene_bias_256 (KYTY_TEX_DLSS_BIAS): an extra LOD bias in 1/256 units for a pixel shader's material
+	// sampler (see samplerCache.cpp); a separate sampler per value.
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, int32_t scene_bias_256 = 0);
+
+	// desport: KYTY_TEX_DLSS_BIAS is set (auto or a value): the callers pass scene_bias_256.
+	[[nodiscard]] static bool SceneBiasEnabled();
+	// desport: the scene bias to pass (1/256 units), given the DLSS render/output LOD offset FrameGen measured.
+	[[nodiscard]] static int32_t SceneBias256(int32_t dlss_bias_256);
 
 private:
-	using SamplerKey = std::array<uint32_t, 4>;
+	using SamplerKey = std::array<uint32_t, 5>; // desport: + the scene bias (KYTY_TEX_DLSS_BIAS)
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

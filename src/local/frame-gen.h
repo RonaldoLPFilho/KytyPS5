@@ -180,6 +180,9 @@ struct SrSlot {
 // target: DLSS reconstructs up to the output size and the composite (tonemap, bloom) runs there.
 // 0: off; 1 or 2 with the DLSS SR active.
 [[nodiscard]] uint32_t SrUpscaleMode();
+// desport: KYTY_TEX_DLSS_BIAS=auto: the texture LOD offset of the DLSS upscale, log2(render width / output width) in
+// 1/256 units (negative), as the last upscaled frame measured it; 0 before one (and with DLAA).
+[[nodiscard]] int32_t SrTextureLodBias256();
 // desport: a draw's pixel texture as SrPlanDraw sees it: its guest address (0: not to be considered) and guest size.
 struct SrDrawTexture {
 	uint64_t     address = 0;

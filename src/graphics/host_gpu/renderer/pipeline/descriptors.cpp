@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "slow-log.h"
+#include "frame-gen.h" // desport: KYTY_TEX_DLSS_BIAS
+#include "loader/desport.h" // desport: DES_TEX textures (KYTY_TEX_LOG)
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -34,6 +36,9 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>        // desport: KYTY_TEX_LOG
+#include <mutex>         // desport: KYTY_TEX_LOG
+#include <unordered_map> // desport: KYTY_TEX_LOG
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -569,6 +574,46 @@ static bool TexturePrefixEnabled(bool small_video_memory) {
 	return value != nullptr && value[0] != '\0' ? value[0] != '0' : small_video_memory;
 }
 
+// desport: begin KYTY_TEX_LOG=1 (desport-tex): every 5 s a DES_TEX textures line about the sampled mipmapped 2D textures
+// bound in that window (by guest address): how many, by the T#'s base level (the game streams a texture in from its
+// smallest levels, base > 0 until the larger ones load), with mip statistics (the streaming feedback) and with a
+// min_lod_warn threshold. Many at base 1+ in a place that should be loaded: the game holds back levels.
+static void NoteSampledTexture(uint64_t address, uint32_t base_level, uint32_t levels, bool stats, uint32_t warn) {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_TEX_LOG");
+		return text != nullptr && *text != '\0' && *text != '0';
+	}();
+	if (!enabled) return;
+	struct Seen {
+		uint8_t base = 0, levels = 0;
+		bool    stats = false, warn = false;
+	};
+	static std::mutex                             mutex;
+	static std::unordered_map<uint64_t, Seen>     seen;
+	static std::chrono::steady_clock::time_point  window = std::chrono::steady_clock::now();
+	std::lock_guard lock(mutex);
+	seen[address] = {static_cast<uint8_t>(std::min(base_level, 15u)), static_cast<uint8_t>(std::min(levels, 15u)), stats,
+	                 warn != 0};
+	const auto now = std::chrono::steady_clock::now();
+	if (now - window < std::chrono::seconds(5)) return;
+	window = now;
+	uint32_t by_base[4] {}, with_stats = 0, with_warn = 0, stats_base0 = 0;
+	for (const auto& [key, value]: seen) {
+		(void)key;
+		++by_base[std::min<uint32_t>(value.base, 3u)];
+		with_stats += value.stats ? 1u : 0u;
+		with_warn += value.warn ? 1u : 0u;
+		stats_base0 += value.stats && value.base == 0 ? 1u : 0u;
+	}
+	char line[256];
+	std::snprintf(line, sizeof(line),
+	              "DES_TEX textures=%zu base0=%u base1=%u base2=%u base3+=%u stats=%u stats_base0=%u warn=%u\n",
+	              seen.size(), by_base[0], by_base[1], by_base[2], by_base[3], with_stats, stats_base0, with_warn);
+	Desport::EmitLine(line);
+	seen.clear();
+}
+// desport: end KYTY_TEX_LOG
+
 static void HoldFromBaseLevel(TextureCache& cache, TextureCache::ImageDesc& desc, bool small_video_memory) {
 	const auto  base = desc.view_info.base_level;
 	const auto& full = desc.info;
@@ -991,6 +1036,9 @@ TextureBinding RenderExecutor::ResolveTextureUncached(
 	}
 
 	if (!storage && type == Prospero::ImageType::kColor2D) {
+		if (levels > 1) { // desport: KYTY_TEX_LOG
+			NoteSampledTexture(address, base_level, levels, descriptor.MipStatsCntEn(), descriptor.MinLodWarn5());
+		}
 		HoldFromBaseLevel(texture_cache, desc, m_context.GetGraphics().small_video_memory);
 	}
 	if (!storage) HoldLayerRange(texture_cache, desc, m_context.GetGraphics().small_video_memory);
@@ -1028,7 +1076,14 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 	if (program.info.samplers[index].force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	// desport: KYTY_TEX_DLSS_BIAS: a pixel shader's samplers (the scene's materials; compute passes sample with explicit
+	// levels and the bias would move those) get the DLSS upscale's LOD bias; GetSampler keeps it for material samplers
+	// only (anisotropic or trilinear with mips: not the UI's bilinear ones).
+	int32_t scene_bias = 0;
+	if (SamplerCache::SceneBiasEnabled() && program.stage == ShaderType::Pixel && FrameGen::SrActive()) {
+		scene_bias = SamplerCache::SceneBias256(FrameGen::SrTextureLodBias256());
+	}
+	return context.GetSamplerCache().GetSampler(descriptor, scene_bias);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,

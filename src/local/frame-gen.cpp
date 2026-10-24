@@ -2085,6 +2085,22 @@ void UpscaleAnnounce(const char* how, uint64_t ps_hash) {
 } // namespace
 #endif
 
+// desport: KYTY_TEX_DLSS_BIAS (desport-tex): written by EvaluateSr once an upscaled frame knows both sizes.
+static std::atomic<int32_t> g_sr_texture_lod_bias_256 {0};
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// desport: KYTY_TEX_DLSS_BIAS, defined below.
+static void NoteTextureLodBias(const vk::Extent2D& render, const vk::Extent2D& output);
+// desport: KYTY_DLSS_PRE_EXPOSURE / KYTY_DLSS_EXPOSURE_SCALE: a positive float, else the fallback.
+static float DlssFloatSetting(const char* name, float fallback) {
+	const char* text = std::getenv(name);
+	if (text == nullptr || *text == '\0') return fallback;
+	char*        end   = nullptr;
+	const double value = std::strtod(text, &end);
+	return end != text && *end == '\0' && value > 0.0 && value < 1.0e6 ? static_cast<float>(value) : fallback;
+}
+#endif
+
 bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs_hash, std::span<const SrSlot> slots,
                 bool upscale) { // desport: upscale (KYTY_DLSS_UPSCALE)
 #ifdef KYTY_FRAMEGEN_STREAMLINE
@@ -2101,7 +2117,14 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 	static const int  motion_slot    = SlotSetting("KYTY_DLSS_MOTION_SLOT", SrMotionSlot);
 	static const auto presets        = ReadPresets();
 	static const auto jitter_sign    = JitterSign();
-	static const bool auto_exposure  = Setting("KYTY_DLSS_AUTOEXPOSURE", true);
+	// desport: KYTY_DLSS_AUTO_EXPOSURE=0|1 (desport-tex) is the same switch as KYTY_DLSS_AUTOEXPOSURE, and wins.
+	static const bool auto_exposure  = Setting("KYTY_DLSS_AUTO_EXPOSURE", Setting("KYTY_DLSS_AUTOEXPOSURE", true));
+	// desport: KYTY_DLSS_PRE_EXPOSURE / KYTY_DLSS_EXPOSURE_SCALE (sl::DLSSOptions; default 1), and KYTY_DLSS_ALPHA=1:
+	// DLSS reconstructs the color's alpha too (alphaUpscalingEnabled). The game's TAA (0xa44e580f4f0cfb2b) writes
+	// RGBA (dmask 0xf) and reads its history's alpha; without it DLSS leaves the output's alpha as it likes.
+	static const float pre_exposure   = DlssFloatSetting("KYTY_DLSS_PRE_EXPOSURE", 1.0f);
+	static const float exposure_scale = DlssFloatSetting("KYTY_DLSS_EXPOSURE_SCALE", 1.0f);
+	static const bool  alpha_upscale  = Setting("KYTY_DLSS_ALPHA", false);
 	static const bool hdr_forced     = std::getenv("KYTY_DLSS_HDR") != nullptr && *std::getenv("KYTY_DLSS_HDR") != '\0';
 	static const bool hdr_setting    = Setting("KYTY_DLSS_HDR", true);
 	static const float cut_distance  = [] {
@@ -2240,6 +2263,7 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 		}
 		if (!PrepareUpscaled(graphics, command, out.format, g_up.output)) return false;
 		upscaled = true;
+		NoteTextureLodBias(render, g_up.output); // desport: KYTY_TEX_DLSS_BIAS
 	}
 
 	std::lock_guard          api_lock(g_streamline_mutex);
@@ -2257,6 +2281,9 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 		options.outputHeight           = output_extent.height;
 		options.colorBuffersHDR        = hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 		options.useAutoExposure        = auto_exposure ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+		options.preExposure            = pre_exposure;                                         // desport
+		options.exposureScale          = exposure_scale;                                       // desport
+		options.alphaUpscalingEnabled  = alpha_upscale ? sl::Boolean::eTrue : sl::Boolean::eFalse; // desport
 		options.dlaaPreset             = presets.dlaa;
 		options.qualityPreset          = presets.quality;
 		options.balancedPreset         = presets.balanced;
@@ -2282,11 +2309,16 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 			SrIssueOnce(SrIssueOptions, "slDLSSSetOptions failed (%d)", static_cast<int>(result));
 			return false;
 		}
-		LOGF("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d, auto exposure %d\n", g_sr_mode_name,
-		     presets.name, output_extent.width, output_extent.height, hdr ? 1 : 0, auto_exposure ? 1 : 0);
-		std::printf("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d, auto exposure %d\n",
+		// desport: + pre-exposure, exposure scale and alpha (desport-tex)
+		LOGF("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d%s, auto exposure %d, pre-exposure %.3f, "
+		     "exposure scale %.3f, alpha %d\n",
+		     g_sr_mode_name, presets.name, output_extent.width, output_extent.height, hdr ? 1 : 0,
+		     hdr_forced ? " (env)" : "", auto_exposure ? 1 : 0, pre_exposure, exposure_scale, alpha_upscale ? 1 : 0);
+		std::printf("DLSS: options: mode %s, preset %s, output %ux%u, HDR color %d%s, auto exposure %d, pre-exposure "
+		            "%.3f, exposure scale %.3f, alpha %d\n",
 		            g_sr_mode_name, presets.name, output_extent.width, output_extent.height, hdr ? 1 : 0,
-		            auto_exposure ? 1 : 0);
+		            hdr_forced ? " (env)" : "", auto_exposure ? 1 : 0, pre_exposure, exposure_scale,
+		            alpha_upscale ? 1 : 0);
 		std::fflush(stdout);
 		g_sr_options.set    = true;
 		g_sr_options.output = output_extent;
@@ -2476,6 +2508,23 @@ bool EvaluateSr(GraphicContext& graphics, vk::CommandBuffer command, uint64_t cs
 	return false;
 #endif
 }
+
+#ifdef KYTY_FRAMEGEN_STREAMLINE
+// desport: KYTY_TEX_DLSS_BIAS (desport-tex): log2(render width / output width), logged when it changes.
+static void NoteTextureLodBias(const vk::Extent2D& render, const vk::Extent2D& output) {
+	if (render.width == 0 || output.width == 0) return;
+	const auto bias = static_cast<int32_t>(
+	    std::lround(std::log2(static_cast<double>(render.width) / static_cast<double>(output.width)) * 256.0));
+	const auto clamped = std::clamp(bias, -1024, 0);
+	if (g_sr_texture_lod_bias_256.exchange(clamped, std::memory_order_relaxed) != clamped) {
+		LOGF("DES_TEX dlss_lod_bias=%.3f render=%ux%u output=%ux%u\n", static_cast<double>(clamped) / 256.0,
+		     render.width, render.height, output.width, output.height);
+		std::printf("DES_TEX dlss_lod_bias=%.3f render=%ux%u output=%ux%u\n", static_cast<double>(clamped) / 256.0,
+		            render.width, render.height, output.width, output.height);
+		std::fflush(stdout);
+	}
+}
+#endif
 
 // desport: KYTY_DLSS_UPSCALE, see frame-gen.h.
 // Mode 1: a draw that samples this frame's TAA output into a larger color target samples the DLSS image instead; its
@@ -2690,6 +2739,10 @@ void SrCompositeEnd(vk::CommandBuffer command) {
 
 uint32_t SrUpscaleMode() { // desport
 	return SrActive() ? g_sr_upscale : 0u;
+}
+
+int32_t SrTextureLodBias256() { // desport
+	return SrActive() ? g_sr_texture_lod_bias_256.load(std::memory_order_relaxed) : 0;
 }
 // desport: end DLSS SR/DLAA
 
