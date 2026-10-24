@@ -130,6 +130,11 @@ public:
 	void CopyGuestMemory(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size);
 	// Called after an identified small GPU copy; it never submits or publishes guest data.
 	void ScheduleCopyFeedback(uint64_t vaddr, uint64_t size);
+	// desport: KYTY_READBACK_PREFETCH. GPU thread, at a guest-visible sync point the command processor writes (an
+	// end-of-pipe label, WRITE_DATA): snapshots, right behind the GPU work recorded so far, the "hot" 64 KiB chunks
+	// (ones the guest read back recently) that GPU work wrote since their last snapshot. A later guest read of them is
+	// served from the snapshot (a copy-feedback slot) in one render-thread turn, with no new copy, submit or GPU drain.
+	void FlushReadbackPrefetch();
 	// GPU thread: retire a pending guest read before touching overlapping backing.
 	// With no range, drain before mapping changes, unknown BDA access, or shutdown.
 	// `gpu_write`: the range is about to be written by the GPU again; a read whose
@@ -286,9 +291,30 @@ private:
 	uint32_t m_active_guest_readbacks = 0;
 	struct CopyFeedback;
 	void InvalidateCopyFeedback(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write);
+	// desport: `pending_tick` (KYTY_READBACK_PREFETCH): when snapshots cover every GPU-written byte but the GPU has not
+	// finished them yet, the tick to wait for (else left alone).
+	[[nodiscard]] bool TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t* pending_tick = nullptr);
+	[[nodiscard]] bool TryGuestReadFromFeedback(uint64_t vaddr, uint64_t size, bool is_write,
+	                                            uint64_t* pending_tick = nullptr);
 	std::unique_ptr<CopyFeedback> m_copy_feedback;
+	// desport: KYTY_READBACK_PREFETCH state (GPU thread). Hot chunks: the 64 KiB chunks guest reads faulted on lately
+	// (by tick, the oldest replaced); m_prefetch_lo/hi bound them (a GPU write outside costs one compare). Pending: hot
+	// chunks GPU work wrote since their last snapshot.
+	struct PrefetchHot {
+		uint64_t chunk = 0, tick = 0;
+	};
+	static constexpr uint64_t PrefetchChunk      = 64 * 1024; // = CopyFeedback::SlotSize
+	static constexpr size_t   PrefetchHotEntries = 32;
+	static constexpr uint64_t PrefetchHotTicks   = 4096;
+	static constexpr size_t   PrefetchMaxPending = 64;
+	std::array<PrefetchHot, PrefetchHotEntries> m_prefetch_hot {};
+	uint64_t                                    m_prefetch_lo = UINT64_MAX, m_prefetch_hi = 0;
+	std::vector<uint64_t>                       m_prefetch_pending;
+	uint64_t                                    m_prefetch_report_ms = 0;
+	bool NotePrefetchRead(uint64_t vaddr, uint64_t size);
+	void NotePrefetchWrite(uint64_t vaddr, uint64_t size);
+	void ServePrefetchNeighbors(uint64_t vaddr);
+	void ReportReadbackPrefetch();
 	bool TryReportLodStatsOnGpu(uint64_t address, bool reset);
 	vk::Pipeline m_lod_pack_pipeline = nullptr;
 	vk::PipelineLayout m_lod_pack_layout = nullptr;
