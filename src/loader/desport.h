@@ -19,6 +19,20 @@ void FlipMilestone(bool from_gpu);
 // The first guest file opened under /app0 that is not part of the executable or sce_sys.
 void FileOpenMilestone(const char* guest_path);
 
+// desport: periodic memory report (DES_MEM=1 or DES_STATS=1): "DES_MEM t=<ms> name=<category> bytes=<n> count=<n>" lines
+// every DES_MEM_INTERVAL_S seconds (default 30), read by tools/log_triage.py. Owners of memory register a provider that
+// calls the sink once per category; providers run on the reporter thread, so they must read thread-safe figures only.
+namespace Mem {
+
+using Sink     = void (*)(const char* name, uint64_t bytes, uint64_t count);
+using Provider = void (*)(Sink sink);
+
+bool Enabled();
+void Register(Provider provider);   // no-op when disabled; starts the reporter on the first call
+void Unregister(Provider provider); // waits for a report in progress
+
+} // namespace Mem
+
 namespace Stats {
 
 // DES_STATS=1: per-name call count, total time and bytes, logged every 5 s as

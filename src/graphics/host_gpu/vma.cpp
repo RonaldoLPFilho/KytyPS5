@@ -25,7 +25,9 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/moduleStore.h" // desport: DES_MEM shader store
 #include "live-counters.h"
+#include "loader/desport.h" // desport: DES_MEM
 #include "local-platform.h"
 
 #include <cstdio>
@@ -40,6 +42,7 @@ void FlushBufferReclaimer(); // streamBuffer.cpp (KYTY_BUFFER_RECLAIM)
 // Local diagnostic (live `vma <path>`): VMA is thread-safe, so the live thread writes it.
 static VmaAllocator          g_report_allocator = nullptr;
 static const GraphicContext* g_report_context   = nullptr;
+static void                  ReportVideoMemory(Desport::Mem::Sink sink); // desport: DES_MEM provider
 // Freed images kept for reuse (KYTY_IMAGE_POOL): at most 1 GiB, and a 16th of the GPU's memory budget.
 static uint64_t g_image_pool_limit = 1024ull << 20;
 static void WriteVmaReport(const char* path) {
@@ -139,6 +142,7 @@ bool GraphicContext::CreateAllocator() {
 	g_report_allocator          = allocator;
 	g_report_context            = this;
 	LiveCounters::g_vma_report = WriteVmaReport;
+	Desport::Mem::Register(&ReportVideoMemory); // desport: DES_MEM
 	g_image_pool_limit         = std::min<uint64_t>(1024ull << 20, GetTotalMemoryBudget() / 16);
 	return true;
 }
@@ -150,6 +154,7 @@ void GraphicContext::DestroyAllocator() {
 		return;
 	}
 	LiveCounters::g_vma_report = nullptr;
+	Desport::Mem::Unregister(&ReportVideoMemory); // desport: DES_MEM
 	g_report_allocator         = nullptr;
 	g_report_context           = nullptr;
 	FlushBufferReclaimer();
@@ -314,6 +319,46 @@ std::array<uint32_t, 10> ImagePoolKey(const VulkanImage& image) {
 	return ImagePoolKey(info);
 }
 } // namespace
+
+// desport: DES_MEM provider (VMA is thread-safe): the allocator's blocks and allocations by kind of memory type, the
+// driver's per-heap usage, the image pool and the shader store (SPIR-V, mostly in a compressed scratch file).
+static void ReportVideoMemory(Desport::Mem::Sink sink) {
+	if (g_report_allocator == nullptr || g_report_context == nullptr) return;
+	VmaTotalStatistics statistics {};
+	vmaCalculateStatistics(g_report_allocator, &statistics);
+	const auto& properties = g_report_context->GetPhysicalDeviceMemoryProperties();
+	uint64_t    blocks[3] {}, block_count[3] {}, allocated[3] {}, allocation_count[3] {};
+	for (uint32_t type = 0; type < properties.memoryTypeCount; type++) {
+		const auto flags = properties.memoryTypes[type].propertyFlags;
+		const int  kind  = (flags & vk::MemoryPropertyFlagBits::eDeviceLocal) ? 0 : (flags & vk::MemoryPropertyFlagBits::eHostVisible) ? 1 : 2;
+		const auto& s    = statistics.memoryType[type].statistics;
+		blocks[kind] += s.blockBytes;
+		block_count[kind] += s.blockCount;
+		allocated[kind] += s.allocationBytes;
+		allocation_count[kind] += s.allocationCount;
+	}
+	static const char* const names[3] = {"vma_device_local", "vma_host_visible", "vma_plain"};
+	for (int kind = 0; kind < 3; kind++) {
+		sink(names[kind], blocks[kind], block_count[kind]); // blocks VMA holds from the driver
+		char allocated_name[48];
+		std::snprintf(allocated_name, sizeof(allocated_name), "%s_allocated", names[kind]);
+		sink(allocated_name, allocated[kind], allocation_count[kind]); // live allocations inside them
+	}
+	VmaBudget budgets[VK_MAX_MEMORY_HEAPS] {};
+	vmaGetHeapBudgets(g_report_allocator, budgets);
+	for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+		char name[32];
+		std::snprintf(name, sizeof(name), "driver_heap%u_usage", heap);
+		sink(name, budgets[heap].usage, 0); // what the driver counts for this process (VMA's and its own)
+	}
+	{
+		std::scoped_lock lock(g_image_pool_mutex);
+		sink("image_pool", g_image_pool_bytes, g_image_pool.size());
+	}
+	const auto modules = ModuleStore::Stats();
+	sink("shader_spirv", modules.spirv_bytes, modules.modules);
+	sink("shader_spirv_stored", modules.stored_bytes, modules.modules);
+}
 
 static void DestroyImagePool(VmaAllocator allocator) {
 	std::scoped_lock lock(g_image_pool_mutex);

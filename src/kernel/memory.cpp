@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/cache/gpuResourceManager.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "loader/desport.h" // desport: DES_MEM
 #include "native-resource-state.h"
 #include "speculation-state.h"
 
@@ -1539,6 +1540,39 @@ static bool SelfTestSub64SharedPlaceholderAlias() {
 
 static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size);
 
+// desport: DES_MEM provider: the guest's memory by kind (each under its own mutex; some tens of thousands of
+// mappings at most, once every 30 s).
+static void ReportGuestMemory(Desport::Mem::Sink sink) {
+	if (g_physical_memory == nullptr || g_flexible_memory == nullptr || g_pooled_memory == nullptr) return;
+	uint64_t allocated = 0, allocated_count = 0, mapped = 0, mapped_count = 0;
+	g_physical_memory->GetMutex().Lock();
+	for (const auto& [start, b]: g_physical_memory->GetPhysicalBlocks()) {
+		allocated += b.size;
+		allocated_count++;
+	}
+	for (const auto& [vaddr, b]: g_physical_memory->GetMappings()) {
+		mapped += b.map_size;
+		mapped_count++;
+	}
+	g_physical_memory->GetMutex().Unlock();
+	uint64_t flexible = 0, flexible_count = 0;
+	g_flexible_memory->GetMutex().Lock();
+	for (const auto& b: g_flexible_memory->GetBlocks()) {
+		flexible += b.map_size;
+		flexible_count++;
+	}
+	g_flexible_memory->GetMutex().Unlock();
+	uint64_t pooled = 0, pooled_count = 0;
+	for (const auto& mapping: g_pooled_memory->GetMappings()) {
+		pooled += mapping.size;
+		pooled_count++;
+	}
+	sink("guest_direct_allocated", allocated, allocated_count);
+	sink("guest_direct_mapped", mapped, mapped_count);
+	sink("guest_flexible_mapped", flexible, flexible_count);
+	sink("guest_pooled_mapped", pooled, pooled_count);
+}
+
 void Initialize() {
 	g_flexible_memory_size_frozen = true;
 	VirtualMemory::Init();
@@ -1549,9 +1583,11 @@ void Initialize() {
 	g_virtual_ranges      = std::make_unique<VirtualRanges>();
 	EXIT_IF(!g_guest_address_space->SelfTest());
 	EXIT_IF(!SelfTestSub64SharedPlaceholderAlias());
+	Desport::Mem::Register(&ReportGuestMemory); // desport: DES_MEM
 }
 
 void Shutdown() {
+	Desport::Mem::Unregister(&ReportGuestMemory); // desport: DES_MEM
 	g_pooled_memory.reset();
 	g_flexible_memory.reset();
 	g_physical_memory.reset();
