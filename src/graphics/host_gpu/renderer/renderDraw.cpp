@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "loader/desport.h" // desport: ultrawide movie pillarbox
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -1556,6 +1557,65 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	     primitive == Prospero::PrimitiveType::kTriStrip ||
 	     primitive == Prospero::PrimitiveType::kRectList);
 #endif
+	// desport: begin ultrawide movie pillarbox (KYTY_ULTRAWIDE_MOVIES, Desport::UltrawideMovieScale): while a Bink movie
+	// plays, a draw covering a target wider than 16:9 (the output-size UI target) that samples a 16:9 texture of a
+	// video's size (the movie frame) gets its viewport narrowed to 16:9 around the same centre; the rest of the target
+	// keeps what the UI cleared it to. The guest viewport register is restored after the draw is recorded. New lines
+	// up to 'desport: end'.
+	struct DesportViewportRestore {
+		HW::Context*          context = nullptr;
+		HW::ScreenViewport    saved {};
+		void Restore() {
+			if (context == nullptr) return;
+			const auto& v = saved.viewports[0];
+			context->SetViewportScaleOffset(0, v.xscale, v.xoffset, v.yscale, v.yoffset, v.zscale, v.zoffset);
+			context = nullptr;
+		}
+		~DesportViewportRestore() { Restore(); }
+	} desport_viewport_restore;
+	if (Desport::MoviePlaying() && state.color_count > 0 && state.color_info[0].image_id && bindings.pixel.has_value()) {
+		const auto  target = state.color_info[0].Extent();
+		const float scale  = Desport::UltrawideMovieScale(target.width, target.height);
+		auto&       regs   = buffer.GetRegisters();
+		const auto& guest  = regs.GetScreenViewport().viewports[0];
+		const bool  covers = std::fabs(guest.xscale * 2.0f - static_cast<float>(target.width)) < 2.0f &&
+		                    std::fabs(guest.yscale * 2.0f - static_cast<float>(target.height)) < 2.0f;
+		int movie_slot = -1;
+		for (size_t i = 0; scale > 0.0f && covers && i < bindings.pixel->images.size(); ++i) {
+			const auto& extent = bindings.pixel->images[i].desc.info.extent;
+			if (extent.width * 9u == extent.height * 16u && extent.width >= 640 && extent.width <= 3840 &&
+			    bindings.pixel->images[i].image_id != state.color_info[0].image_id) {
+				movie_slot = static_cast<int>(i);
+				break;
+			}
+		}
+		if (movie_slot >= 0 && regs.GetClipControl().clip_disable) {
+			static std::atomic_bool clip_logged {false};
+			if (!clip_logged.exchange(true)) {
+				Desport::EmitLine("DES_ULTRAWIDE movie_pillarbox skipped: the movie draw bypasses the viewport (clip disabled)\n");
+			}
+		} else if (movie_slot >= 0) {
+			desport_viewport_restore.context = &regs;
+			desport_viewport_restore.saved   = regs.GetScreenViewport();
+			regs.SetViewportScaleOffset(0, guest.xscale * scale, guest.xoffset, guest.yscale, guest.yoffset, guest.zscale,
+			                            guest.zoffset);
+			static std::atomic<uint32_t> logged {0};
+			if (logged.fetch_add(1) < 4) {
+				const auto& extent = bindings.pixel->images[movie_slot].desc.info.extent;
+				const auto  ps     = state.ps_active && state.ps_input_info.stage.program != nullptr
+				                         ? state.ps_input_info.stage.program->shader_hash
+				                         : 0;
+				char line[256];
+				std::snprintf(line, sizeof(line),
+				              "DES_ULTRAWIDE movie_pillarbox draw ps=0x%016" PRIx64 " texture=%ux%u slot=%d target=%ux%u "
+				              "viewport_width=%.0f->%.0f\n",
+				              ps, extent.width, extent.height, movie_slot, target.width, target.height,
+				              guest.xscale * 2.0f / scale, guest.xscale * 2.0f);
+				Desport::EmitLine(line);
+			}
+		}
+	}
+	// desport: end ultrawide movie pillarbox
 	auto vk_buffer = buffer.Handle();
 	if (set_bind_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x100u);
@@ -1652,6 +1712,7 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    emit.direct_run.empty() ? std::span {&command, 1} : emit.direct_run);
 	}
 #endif
+	desport_viewport_restore.Restore(); // desport: ultrawide movie pillarbox (the draw is recorded)
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
