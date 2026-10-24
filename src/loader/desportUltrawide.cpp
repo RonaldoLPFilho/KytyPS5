@@ -473,9 +473,12 @@ float UltrawideMovieScale(uint32_t target_width, uint32_t target_height) {
 		const char* aspect = std::getenv("KYTY_ULTRAWIDE");                                    // desport
 		if (aspect == nullptr || *aspect == '\0') return false;                                // desport
 		const char* mode   = std::getenv("KYTY_ULTRAWIDE_MOVIES");                             // desport
-		// desport: opt-in only: with KYTY_ULTRAWIDE_HUD=native the filter matched the UI composite (a 3840x2160 texture)
-		// instead of the movie, which the game draws 16:9 from the left edge of the UI space (2026-10-24).
-		return mode != nullptr && std::string_view(mode) == "pillarbox";
+		if (mode != nullptr && *mode != '\0') return std::string_view(mode) == "pillarbox";    // desport
+		// desport: default with the native HUD: the movie layer draw (ps a6b124d2b1ba4b7e) is shifted so the movie, laid out
+		// 16:9 from the left edge of the UI space, sits centred (verified at 3440x1440, 2026-10-24).
+		const char* render = std::getenv("KYTY_ULTRAWIDE_RENDER");                             // desport
+		const char* hud    = std::getenv("KYTY_ULTRAWIDE_HUD");                                // desport
+		return render != nullptr && std::strcmp(render, "1") == 0 && hud != nullptr && std::string_view(hud) == "native";
 	}();
 	if (!pillarbox || target_height == 0) return 0.0f;                                         // desport
 	const float aspect = static_cast<float>(target_width) / static_cast<float>(target_height);  // desport
