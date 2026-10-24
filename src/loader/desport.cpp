@@ -227,6 +227,47 @@ void Unregister(Provider provider) {
 
 } // namespace Mem
 
+namespace Faults {
+
+namespace {
+
+std::atomic_uint64_t g_counts[KindCount];
+
+void ReporterLoop() {
+	uint64_t last[KindCount] {};
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::seconds(5));
+		uint64_t now[KindCount];
+		for (uint32_t i = 0; i < KindCount; i++) now[i] = g_counts[i].load(std::memory_order_relaxed);
+		auto delta = [&](Kind kind) { return now[kind] - last[kind]; };
+		Emit(fmt::format("DES_FAULTS t={} write_direct={} write_flexible={} write_pooled={} write_other={} read={} other={} "
+		                 "window={} restore={} invalidate={} readback={} guest={} gpu_thread={}\n",
+		                 ElapsedMs(), delta(WriteDirect), delta(WriteFlexible), delta(WritePooled), delta(WriteOther), delta(Read),
+		                 delta(Other), delta(Window), delta(Restore), delta(Invalidate), delta(Readback), delta(Guest),
+		                 delta(GpuThread)));
+		std::copy(std::begin(now), std::end(now), std::begin(last));
+	}
+}
+
+} // namespace
+
+bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FAULT_CLASSIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void Add(Kind kind) noexcept {
+	if (!Enabled()) return;
+	static std::once_flag started;
+	std::call_once(started, [] { std::thread(ReporterLoop).detach(); });
+	g_counts[kind].fetch_add(1, std::memory_order_relaxed);
+}
+
+} // namespace Faults
+
 namespace Stats {
 
 namespace {

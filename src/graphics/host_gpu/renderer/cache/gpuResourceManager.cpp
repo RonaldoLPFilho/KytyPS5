@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "kernel/memory.h"
+#include "loader/desport.h" // desport: KYTY_FAULT_CLASSIFY
 #include "speculation-state.h"
 
 extern "C" {
@@ -90,8 +91,21 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	// desport: KYTY_FAULT_CLASSIFY: by access, mapping kind and thread (no log per fault; Desport::Faults reports every 5 s)
+	const bool classify = Desport::Faults::Enabled();
+	if (classify) {
+		using namespace Desport::Faults;
+		Add(GuestGpu::IsGpuThread() ? GpuThread : Guest);
+		if (access == PageFaultAccess::Write) {
+			static constexpr Kind kinds[4] {WriteDirect, WriteFlexible, WritePooled, WriteOther};
+			Add(kinds[LibKernel::Memory::ClassifyFaultMemory(fault_vaddr)]);
+		} else {
+			Add(access == PageFaultAccess::Read ? Read : Other);
+		}
+	}
 	if (access == PageFaultAccess::Write) {
 		if (TryInvalidateCpuWriteWindow(fault_vaddr)) {
+			if (classify) Desport::Faults::Add(Desport::Faults::Window); // desport
 			LiveCounters::Add(LiveCounters::WindowFault);
 			return true;
 		}
@@ -99,9 +113,11 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 		// No watcher holds the page, so no cache expects this fault: the protection outlived its
 		// watchers and would fault forever. It gets the guest's own protection back.
 		if (m_page_manager.RestoreIfUnwatched(fault_vaddr)) {
+			if (classify) Desport::Faults::Add(Desport::Faults::Restore); // desport
 			LiveCounters::Add(LiveCounters::StaleProtectRepairs);
 			return true;
 		}
+		if (classify) Desport::Faults::Add(Desport::Faults::Invalidate); // desport
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
@@ -118,6 +134,7 @@ bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vadd
 				CommandScheduler::SetThreadRecorder(recorder);
 			}
 		} normal_path;
+		if (classify) Desport::Faults::Add(Desport::Faults::Readback); // desport
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;

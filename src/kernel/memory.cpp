@@ -1062,6 +1062,7 @@ public:
 		GpuAccessMode gpu_mode;
 	};
 
+	[[nodiscard]] bool     Covers(uint64_t vaddr); // desport: KYTY_FAULT_CLASSIFY
 	void                   Expand(uint64_t phys_addr, uint64_t size);
 	bool                   ReleaseExpansion(uint64_t phys_addr, uint64_t size);
 	bool                   Allocate(uint64_t vaddr, uint64_t size, GpuAccessMode gpu_mode,
@@ -1417,6 +1418,15 @@ void InstallGpuResources(Graphics::GpuResourceManager* resources) noexcept {
 
 bool IsGuestMappedAfterChanges(uint64_t vaddr) {
 	return g_guest_address_space != nullptr && g_guest_address_space->IsMappedAfterChanges(vaddr);
+}
+
+int ClassifyFaultMemory(uint64_t vaddr) noexcept { // desport: KYTY_FAULT_CLASSIFY
+	if (g_guest_address_space == nullptr) return 3;
+	switch (g_guest_address_space->MappingKindOf(vaddr)) {
+		case 0: return g_pooled_memory != nullptr && g_pooled_memory->Covers(vaddr) ? 2 : 0;
+		case 1: return 1;
+		default: return 3;
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
@@ -2687,6 +2697,12 @@ bool PooledMemory::QueryUnlocked(uint64_t vaddr, uint64_t size,
 		current += part_size;
 	}
 	return true;
+}
+
+bool PooledMemory::Covers(uint64_t vaddr) { // desport: KYTY_FAULT_CLASSIFY
+	Common::LockGuard lock(m_mutex);
+	return std::any_of(m_mappings.begin(), m_mappings.end(),
+	                   [vaddr](const auto& m) { return vaddr >= m.vaddr && vaddr < m.vaddr + m.size; });
 }
 
 bool PooledMemory::Query(uint64_t vaddr, uint64_t size, std::vector<Mapping>* mappings) {
