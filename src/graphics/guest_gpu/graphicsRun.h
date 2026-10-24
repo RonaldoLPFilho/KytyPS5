@@ -79,6 +79,10 @@ private:
 		uint32_t                    spec_chunk  = 0;
 		bool                        spec_normal = false;
 		std::optional<Pm4Execution> spec_end;
+		// desport: KYTY_READBACK_LATENCY: when it was queued (counters), and a graphics slice that stopped for an
+		// async-compute submission (not blocked: it goes on right after).
+		uint64_t enqueue_ns = 0;
+		bool     yielded    = false;
 	};
 
 	void              Enqueue(Submission submission);
@@ -88,6 +92,8 @@ private:
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// desport: KYTY_READBACK_LATENCY=2. GPU thread: an async-compute submission could be processed now.
+	bool ComputeReady();
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_submission_mutex;
@@ -98,6 +104,8 @@ private:
 	std::array<std::deque<Submission>, QueueCount> m_queues;
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
+	// desport: KYTY_READBACK_LATENCY=2: submissions in the async-compute queues (changed under m_queue_mutex).
+	std::atomic_uint32_t                           m_compute_queued {0};
 	uint32_t                                       m_next_queue        = 0;
 	std::array<uint64_t, QueueCount>               m_serials {};
 	uint32_t                                       m_submission_count  = 0;

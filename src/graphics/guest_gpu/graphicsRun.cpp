@@ -724,6 +724,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	LiveTrace::Event(LiveTrace::LabelWrite, reinterpret_cast<uint64_t>(dst),
 	                 src[write_one_address ? dw_num - 1 : 0] | uint64_t {2} << 56u);
 	FlushReadbackPrefetch(m_renderer, m_state_only); // desport: KYTY_READBACK_PREFETCH
+	if (!m_state_only) ReadbackLatency::NoteSyncPoint(IsAsyncComputeQueue()); // desport: KYTY_READBACK_LATENCY
 
 	if (write_one_address) {
 		WriteGuestMemory(dst, src + dw_num - 1, sizeof(uint32_t));
@@ -834,6 +835,8 @@ void GuestGpu::Enqueue(Submission submission) {
 		                 : Speculation::Job::Kind::Other});
 	LiveTrace::Event(LiveTrace::Submit, submission.queue_id | static_cast<uint32_t>(submission.type) << 8u,
 	                 submission.commands.size());
+	submission.enqueue_ns = ReadbackLatency::Stats() ? ReadbackLatency::NowNs() : 0; // desport: KYTY_READBACK_LATENCY
+	if (submission.queue_id != 0) m_compute_queued.fetch_add(1, std::memory_order_relaxed); // desport
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
@@ -936,6 +939,7 @@ void GuestGpu::ThreadRun(void* data) {
 				submission  = std::move(queue.front());
 				queue.pop_front();
 				gpu->m_submission_count--;
+				if (selected_queue != 0) gpu->m_compute_queued.fetch_sub(1, std::memory_order_relaxed); // desport
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
 				has_submission    = true;
@@ -967,7 +971,24 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u | 1u << 17u,
 		                 submission.frame_epoch | uint64_t {submission.commands.size()} << 32u);
+		// desport: KYTY_READBACK_LATENCY counters: an async-compute submission's wait for the render thread, the
+		// graphics slices.
+		const bool     lat_stats   = ReadbackLatency::Stats();
+		const uint64_t slice_start = lat_stats ? ReadbackLatency::NowNs() : 0;
+		if (lat_stats && submission.type == SubmissionType::Compute && !submission.started && submission.enqueue_ns != 0 &&
+		    slice_start > submission.enqueue_ns) {
+			const uint64_t waited = slice_start - submission.enqueue_ns;
+			ReadbackLatency::Add(ReadbackLatency::CqSubs);
+			ReadbackLatency::Add(ReadbackLatency::CqWaitNs, waited);
+			ReadbackLatency::Max(ReadbackLatency::CqWaitMaxNs, waited);
+		}
 		const bool complete = gpu->Process(submission);
+		if (lat_stats && submission.type == SubmissionType::Graphics) { // desport
+			const uint64_t took = ReadbackLatency::NowNs() - slice_start;
+			ReadbackLatency::Add(ReadbackLatency::GfxSlices);
+			ReadbackLatency::Add(ReadbackLatency::GfxSliceNs, took);
+			ReadbackLatency::Max(ReadbackLatency::GfxSliceMaxNs, took);
+		}
 		LiveTrace::Event(LiveTrace::RenderSlice,
 		                 submission.queue_id | static_cast<uint32_t>(submission.type) << 8u |
 		                     static_cast<uint32_t>(complete) << 16u,
@@ -977,7 +998,10 @@ void GuestGpu::ThreadRun(void* data) {
 		LiveCounters::Add(LiveCounters::Submissions);
 		if (!complete) {
 			LiveCounters::Add(LiveCounters::SubmissionRequeues);
-			submission.blocked = true;
+			// desport: KYTY_READBACK_LATENCY=2: a graphics slice that stopped for an async-compute submission is not
+			// blocked (the compute queues come first in the round, m_next_queue; it goes on right after them).
+			submission.blocked = !std::exchange(submission.yielded, false);
+			if (submission.queue_id != 0) gpu->m_compute_queued.fetch_add(1, std::memory_order_relaxed); // desport
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
 			gpu->m_submission_count++;
 		} else {
@@ -1161,7 +1185,7 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 				progressed |= round_progress;
 				complete = submission.command_complete && submission.constant_complete;
-				if (complete || !round_progress) {
+				if (complete || !round_progress || cp.YieldPending()) { // desport: KYTY_READBACK_LATENCY=2 (a yield)
 					break;
 				}
 			}
@@ -1209,6 +1233,8 @@ bool GuestGpu::Process(Submission& submission) {
 			break;
 		case SubmissionType::FrameBoundary: EXIT("frame boundary already handled\n");
 	}
+	// desport: KYTY_READBACK_LATENCY=2: a slice stopped for an async-compute submission (GuestGpu::ThreadRun).
+	submission.yielded = cp.TakeYield() && !complete;
 	// (KYTY_SPECULATE=4: the state after the graphics queue's submission, for a chain that could not follow it.)
 	if (complete && submission.queue_id == 0 && m_ahead.load(std::memory_order_relaxed) != nullptr)
 		m_speculation->Done(submission.serial, cp);
@@ -1216,11 +1242,27 @@ bool GuestGpu::Process(Submission& submission) {
 	return complete;
 }
 
+// desport: KYTY_READBACK_LATENCY=2. GPU thread, translating the graphics queue: an async-compute submission could be
+// processed now (queued, not blocked at a wait, of the frame being consumed: CanProcessSubmission).
+bool GuestGpu::ComputeReady() {
+	if (m_compute_queued.load(std::memory_order_relaxed) == 0) return false;
+	Common::LockGuard lock(m_queue_mutex);
+	for (uint32_t id = 1; id < QueueCount; ++id) {
+		const auto& queue = m_queues[id];
+		if (!queue.empty() && !queue.front().blocked && CanProcessSubmission(queue.front())) return true;
+	}
+	return false;
+}
+
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
+	// desport: KYTY_READBACK_LATENCY=2: resumed after a yield. The clean-draw shadow is shared by the processors (one per
+	// thread) and an async-compute submission ran in between: a register it set to the value this queue sets next would
+	// hide that change from the shadow, so nothing it holds is taken as known.
+	if (std::exchange(m_yield_resume, false)) DrawStateObserver::Invalidate();
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		execution.m_buffer_stack.push_back({commands});
 	}
@@ -1416,6 +1458,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				return;
 			}
 			++m_chunk_work;
+		}
+		// desport: KYTY_READBACK_LATENCY=2: the graphics queue stops before a draw or dispatch (not within a run of
+		// indirect draws or a draw run being skipped; at most every KYTY_READBACK_YIELD_WORK of them) while an
+		// async-compute submission waits for the render thread: what it translated is flushed and that submission is
+		// translated next (GuestGpu::Process, ThreadRun). The packet runs when the queue resumes, as at a chunk end.
+		if (spec == nullptr && !m_state_only && m_chunk_every == 0 && m_stop_at == nullptr && !IsAsyncComputeQueue() &&
+		    IsChunkWork(opcode) && m_draw_run_skip == 0 && g_gpu_state != nullptr && GuestGpu::IsGpuThread() &&
+		    ReadbackLatency::YieldOn() && kyty_local_speculate_mode.load(std::memory_order_relaxed) == 0 &&
+		    ++m_yield_work >= std::max(1u, kyty_local_readback_yield_work.load(std::memory_order_relaxed)) &&
+		    !(opcode == Pm4::IT_DRAW_INDEX_INDIRECT && m_chunk_last_opcode == Pm4::IT_DRAW_INDEX_INDIRECT)) {
+			m_yield_work = 0; // (checked again after as many: ComputeReady takes the queue lock)
+			if (g_gpu_state->ComputeReady()) {
+				m_yield_pending       = true;
+				m_yield_resume        = true;
+				execution.m_suspended = true;
+				ReadbackLatency::Add(ReadbackLatency::Yields);
+				return;
+			}
 		}
 		m_chunk_last_opcode = opcode;
 		if (spec != nullptr) {
@@ -2310,6 +2370,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	EXIT_NOT_IMPLEMENTED(cache_policy != 0x00000000);
 	EXIT_NOT_IMPLEMENTED(event_write_dest != 0x00000000);
 	FlushReadbackPrefetch(m_renderer, m_state_only); // desport: KYTY_READBACK_PREFETCH
+	if (!m_state_only) ReadbackLatency::NoteSyncPoint(IsAsyncComputeQueue()); // desport: KYTY_READBACK_LATENCY
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {

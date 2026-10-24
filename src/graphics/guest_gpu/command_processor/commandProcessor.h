@@ -81,6 +81,9 @@ public:
 	[[nodiscard]] bool        TakeBoundary() noexcept { return std::exchange(m_at_boundary, false); }
 	void                      SetStopAt(const Pm4Execution* at) noexcept { m_stop_at = at; }
 	[[nodiscard]] bool        TakeStopReached() noexcept { return std::exchange(m_stop_reached, false); }
+	// desport: KYTY_READBACK_LATENCY=2: Process stopped before a draw or dispatch for an async-compute submission.
+	[[nodiscard]] bool YieldPending() const noexcept { return m_yield_pending; }
+	[[nodiscard]] bool TakeYield() noexcept { return std::exchange(m_yield_pending, false); }
 	[[nodiscard]] static bool SamePosition(const Pm4Execution& a, const Pm4Execution& b);
 	// The packet a suspended execution stopped at (its length in `dwords`), and past it.
 	[[nodiscard]] static const uint32_t* SuspendedPacket(const Pm4Execution& execution, uint32_t& dwords);
@@ -186,6 +189,9 @@ private:
 	uint32_t            m_chunk_every = 0, m_chunk_work = 0, m_chunk_last_opcode = 0;
 	bool                m_at_boundary = false, m_stop_reached = false;
 	const Pm4Execution* m_stop_at = nullptr;
+	uint32_t            m_yield_work    = 0;     // desport: KYTY_READBACK_LATENCY=2: draws/dispatches since the last check
+	bool                m_yield_pending = false; // desport
+	bool                m_yield_resume  = false; // desport: the next Process resumes after a yield
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
