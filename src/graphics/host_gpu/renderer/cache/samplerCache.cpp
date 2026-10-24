@@ -66,11 +66,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			case Prospero::SamplerAnisoRatio::kTwo: aniso_ratio = 2.0f; break;
 			case Prospero::SamplerAnisoRatio::kFour: aniso_ratio = 4.0f; break;
 			case Prospero::SamplerAnisoRatio::kEight: aniso_ratio = 8.0f; break;
-			case Prospero::SamplerAnisoRatio::kSixteen: aniso_ratio = 16.0f; break;
-			default:
-				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
-				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
-				     r.fields[3]);
+			case Prospero::SamplerAnisoRatio::kSixteen:
+			// Reserved encodings 5-7 fall back to the maximum ratio.
+			default: aniso_ratio = 16.0f; break;
 		}
 	}
 
@@ -136,8 +134,11 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	sampler_info.addressModeU = to_vk_address_mode(r.ClampX());
 	sampler_info.addressModeV = to_vk_address_mode(r.ClampY());
 	sampler_info.addressModeW = to_vk_address_mode(r.ClampZ());
-	sampler_info.mipLodBias =
-	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
+    const auto max_lod_bias = m_graphics.GetPhysicalDeviceProperties().limits.maxSamplerLodBias;
+    sampler_info.mipLodBias = std::clamp(
+        static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f,
+        -max_lod_bias, max_lod_bias
+    );
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
 	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);

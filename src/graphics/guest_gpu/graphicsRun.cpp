@@ -2398,6 +2398,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 								break;
 							case 0x14:
 							case 0x28:
+							case 0x2f:
 								if (event_index == 0x00) {
 									write64(false);
 									return;
@@ -2405,7 +2406,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 								break;
 							case 0x2b:
 							case 0x2d:
-							case 0x2f:
 							case 0x30:
 								if (event_index == 0x00 && !with_interrupt) {
 									write64(false);

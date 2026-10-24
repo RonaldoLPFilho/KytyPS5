@@ -3389,6 +3389,25 @@ public:
         interrupt_event.udata == &compute_interrupt_udata &&
         compute_clock_label != 0;
 
+    constexpr uint64_t compute_done_value = 0x1234567887654321ull;
+    uint64_t compute_done_label = 0;
+    auto compute_done_commands = make_interrupt_packet(
+        2, 2, &compute_done_label, compute_done_value, 0x678u);
+    compute_done_commands[1] = 0x62fu; // CS_DONE, shader-done index, no GCR action.
+    gpu.SubmitCompute(0x20, compute_done_commands);
+    gpu.Done();
+    finish_gpu();
+
+    interrupt_count = 0;
+    const auto compute_done_wait =
+        wait_for_interrupt(interrupt_event, interrupt_count);
+    Require("GpuCommandLane", "CS_DONE write-confirm interrupt",
+            compute_done_wait == 0 && interrupt_count == 1 &&
+                interrupt_event.ident == 0x20 && interrupt_event.data == 0x678u &&
+                interrupt_event.udata == &compute_interrupt_udata &&
+                compute_done_label == compute_done_value,
+            "CS_DONE lost its full 64-bit label write or write-confirm interrupt");
+
     interrupt_count = 0;
     const auto extra_interrupt_wait =
         wait_for_interrupt(interrupt_event, interrupt_count);
@@ -6816,6 +6835,51 @@ public:
                        vk::AccessFlagBits2::eTransferRead),
               "Image::CopyImage did not retain pinned "
               "source/destination states");
+
+      auto wide_volume_info = native_volume_info;
+      wide_volume_info.extent = {85, 5, 5};
+      wide_volume_info.pitch = 85;
+      auto narrow_volume_info = wide_volume_info;
+      narrow_volume_info.extent.width = 20;
+      narrow_volume_info.pitch = 20;
+      Libs::Graphics::Image wide_volume(m_runtime_context, scheduler,
+                                        wide_volume_info);
+      Libs::Graphics::Image narrow_volume(m_runtime_context, scheduler,
+                                          narrow_volume_info);
+      std::vector<uint32_t> volume_source_words(85 * 5 * 5);
+      for (uint32_t i = 0; i < volume_source_words.size(); ++i)
+        volume_source_words[i] = i + 1;
+      auto volume_upload = CreateHostBuffer(
+          name, volume_source_words.size() * sizeof(uint32_t),
+          vk::BufferUsageFlagBits::eTransferSrc, volume_source_words);
+      auto shrinking_readback =
+          CreateHostBuffer(name, 20 * 5 * 5 * sizeof(uint32_t),
+                           vk::BufferUsageFlagBits::eTransferDst, {});
+      vk::BufferImageCopy volume_region{};
+      volume_region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0,
+                                        1};
+      volume_region.imageExtent = wide_volume_info.extent;
+      wide_volume.Upload(std::span{&volume_region, 1}, volume_upload.buffer, 0,
+                         volume_upload.size);
+      narrow_volume.CopyImage(wide_volume);
+      volume_region.imageExtent = narrow_volume_info.extent;
+      narrow_volume.Download(std::span{&volume_region, 1},
+                             shrinking_readback.buffer, 0,
+                             shrinking_readback.size);
+      HostReadBarrier(shrinking_readback.buffer, shrinking_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      const auto volume_copied_words =
+          ReadBuffer(name, shrinking_readback, 20 * 5 * 5);
+      for (uint32_t row = 0; row < 5 * 5; ++row)
+        Require(name, "shrinking volume copy contents",
+                std::equal(volume_copied_words.begin() + row * 20,
+                           volume_copied_words.begin() + (row + 1) * 20,
+                           volume_source_words.begin() + row * 85),
+                "85x5x5 to 20x5x5 copy lost a row or depth slice");
+      DestroyBuffer(&shrinking_readback);
+      DestroyBuffer(&volume_upload);
 
       ImageInfo resolve_source_info{};
       resolve_source_info.pixel_format = vk::Format::eR8G8B8A8Unorm;
@@ -30924,7 +30988,9 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
   }
-  for (uint32_t offset = 0x0cau; offset <= 0x0ebu; offset++) {
+  // Restoring shader state after Toolkit rendering still emits the compiler's
+  // GS-front allocation metadata at 0xca.
+  for (uint32_t offset = 0x0cbu; offset <= 0x0ebu; offset++) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
                                   g_hw_sh_indirect_func[offset] == nullptr;
   }
@@ -30957,16 +31023,25 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-  std::array<uint32_t, 6> registers{
+  std::array<uint32_t, 24> registers{
       Pm4::SPI_SHADER_PGM_RSRC4_GS, 0x0badc0deu,
       Pm4::SPI_SHADER_PGM_CHKSUM_HS, 0x12345678u,
       Pm4::SPI_SHADER_PGM_RSRC4_HS, 0x87654321u,
+      Pm4::SPI_SHADER_PGM_LO_ES, 0x050025e5u,
+      Pm4::SPI_SHADER_PGM_HI_ES, 0u,
+      Pm4::SPI_SHADER_PGM_RSRC1_GS, 0x60000002u,
+      Pm4::SPI_SHADER_PGM_RSRC2_GS, 0x00030008u,
+      0x000000cau, 0x03000002u,
+      Pm4::SPI_SHADER_PGM_LO_PS, 0x05000104u,
+      Pm4::SPI_SHADER_PGM_HI_PS, 0u,
+      Pm4::SPI_SHADER_PGM_RSRC1_PS, 0x022c018du,
+      Pm4::SPI_SHADER_PGM_RSRC2_PS, 0x0000003cu,
   };
   const auto address = reinterpret_cast<uint64_t>(registers.data());
   std::array<uint32_t, 5> command{
       KYTY_PM4(5, Pm4::IT_SET_SH_REG_INDIRECT, Pm4::R_ZERO),
       static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
-      0x80000000u, 3u,
+      0x80000000u, static_cast<uint32_t>(registers.size() / 2u),
   };
   Pm4Execution execution;
   const bool handlers_present =
@@ -30977,6 +31052,17 @@ void CheckPm4PrivateAgcShaderRegisters(RenderContext &renderer) {
           handlers_present &&
               processor.Process(execution, command) == Pm4ProcessResult::Complete,
           "private AGC shader registers were rejected by SET_SH_REG_INDIRECT");
+  const auto &vs = processor.GetShCtx().GetVs();
+  const auto &ps = processor.GetShCtx().GetPs().ps_regs;
+  Require("Pm4PrivateAgcShaderRegisters", "native state around front metadata",
+          vs.es_regs.data_addr == 0x50025e500ull &&
+              vs.gs_regs.rsrc1.vgprs == 2u &&
+              vs.gs_regs.rsrc1.gs_vgpr_component_count == 3u &&
+              vs.gs_regs.rsrc2.es_vgpr_component_count == 3u &&
+              vs.gs_regs.rsrc2.user_sgpr == 4u &&
+              ps.data_addr == 0x500010400ull && ps.rsrc1.vgprs == 13u &&
+              ps.rsrc2.user_sgpr == 30u,
+          "GS-front metadata changed native GS state or prevented later PS writes");
   std::printf("[host]    %-32s ok\n", "Pm4PrivateAgcShaderRegisters");
 }
 

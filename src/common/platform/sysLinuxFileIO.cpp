@@ -53,7 +53,7 @@ struct sys_file_t {
 #endif
 
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
-	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
+	return name.empty() || name.is_absolute() ? name : (std::filesystem::path(".") / name);
 }
 
 // Pass access-pattern hints to the host.
@@ -435,7 +435,7 @@ bool SysFileDeleteFile(const std::filesystem::path& name) {
 
 bool SysFileFlush(sys_file_t& f) {
 	if (f.type == SYS_FILE_FILE && f.f != nullptr) {
-		return (fflush(f.f) == 0);
+		return fflush(f.f) == 0 && fsync(fileno(f.f)) == 0;
 	}
 
 	return false;
