@@ -1195,14 +1195,17 @@ void BufferCache::FlushReadbackPrefetch() {
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
 	const auto              native = command.Handle();
-	const vk::MemoryBarrier before {vk::AccessFlagBits::eMemoryWrite, vk::AccessFlagBits::eTransferRead};
+	// desport: vk-hpp here has no struct constructors; set the masks by field.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0,
 	                       nullptr, 0, nullptr);
 	for (const auto& copy: copies) native.copyBuffer(copy.source, feedback.download.Handle(), 1, &copy.region);
 	// The host reads the slots; later GPU writes of the sources wait for the copies.
-	const vk::MemoryBarrier after {vk::AccessFlagBits::eTransferWrite,
-	                               vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryRead |
-	                                   vk::AccessFlagBits::eMemoryWrite};
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
 	                       nullptr, 0, nullptr);
