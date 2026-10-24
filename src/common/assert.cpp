@@ -60,6 +60,21 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	                   line);
 }
 
+static std::atomic<void (*)(const char*)> g_crash_hook {nullptr}; // desport: crash record
+
+void SetCrashHook(void (*hook)(const char* message)) noexcept { // desport: crash record
+	g_crash_hook.store(hook, std::memory_order_release);
+}
+
+void ReportCrash(const char* message) noexcept { // desport: crash record
+	if (const auto hook = g_crash_hook.load(std::memory_order_acquire)) hook(message);
+}
+
+static void ReportFatalCrash(std::string_view text, const char* file, int line) { // desport: crash record
+	if (g_crash_hook.load(std::memory_order_acquire) == nullptr) return;
+	ReportCrash(fmt::format("{} in {}:{}", text, file, line).c_str());
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	if (t_recoverable) {
 		t_recoverable_message = fmt::format("{} in {}:{}", text, file, line);
@@ -67,6 +82,7 @@ static int DbgReport(const char* title, std::string_view text, const char* file,
 	}
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
 	WriteFatalBacktrace();
+	ReportFatalCrash(text, file, line); // desport: crash record, before the shutdown
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
@@ -87,6 +103,7 @@ int DbgExitHandler(const char* file, int line, std::string_view text) {
 	}
 	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
+	ReportFatalCrash(text, file, line); // desport: crash record
 	return 1;
 }
 
@@ -97,6 +114,7 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 	}
 	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
 	WriteFatalBacktrace();
+	ReportFatalCrash(text, file, line); // desport: crash record
 	return 1;
 }
 

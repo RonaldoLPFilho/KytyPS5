@@ -31,6 +31,11 @@ void DbgExit(int status);
 // What DbgExit runs before the process ends (output written asynchronously reaching its file), and RunExitDrain
 // for the other ends that skip exit handlers (std::_Exit, TerminateProcess).
 void SetExitDrain(void (*drain)()) noexcept;
+
+// desport: crash record. The hook runs once per fatal report (EXIT, EXIT_IF, NOT_IMPLEMENTED: "<text> in <file>:<line>")
+// before the process ends, and ReportCrash lets the other ends (PageManager's fail-fast) call it too.
+void SetCrashHook(void (*hook)(const char* message)) noexcept;
+void ReportCrash(const char* message) noexcept;
 void RunExitDrain() noexcept;
 
 // A report a thread is writing (the device-loss report): a fatal exit on another thread ends the process after it
